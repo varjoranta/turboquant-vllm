@@ -40,12 +40,12 @@ Quality preserved or better on every scenario. Full benchmark across 15 model co
 ## Install
 
 ```bash
-pip install turboquant-vllm@git+https://github.com/varjoranta/turboquant-vllm.git
+pip install turboquant-plus-vllm@git+https://github.com/varjoranta/turboquant-vllm.git
 ```
 
 For vLLM integration:
 ```bash
-pip install "turboquant-vllm[vllm] @ git+https://github.com/varjoranta/turboquant-vllm.git"
+pip install "turboquant-plus-vllm[vllm] @ git+https://github.com/varjoranta/turboquant-vllm.git"
 ```
 
 PyPI release coming soon.
@@ -150,6 +150,7 @@ Assuming 32 layers, 32 KV heads, head_dim=128 (typical for Qwen3-235B, Llama-70B
 
 ## Related projects
 
+- **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent implementation of TurboQuant for vLLM by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths (required for quantized weight models), and vLLM paged cache integration. The PyPI package for this project will be published as `turboquant-plus-vllm` to avoid confusion.
 - **[turbo-quant-lite](https://pypi.org/project/turbo-quant-lite/)** — Numpy-only TurboQuant for embedding compression in databases. Same math, different codebook and use case.
 - **[turboquant_plus](https://github.com/TheTom/turboquant_plus)** — Research implementation of the KV cache algorithm. This package builds production CUDA kernels on top of that work.
 - **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh et al., ICLR 2026. The underlying algorithm.

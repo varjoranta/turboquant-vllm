@@ -1,5 +1,5 @@
 [project]
-name = "turboquant-vllm"
+name = "turboquant-plus-vllm"
 version = "0.1.0"
 description = "TurboQuant+ KV cache compression for vLLM. 3.8x smaller KV cache, same quality."
 readme = "README.md"
