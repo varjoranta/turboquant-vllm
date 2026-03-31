@@ -28,18 +28,27 @@ vLLM offers FP8 KV cache (2x compression). For large MoE models at production co
 
 Norm storage is already optimal: one fp32 norm per 128-element vector (head_dim = block_size), matching the [block-size optimization](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/block-size-experiment.md) finding from turboquant_plus that block_size=128 eliminates redundant norm storage for free.
 
-Tested on A100 80GB with Qwen3-30B-A3B-AWQ across 5 multi-turn conversation scenarios (product inquiry, technical support, adversarial injection, reasoning, multilingual), scored by Llama-3.3-70B judge:
+### Full benchmark (20 scenarios, Verda GPU cloud)
 
-| Scenario | Baseline | TQ+ turbo4 |
-|----------|----------|------------|
-| Product inquiry (EN) | 4.25 | **4.50** |
-| Technical support (EN) | 4.25 | **4.50** |
-| Product inquiry (FI) | 4.75 | 4.75 |
-| Adversarial injection | 5.00 | 5.00 |
-| Debate/reasoning | 5.00 | 5.00 |
-| **Average** | **4.65** | **4.75** |
+Tested on H100 80GB and A100 80GB on [Verda](https://verda.ai) (Helsinki). 20 multi-turn conversation scenarios scored by Llama-3.3-70B judge. Results so far (more configs in progress):
 
-Quality preserved or better on every scenario. Full benchmark across 15 model configs and 20 scenarios coming soon.
+| Config | Model | KV Cache | Avg Score | Latency |
+|--------|-------|----------|-----------|---------|
+| 4 | GLM-4.7-Flash BF16 | FP16 (baseline) | **4.61** | 5993ms |
+| 11 | GLM-4.7-Flash BF16 | **TQ+ turbo4** | **4.58** | 6042ms |
+| 12 | GLM-4.7-Flash BF16 | **TQ+ turbo3** | **4.63** | 5998ms |
+| 5 | GLM-4.7-Flash BF16 | FP8 | 1.07 | 6299ms |
+| 7 | Qwen3-30B FP16 | FP16 (baseline) | **4.73** | 4396ms |
+| 8 | Qwen3-30B AWQ | FP16 | **4.67** | 3721ms |
+| 3 | Qwen3-235B AWQ | FP16 (baseline) | **4.74** | 29415ms |
+| 6 | Qwen3-235B AWQ | FP8 | **4.71** | 29971ms |
+
+**Key findings:**
+- **TQ+ preserves quality on MLA models.** GLM-4.7-Flash uses Multi-head Latent Attention. TQ+ turbo4 (4.58) and turbo3 (4.63) both match the FP16 baseline (4.61).
+- **FP8 KV cache breaks MLA.** GLM-Flash with FP8 KV scores 1.07/5 — catastrophically broken. FP8 works fine on standard attention (Qwen3-235B: 4.71 vs 4.74 baseline).
+- **AWQ weight quantization has minimal impact.** Qwen3-30B AWQ (4.67) vs FP16 (4.73).
+
+Qwen3-235B + TQ+ results pending. GLM-4.7 355B and DeepSeek-V3 671B require larger disk provisioning.
 
 ## Install
 
