@@ -148,9 +148,9 @@ Assuming 32 layers, 32 KV heads, head_dim=128 (typical for Qwen3-235B, Llama-70B
 | Model family | Attention type | TQ+ support |
 |-------------|---------------|-------------|
 | Qwen3, Llama, Mistral | FlashAttention (GQA/MHA) | **Yes** |
-| GLM-4.7, DeepSeek-V3 | Multi-head Latent Attention (MLA) | Coming soon |
+| GLM-4.7, DeepSeek-V3 | Multi-head Latent Attention (MLA) | **Yes** (new) |
 
-**MLA support:** MLA models store a compressed latent vector (`kv_c_normed`) plus positional encoding (`k_pe`) instead of standard K/V. The fix is straightforward — patch `MLACommonImpl.do_kv_cache_update` and apply TurboQuant+ to the latent vector, which is just a different-shaped tensor going through the same compress/decompress pipeline. The main thing to verify is that MLA's latent vectors follow the Gaussian distribution assumption after rotation, which is empirically testable. Targeting next release.
+MLA models store a compressed latent vector (`kv_c_normed`) plus positional encoding (`k_pe`) instead of standard K/V. The patch compresses `kv_c_normed` with PolarQuant MSE-only and passes `k_pe` through uncompressed. Both `forward_mha` and `forward_mqa` paths are patched via `TritonMLAImpl`. GPU validation pending.
 
 ## Related projects
 
