@@ -1,8 +1,8 @@
 # turboquant-vllm
 
-TurboQuant+ KV cache compression for vLLM. Compress the KV cache 3.8x during inference — serve more concurrent conversations on the same GPU, or use longer context at the same cost.
+TurboQuant+ KV cache compression for vLLM. Compress the KV cache 3.7x during inference — serve more concurrent conversations on the same GPU, or use longer context at the same cost.
 
-In early benchmarks on A100 80GB (Qwen3-30B, 5 multi-turn conversation scenarios), TQ+ **matched or outscored the uncompressed baseline on every scenario** while reducing KV cache memory to 26% of FP16. The impact scales with how much of your VRAM is KV cache — for large models at long context, that's most of it.
+In early benchmarks on A100 80GB (Qwen3-30B, 5 multi-turn conversation scenarios), TQ+ **matched or outscored the uncompressed baseline on every scenario** while reducing KV cache memory to 27% of FP16. The impact scales with how much of your VRAM is KV cache — for large models at long context, that's most of it.
 
 ```python
 from turboquant_vllm import patch_vllm_attention
@@ -14,15 +14,19 @@ patch_vllm_attention(k_bits=4, v_bits=4)  # before starting vLLM engine
 
 ## Why this exists
 
-vLLM offers FP8 KV cache (2x compression). For large MoE models at production context lengths, the KV cache is the memory bottleneck — not the weights. TurboQuant+ gives 3.8-4.6x compression with minimal quality loss:
+vLLM offers FP8 KV cache (2x compression). For large MoE models at production context lengths, the KV cache is the memory bottleneck — not the weights. TurboQuant+ gives 3.7-4.7x compression with minimal quality loss:
 
-| KV cache type | Compression | Quality impact |
-|---------------|-------------|----------------|
-| FP16 (default) | 1x | baseline |
-| FP8 (vLLM built-in) | 2x | negligible |
-| **TQ+ turbo4** | **3.8x** | **+0.23% PPL** |
-| TQ+ turbo3 | 4.6x | +1.06% PPL |
-| TQ+ asymmetric K4/V3 | ~4.2x | K precision preserved |
+| KV cache type | Compression | Per-vector overhead | Quality impact |
+|---------------|-------------|---------------------|----------------|
+| FP16 (default) | 1x | 512 bytes | baseline |
+| FP8 (vLLM built-in) | 2x | 256 bytes | negligible |
+| **TQ+ turbo4** | **3.7x** | 140 bytes (K: 72 + V: 68) | **+0.23% PPL** |
+| TQ+ turbo3 | 4.7x* | 108 bytes (K: 56 + V: 52) | +1.06% PPL |
+| TQ+ asymmetric K4/V3 | ~4.0x | 124 bytes (K: 72 + V: 52) | K precision preserved |
+
+*turbo3 with proper 3-bit sub-byte packing. Current implementation stores 3-bit as 1 byte per index (2.7x) — packing is a known TODO.
+
+Norm storage is already optimal: one fp32 norm per 128-element vector (head_dim = block_size), matching the [block-size optimization](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/block-size-experiment.md) finding from turboquant_plus that block_size=128 eliminates redundant norm storage for free.
 
 Tested on A100 80GB with Qwen3-30B-A3B-AWQ across 5 multi-turn conversation scenarios (product inquiry, technical support, adversarial injection, reasoning, multilingual), scored by Llama-3.3-70B judge:
 
