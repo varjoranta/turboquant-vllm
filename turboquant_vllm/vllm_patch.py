@@ -1,17 +1,16 @@
-"""Monkey-patch vLLM's flash attention to use TurboQuant+ KV cache.
+"""Monkey-patch vLLM's attention backends to use TurboQuant+ KV cache.
 
-Intercepts FlashAttentionImpl at two points:
-1. do_kv_cache_update: compress K/V with TurboQuant+ before storing
-2. forward: decompress from TurboQuant+ before attention computation
+Supports two attention backends:
+1. FlashAttentionImpl (standard GQA/MHA) — Qwen3, Llama, Mistral, etc.
+2. MLACommonImpl (Multi-head Latent Attention) — GLM-4.7, DeepSeek-V3
+
+For FlashAttention, intercepts do_kv_cache_update(key, value, ...) and forward().
+For MLA, intercepts do_kv_cache_update(kv_c_normed, k_pe, ...) — compresses
+the latent vector kv_c_normed, passes k_pe through uncompressed.
 
 The compressed data lives in a sidecar store (Python dict), not in vLLM's
 paged cache. vLLM's cache is still allocated and written to (for memory
 accounting), but attention reads from our decompressed tensors.
-
-This is a prototype integration. Production would need CUDA kernels:
-- CUDA WHT butterfly (128-dim, O(d log d)) for rotation
-- CUDA searchsorted on 8-16 centroids for quantization
-- Fused dequant inside flash attention tile loop for reads
 """
 
 import torch
@@ -134,6 +133,93 @@ def _make_patched_forward(original_fn):
     return patched
 
 
+# ============================================================================
+# MLA (Multi-head Latent Attention) patches — GLM-4.7, DeepSeek-V3
+# ============================================================================
+
+# MLA sidecar: stores compressed kv_c_normed per slot
+# _mla_cache[layer_id][(block_idx, offset)] = compressed_kv_c
+_mla_cache: dict[int, dict[tuple[int, int], CompressedKV]] = {}
+
+
+def _make_mla_patched_cache_update(original_fn):
+    """Wrap MLA do_kv_cache_update to compress kv_c_normed with TurboQuant+.
+
+    MLA signature: do_kv_cache_update(self, kv_c_normed, k_pe, kv_cache,
+                                       slot_mapping, kv_cache_dtype, k_scale)
+
+    kv_c_normed: the latent KV vector (compressed representation of K+V)
+    k_pe: positional encoding for K (small, passed through uncompressed)
+    """
+
+    @wraps(original_fn)
+    def patched(self, kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale):
+        # Call original so vLLM's memory accounting stays correct
+        original_fn(self, kv_c_normed, k_pe, kv_cache, slot_mapping, kv_cache_dtype, k_scale)
+
+        # Compress kv_c_normed and store in sidecar
+        layer_id = id(self)
+        if layer_id not in _mla_cache:
+            _mla_cache[layer_id] = {}
+
+        latent_dim = kv_c_normed.shape[-1]
+        compressor = _get_compressor(latent_dim, kv_c_normed.device)
+
+        num_tokens = slot_mapping.shape[0]
+        block_size = kv_cache.shape[1]
+
+        for t in range(num_tokens):
+            slot = slot_mapping[t].item()
+            block_idx = slot // block_size
+            offset = slot % block_size
+
+            vec = kv_c_normed[t].unsqueeze(0)  # (1, latent_dim)
+            compressed = compressor.compress_v(vec)  # MSE-only for latent (no QJL)
+            _mla_cache[layer_id][(block_idx, offset)] = compressed
+
+    return patched
+
+
+def _make_mla_patched_forward(original_fn, method_name):
+    """Wrap MLA forward_mha/forward_mqa to decompress kv_c_normed before attention."""
+
+    @wraps(original_fn)
+    def patched(self, *args, **kwargs):
+        layer_id = id(self)
+        store = _mla_cache.get(layer_id)
+        if not store:
+            return original_fn(self, *args, **kwargs)
+
+        # The kv_c_and_k_pe_cache is the combined cache tensor
+        # Find it in args (position varies between forward_mha and forward_mqa)
+        if method_name == "forward_mha":
+            # forward_mha(self, q, kv_c_normed, k_pe, kv_c_and_k_pe_cache, attn_metadata, k_scale, output)
+            kv_cache = args[3] if len(args) > 3 else kwargs.get("kv_c_and_k_pe_cache")
+        else:
+            # forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer)
+            kv_cache = args[1] if len(args) > 1 else kwargs.get("kv_c_and_k_pe_cache")
+
+        if kv_cache is None:
+            return original_fn(self, *args, **kwargs)
+
+        # Decompress all cached latent vectors back into the paged cache
+        # kv_cache layout for MLA: (num_blocks, block_size, latent_dim + pe_dim)
+        latent_dim = list(store.values())[0].indices.shape[-1] if store else 0
+        if latent_dim == 0:
+            return original_fn(self, *args, **kwargs)
+
+        compressor = _get_compressor(latent_dim, kv_cache.device)
+
+        for (block_idx, offset), compressed in store.items():
+            dec = compressor.decompress_v(compressed).squeeze(0)
+            # Write only the latent portion (first latent_dim elements)
+            kv_cache[block_idx, offset, :latent_dim] = dec.to(kv_cache.dtype)
+
+        return original_fn(self, *args, **kwargs)
+
+    return patched
+
+
 def patch_vllm_attention(k_bits: int = 4, v_bits: int = 4):
     """Monkey-patch vLLM's FlashAttentionImpl for TurboQuant+ KV cache.
 
@@ -157,20 +243,40 @@ def patch_vllm_attention(k_bits: int = 4, v_bits: int = 4):
     # Try CUDA kernels first, fall back to PyTorch
     _try_cuda_init()
 
+    patched_backends = []
+
+    # Patch FlashAttention (standard GQA/MHA models)
     try:
         from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
+        FlashAttentionImpl.do_kv_cache_update = _make_patched_cache_update(
+            FlashAttentionImpl.do_kv_cache_update
+        )
+        FlashAttentionImpl.forward = _make_patched_forward(
+            FlashAttentionImpl.forward
+        )
+        patched_backends.append("FlashAttention")
     except ImportError:
-        logger.error("Cannot import vLLM FlashAttentionImpl — is vLLM installed?")
-        raise
+        logger.warning("FlashAttentionImpl not found, skipping FlashAttention patch")
 
-    FlashAttentionImpl.do_kv_cache_update = _make_patched_cache_update(
-        FlashAttentionImpl.do_kv_cache_update
-    )
-    FlashAttentionImpl.forward = _make_patched_forward(
-        FlashAttentionImpl.forward
-    )
+    # Patch MLA (GLM-4.7, DeepSeek-V3)
+    try:
+        from vllm.v1.attention.backends.mla.triton_mla import TritonMLAImpl
+        TritonMLAImpl.do_kv_cache_update = _make_mla_patched_cache_update(
+            TritonMLAImpl.do_kv_cache_update
+        )
+        for method_name in ("forward_mha", "forward_mqa"):
+            if hasattr(TritonMLAImpl, method_name):
+                setattr(TritonMLAImpl, method_name, _make_mla_patched_forward(
+                    getattr(TritonMLAImpl, method_name), method_name
+                ))
+        patched_backends.append("TritonMLA")
+    except ImportError:
+        logger.warning("TritonMLAImpl not found, skipping MLA patch")
+
+    if not patched_backends:
+        raise ImportError("No vLLM attention backends found. Is vLLM installed?")
 
     logger.info(
-        "TurboQuant+ patched vLLM: K=%d-bit (PolarQuant %d-bit + QJL 1-bit), V=%d-bit (PolarQuant MSE-only)",
-        k_bits, k_bits - 1, v_bits,
+        "TurboQuant+ patched vLLM [%s]: K=%d-bit (PolarQuant %d-bit + QJL 1-bit), V=%d-bit (PolarQuant MSE-only)",
+        "+".join(patched_backends), k_bits, k_bits - 1, v_bits,
     )
