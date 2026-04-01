@@ -71,7 +71,7 @@ PyPI release coming soon.
 
 ## How it works
 
-Based on [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., ICLR 2026). After a random rotation, vector coordinates follow a known Gaussian distribution, so precomputed optimal centroids replace learned codebooks. No calibration data needed.
+Based on [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025). After a random rotation, vector coordinates follow a known Gaussian distribution, so precomputed optimal centroids replace learned codebooks. No calibration data needed.
 
 Extended by [turboquant_plus](https://github.com/TheTom/turboquant_plus) for KV cache:
 
@@ -213,7 +213,7 @@ Contributions and testing on different models welcome. Write-up: [varjosoft.com/
 - **[turbo-quant-lite](https://pypi.org/project/turbo-quant-lite/)** — Numpy-only TurboQuant for embedding compression in databases. Same math, different codebook and use case.
 - **[turboquant_plus](https://github.com/TheTom/turboquant_plus)** — Research implementation of the KV cache algorithm. This package builds production CUDA kernels on top of that work.
 - **[TQ3_1S for llama.cpp](https://github.com/turbo-tan/llama.cpp)** — @coffeecup2020's proof-of-concept applying TurboQuant to model weights (not just KV cache). Achieved near-Q4_0 quality at 3.5-bit on Qwen3.5-27B. Inspired the weight quantization feature in this package.
-- **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh et al., ICLR 2026. The underlying algorithm.
+- **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh et al., 2025. The underlying algorithm.
 
 ## License
 
