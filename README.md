@@ -1,8 +1,11 @@
 # turboquant-vllm
 
-TurboQuant+ KV cache compression for vLLM. Compress the KV cache 3.7x during inference, serve more concurrent conversations on the same GPU, or use longer context at the same cost.
+TurboQuant+ compression for vLLM. Two features from one library:
 
-In benchmarks across 10 model configs and 20 multi-turn conversation scenarios on [Verda](https://verda.ai) GPU cloud, **TQ+ matched or beat the FP16 baseline on every model tested**. Asymmetric K4/V3 scored highest overall. On MLA models (GLM-4.7-Flash), TQ+ works correctly where vLLM's built-in FP8 KV cache does not.
+- **KV cache compression** (3.7x) for more concurrent conversations on the same GPU
+- **Weight compression** (3.6x) to fit large models on smaller hardware. No calibration, no pre-quantization. Any BF16 checkpoint, compressed in 4 seconds.
+
+Qwen3-30B: 59.7 GB BF16 → **16.8 GB** after weight compression. Qwen3-235B KV cache benchmark: **4.75/5** quality score with TQ+ K4/V3. On MLA models, TQ+ works correctly where vLLM's built-in FP8 KV cache does not.
 
 ```python
 from turboquant_vllm import patch_vllm_attention
@@ -160,11 +163,56 @@ At 32K context with 32 layers, 32 KV heads, head_dim=128 (typical for Qwen3-235B
 
 MLA models store a compressed latent vector (`kv_c_normed`) plus positional encoding (`k_pe`) instead of standard K/V. The patch compresses `kv_c_normed` with PolarQuant MSE-only and passes `k_pe` through uncompressed. Validated on GLM-4.7-Flash across 20 scenarios.
 
+## Weight quantization (experimental)
+
+The same WHT rotation + codebook math that compresses the KV cache can also compress **model weights**. Load any BF16 checkpoint, compress at startup, serve. No calibration data, no separate quantization step.
+
+```python
+from turboquant_vllm import enable_weight_quantization
+
+enable_weight_quantization(bits=4, group_size=128)  # before loading model
+# Weights compressed at load time. Any BF16 model from HuggingFace works.
+```
+
+Inspired by [@coffeecup2020's TQ3_1S implementation](https://github.com/turbo-tan/llama.cpp) for llama.cpp.
+
+### Results (Qwen3-30B on H100)
+
+| | BF16 baseline | TQ4-g128 |
+|---|---|---|
+| **GPU memory** | **59.7 GB** | **16.8 GB** |
+| Peak during generation | | 26.3 GB |
+| Perplexity | 4.19 | 4.33 (+3.4%) |
+| Compression time | | 4 seconds |
+| Layers compressed | | 192 linear + 96 MoE expert |
+
+All test prompts produce coherent, factually correct output (capitals, code, multilingual, reasoning). Compresses both standard linear layers and MoE expert weights (3D tensors detected by shape).
+
+### Current limitations
+
+- **Speed:** Inference is slower than uncompressed (decompressing expert weights per-forward via PyTorch hooks). Production speed requires fused dequant-GEMM kernels, which are the next priority.
+- **3-bit:** TQ3 works on 30B models but degrades on smaller ones. TQ4 is the safe default.
+
+### Combined with KV cache compression
+
+Both features work together:
+```python
+from turboquant_vllm import enable_weight_quantization, patch_vllm_attention
+
+enable_weight_quantization(bits=4, group_size=128)  # 59.7 GB → 16.8 GB model
+patch_vllm_attention(k_bits=4, v_bits=3)            # 3.7x smaller KV cache
+```
+
+Same math, same CUDA kernels. Weight compression reduces the hardware you need. KV cache compression increases how many users you can serve on it.
+
+Contributions and testing on different models welcome. Write-up: [varjosoft.com/weight-compression.html](https://varjosoft.com/weight-compression.html)
+
 ## Related projects
 
 - **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent implementation of TurboQuant for vLLM by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths (required for quantized weight models), and vLLM paged cache integration. The PyPI package for this project will be published as `turboquant-plus-vllm` to avoid confusion.
 - **[turbo-quant-lite](https://pypi.org/project/turbo-quant-lite/)** — Numpy-only TurboQuant for embedding compression in databases. Same math, different codebook and use case.
 - **[turboquant_plus](https://github.com/TheTom/turboquant_plus)** — Research implementation of the KV cache algorithm. This package builds production CUDA kernels on top of that work.
+- **[TQ3_1S for llama.cpp](https://github.com/turbo-tan/llama.cpp)** — @coffeecup2020's proof-of-concept applying TurboQuant to model weights (not just KV cache). Achieved near-Q4_0 quality at 3.5-bit on Qwen3.5-27B. Inspired the weight quantization feature in this package.
 - **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh et al., ICLR 2026. The underlying algorithm.
 
 ## License
