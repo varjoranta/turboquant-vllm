@@ -126,7 +126,7 @@ If CUDA compilation fails, the system automatically falls back to PyTorch ops (s
 
 ## The CUDA kernels
 
-Four fused kernels in `csrc/turbo_quant.cu`:
+**KV cache kernels** in `csrc/turbo_quant.cu`:
 
 | Kernel | Purpose | Key operation |
 |--------|---------|---------------|
@@ -135,9 +135,20 @@ Four fused kernels in `csrc/turbo_quant.cu`:
 | `qjl_quantize_residual_kernel` | K cache QJL | PolarQuant residual → 128×128 projection → pack sign bits |
 | `qjl_dequantize_and_add_kernel` | K cache QJL | Reconstruct QJL contribution, add to PolarQuant output |
 
+**Weight dequant kernel** in `csrc/tq_weight_dequant.cu`:
+
+| Kernel | Purpose | Key operation |
+|--------|---------|---------------|
+| `tq_weight_dequant_kernel` | Weight decompression | Unpack indices → codebook lookup → inverse WHT butterfly in shared memory → rescale by group norm |
+
+Weight dequant is 6.3x faster than the PyTorch fallback path (0.36ms vs 2.28ms for 4096x4096 on H100). Supports 2-bit, 3-bit, and 4-bit with group sizes 64/128/256, fp16 and fp32 output. Automatically used when CUDA is available, with PyTorch fallback otherwise.
+
+Note: this is a **dequant + separate cuBLAS GEMM** approach, not a fused dequant-GEMM like Marlin (used by AWQ/GPTQ). A fused kernel would match AWQ speed but is significantly more complex to implement. The current kernel makes weight compression practical for batch workloads where AWQ checkpoints are not available.
+
 Design choices:
 - **Walsh-Hadamard Transform** over dense rotation: O(d log d) vs O(d²). 896 FLOPs vs 16,384 for d=128. Fits entirely in shared memory.
 - **Separate K/V codebooks** in constant memory for asymmetric bit widths.
+- **Constant memory caching**: codebook and sign vectors only re-uploaded when config changes.
 - **4-bit packing**: two indices per byte, halves cache bandwidth.
 - Targets A100 (sm_80), L40S/RTX4090 (sm_89), H100 (sm_90).
 
@@ -190,7 +201,7 @@ All test prompts produce coherent, factually correct output (capitals, code, mul
 
 ### Current limitations
 
-- **Speed:** Inference is slower than uncompressed (decompressing expert weights per-forward via PyTorch hooks). Production speed requires fused dequant-GEMM kernels, which are the next priority.
+- **Speed:** Weight decompression uses a fused CUDA kernel (6.3x faster than PyTorch fallback, 0.36ms per 4096x4096 layer on H100). Still slower than pre-quantized formats like AWQ/GPTQ which use fused dequant-GEMM kernels (Marlin). Current approach: decompress to fp16, then cuBLAS GEMM. Practical for batch workloads and models without pre-quantized checkpoints.
 - **3-bit:** TQ3 works on 30B models but degrades on smaller ones. TQ4 is the safe default.
 
 ### Combined with KV cache compression
