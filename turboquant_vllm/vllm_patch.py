@@ -34,6 +34,8 @@ _mla_cache: dict[int, dict[tuple[int, int], CompressedKV]] = {}
 _k_bits = 4
 _v_bits = 4
 _use_cuda = False
+_norm_correction = True
+_use_qjl = False
 
 
 def _try_cuda_init() -> bool:
@@ -58,8 +60,8 @@ def _get_compressor(dim: int, device: torch.device) -> KVCacheCompressorTorch:
             dim, k_bits=_k_bits, v_bits=_v_bits,
             seed=42, device=str(device),
             use_cuda=_use_cuda,
-            norm_correction=True,
-            use_qjl=False,
+            norm_correction=_norm_correction,
+            use_qjl=_use_qjl,
         )
         stats = _compressors[dim].memory_stats()
         backend = "CUDA" if _use_cuda else "PyTorch"
@@ -198,15 +200,28 @@ def _make_mla_patched_forward(original_fn, cache_arg_idx):
 # Public API
 # ============================================================================
 
-def patch_vllm_attention(k_bits: int = 4, v_bits: int = 4):
+def patch_vllm_attention(
+    k_bits: int = 4,
+    v_bits: int = 4,
+    norm_correction: bool = True,
+    use_qjl: bool = False,
+):
     """Monkey-patch vLLM attention backends for TurboQuant+ KV cache.
 
     Call before starting the vLLM engine. Patches both FlashAttention (standard
     models) and TritonMLA (GLM-4.7, DeepSeek-V3) if available.
+
+    Args:
+        k_bits: Bits for key compression (default 4, 16 centroids).
+        v_bits: Bits for value compression (default 4).
+        norm_correction: Correct reconstruction magnitude error (default True).
+        use_qjl: Use QJL residual correction for K cache (default False).
     """
-    global _k_bits, _v_bits
+    global _k_bits, _v_bits, _norm_correction, _use_qjl
     _k_bits = k_bits
     _v_bits = v_bits
+    _norm_correction = norm_correction
+    _use_qjl = use_qjl
 
     _try_cuda_init()
 

@@ -364,7 +364,7 @@ class KVCacheCompressorTorch:
         from turboquant_vllm.build import build
         self._cuda_mod = build()
 
-        k_pq_bits = k_bits - 1 if k_bits >= 2 else 1
+        k_pq_bits = (k_bits - 1 if k_bits >= 2 else 1) if self.use_qjl else k_bits
         v_pq_bits = v_bits
 
         # Compute codebooks (reuse the same Lloyd's algorithm)
