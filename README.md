@@ -263,13 +263,16 @@ python containers/deploy.py pause gpt-oss-20b        # stop billing
 
 ### Measured results (April 2026)
 
-| Model | Active params | GPU | Cold start | Throughput | Per session |
-|---|---|---|---|---|---|
-| gpt-oss-20b | 3.6B (MoE) | L40S $0.90/hr | ~3.3 min | ~40 tok/s | ~$0.15 |
-| Qwen3-8B | 8B | L40S $0.90/hr | ~3 min | 38-51 tok/s | ~$0.15 |
-| Qwen3-235B AWQ | 22B (MoE) | H200 $3.39/hr | ~5.5 min | 23 tok/s | ~$0.57 |
+| Model | Active params | GPU | Cold start | Warm start | Throughput | Per session |
+|---|---|---|---|---|---|---|
+| gpt-oss-20b | 3.6B (MoE) | L40S $0.90/hr | 3.3 min | 2.7 min | 42 tok in 2.4s | ~$0.15 |
+| Qwen3-8B | 8B | L40S $0.90/hr | 3 min | — | 38-51 tok/s | ~$0.15 |
+| Qwen3-1.7B | 1.7B | L40S $0.90/hr | 2 min | — | — | ~$0.15 |
+| Qwen3-235B AWQ | 22B (MoE) | H200 $3.39/hr | 5.5 min | — | 23 tok/s | ~$0.57 |
 
-Cold start = time from zero replicas to first token (model cached on persistent volume). First boot adds model download time (~2 min for 20B, ~11 min for 235B).
+Cold start = first boot (model download + load). Warm start = resume from paused (model cached on persistent volume).
+
+**Gemma 4 26B MoE** (3.8B active, Apache 2.0, #6 on Arena AI): working on getting this running. Needs A100 80GB+ and `transformers>=5.5.0`. Benchmarks coming soon.
 
 **For real-time chat, always-warm is required** — cold starts of 2-5 minutes are too slow for interactive use. Always-warm cost: ~$216/month for gpt-oss-20b on L40S (8hr/day). Serverless scale-to-zero is practical for batch processing, internal tools, or async workloads.
 
