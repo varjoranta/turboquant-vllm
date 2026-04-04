@@ -272,7 +272,7 @@ python containers/deploy.py pause gpt-oss-20b        # stop billing
 
 Cold start = first boot (model download + load). Warm start = resume from paused (model cached on persistent volume).
 
-**Gemma 4 26B MoE** (3.8B active, Apache 2.0, #6 on Arena AI): working on getting this running. Needs A100 80GB+ and `transformers>=5.5.0`. Benchmarks coming soon.
+**Gemma 4 26B MoE** (3.8B active, Apache 2.0, #6 on Arena AI): working on A100 80GB with `transformers>=5.5.0`. Concise, well-formatted output. Use `google/gemma-4-26B-A4B-it` (not the base model). Needs custom vLLM image with upgraded transformers — see [containers/](https://github.com/varjoranta/verda-model-bench/tree/main/containers).
 
 **For real-time chat, always-warm is required** — cold starts of 2-5 minutes are too slow for interactive use. Always-warm cost: ~$216/month for gpt-oss-20b on L40S (8hr/day). Serverless scale-to-zero is practical for batch processing, internal tools, or async workloads.
 
