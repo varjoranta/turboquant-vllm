@@ -304,7 +304,39 @@ def _register_moe_hooks(module: nn.Module, param_names: list[str]):
     module.register_forward_hook(post_hook)
 
 
-def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128, min_size: int = 1024):
+def _select_bits(param: torch.Tensor, default_bits: int, kurtosis_aware: bool = False) -> int:
+    """Select quantization bits based on tensor statistics.
+
+    Heavy-tailed distributions (high kurtosis, e.g. shared MoE experts)
+    need more bits. Near-Gaussian distributions (low kurtosis, e.g. routed
+    MoE experts) tolerate aggressive compression.
+
+    Based on APEX finding: shared expert kurtosis ~13.1, routed ~3.4.
+    """
+    if not kurtosis_aware:
+        return default_bits
+
+    flat = param.float().reshape(-1)
+    mean = flat.mean()
+    std = flat.std()
+    if std < 1e-8:
+        return default_bits
+    normalized = (flat - mean) / std
+    kurt = (normalized ** 4).mean().item()  # excess kurtosis + 3
+
+    if kurt > 8:
+        # Heavy-tailed (shared experts, attention projections): more bits
+        return min(default_bits + 2, 8)
+    elif kurt > 5:
+        return min(default_bits + 1, 8)
+    elif kurt < 3.5:
+        # Near-Gaussian (routed experts): fewer bits OK
+        return max(default_bits - 1, 2)
+    return default_bits
+
+
+def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
+                            min_size: int = 1024, kurtosis_aware: bool = False):
     """Compress model weights: nn.Linear layers AND MoE expert weights."""
     replacements = 0
     total_original = 0
@@ -326,7 +358,8 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128, m
             parent = getattr(parent, part)
 
         original_bytes = module.weight.numel() * module.weight.element_size()
-        wrapper = TurboQuantWrapper(module, bits=bits, group_size=group_size)
+        tensor_bits = _select_bits(module.weight.data, bits, kurtosis_aware)
+        wrapper = TurboQuantWrapper(module, bits=tensor_bits, group_size=group_size)
         setattr(parent, parts[-1], wrapper)
 
         compressed_bytes = wrapper.packed_weight.numel() + wrapper.norms.numel() * 4
@@ -354,7 +387,8 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128, m
         for part in parts[:-1]:
             owner = getattr(owner, part)
 
-        orig_bytes, comp_bytes = _compress_3d_param(owner, param_name, bits, group_size)
+        tensor_bits = _select_bits(param.data, bits, kurtosis_aware)
+        orig_bytes, comp_bytes = _compress_3d_param(owner, param_name, tensor_bits, group_size)
         total_original += orig_bytes
         total_compressed += comp_bytes
         expert_layers += 1
@@ -382,15 +416,19 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128, m
     return total
 
 
-def enable_weight_quantization(bits: int = 3, group_size: int = 128, min_layer_size: int = 1024):
+def enable_weight_quantization(bits: int = 3, group_size: int = 128,
+                                min_layer_size: int = 1024, kurtosis_aware: bool = False):
     """Monkey-patch vLLM to apply TurboQuant weight compression at model load time.
 
     Args:
-        bits: quantization bits (2, 3, or 4). Default 3 for best size/quality.
+        bits: default quantization bits (2-8). Default 3 for best size/quality.
         group_size: elements per quantization group. Default 128 (matches head_dim).
         min_layer_size: minimum dimension to compress (skip small layers).
+        kurtosis_aware: Auto-select bits per tensor based on kurtosis.
+            Heavy-tailed tensors (shared MoE experts) get more bits.
+            Near-Gaussian tensors (routed experts) get fewer bits.
     """
-    assert 2 <= bits <= 4, f"bits must be 2-4, got {bits}"
+    assert 2 <= bits <= 8, f"bits must be 2-8, got {bits}"
     assert group_size in (64, 128, 256), f"group_size must be 64/128/256, got {group_size}"
 
     try:
@@ -401,7 +439,8 @@ def enable_weight_quantization(bits: int = 3, group_size: int = 128, min_layer_s
 
     def patched_process_weights(model, model_config, target_device):
         _original_process(model, model_config, target_device)
-        _replace_linear_layers(model, bits=bits, group_size=group_size, min_size=min_layer_size)
+        _replace_linear_layers(model, bits=bits, group_size=group_size,
+                                min_size=min_layer_size, kurtosis_aware=kurtosis_aware)
 
     import vllm.model_executor.model_loader.utils as loader_utils
     loader_utils.process_weights_after_loading = patched_process_weights
