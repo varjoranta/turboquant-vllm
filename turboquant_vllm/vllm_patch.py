@@ -39,6 +39,7 @@ _use_qjl = False
 _sink_tokens = 4  # first N positions per layer stored at FP16
 _boundary_layers = 5  # first/last N layers get higher K precision
 _total_layers = 0  # set during patching from model config
+_fp16_heads: set[int] = set()  # head indices to keep at FP16 (sink heads)
 _layer_token_counts: dict[int, int] = {}  # layer_id → tokens seen
 _layer_indices: dict[int, int] = {}  # layer_id → layer index (0-based)
 
@@ -150,6 +151,10 @@ def _make_patched_cache_update(original_fn):
                 continue
 
             for h in range(num_kv_heads):
+                if h in _fp16_heads:
+                    # Sink head: store as None (FP16 passthrough)
+                    _cache[layer_id][(block_idx, offset, h)] = None
+                    continue
                 ck = compressor.compress_k(key[t, h].unsqueeze(0))
                 cv = compressor.compress_v(value[t, h].unsqueeze(0))
                 _cache[layer_id][(block_idx, offset, h)] = (ck, cv)
@@ -259,6 +264,7 @@ def patch_vllm_attention(
     use_qjl: bool = False,
     sink_tokens: int = 4,
     boundary_layers: int = 5,
+    fp16_heads: set[int] | None = None,
 ):
     """Monkey-patch vLLM attention backends for TurboQuant+ KV cache.
 
@@ -276,14 +282,19 @@ def patch_vllm_attention(
         boundary_layers: First and last N layers get K=8-bit precision (default 5).
             Boundary layers carry more signal through the residual stream.
             Set to 0 to disable.
+        fp16_heads: Set of KV head indices to keep at FP16 (no compression).
+            Sink heads with low attention entropy need full precision.
+            Identify via attention entropy analysis or set empirically.
+            Default None (compress all heads).
     """
-    global _k_bits, _v_bits, _norm_correction, _use_qjl, _sink_tokens, _boundary_layers
+    global _k_bits, _v_bits, _norm_correction, _use_qjl, _sink_tokens, _boundary_layers, _fp16_heads
     _k_bits = k_bits
     _v_bits = v_bits
     _norm_correction = norm_correction
     _use_qjl = use_qjl
     _sink_tokens = sink_tokens
     _boundary_layers = boundary_layers
+    _fp16_heads = fp16_heads or set()
 
     _try_cuda_init()
 

@@ -9,3 +9,6 @@ build/
 uv.lock
 .idea/
 .plans/
+ARTICLE_DRAFT.md
+article-draft.html
+.mcp.json

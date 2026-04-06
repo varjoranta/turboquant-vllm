@@ -1,18 +1,22 @@
 # turboquant-vllm
 
-TurboQuant+ compression for vLLM. Two features from one library:
+TurboQuant+ compression for vLLM. Three features from one algorithm:
 
+- **Weight compression** (4.3-4.6x) via 3-bit TQ3. Any BF16 checkpoint, compressed in 9 seconds, zero calibration. Faster than uncompressed serving.
 - **KV cache compression** (3.7x) for more concurrent conversations on the same GPU
-- **Weight compression** (3.6x) to fit large models on smaller hardware. No calibration, no pre-quantization. Any BF16 checkpoint, compressed in 4 seconds.
+- **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models
 
-Qwen3-30B: 59.7 GB BF16 → **16.8 GB** after weight compression. Qwen3-235B KV cache benchmark: **4.75/5** quality score with TQ+ K4/V3. On MLA models, TQ+ works correctly where vLLM's built-in FP8 KV cache does not.
+Gemma 4 26B: ~52 GB checkpoint → **~12 GB runtime VRAM** with TQ3. Scores **4.76/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost. Serves at 14-17 tok/s on A100 in our tests.
+
+Qwen3-30B: 61 GB → **13 GB** (4.6x). On MLA models, TQ+ KV cache works where vLLM's FP8 is broken.
 
 ```python
-from turboquant_vllm import patch_vllm_attention
+from turboquant_vllm import enable_weight_quantization, patch_vllm_attention
 
-patch_vllm_attention(k_bits=4, v_bits=4)  # before starting vLLM engine
+enable_weight_quantization(bits=3)                          # 52 GB → 12 GB in 9 seconds
+patch_vllm_attention(k_bits=4, v_bits=3, norm_correction=True)  # 3.7x KV compression
 
-# Then start vLLM as usual — KV cache is compressed transparently
+# Then start vLLM as usual
 ```
 
 ## Why this exists
@@ -27,7 +31,7 @@ vLLM offers FP8 KV cache (2x compression). For large MoE models at production co
 | TQ+ turbo3 | 4.7x* | 108 bytes (K: 56 + V: 52) | +1.06% PPL |
 | TQ+ asymmetric K4/V3 | ~4.0x | 124 bytes (K: 72 + V: 52) | K precision preserved |
 
-*turbo3 with proper 3-bit sub-byte packing. Current implementation stores 3-bit as 1 byte per index (2.7x), packing is a known TODO.
+*turbo3 with 3-bit sub-byte packing (8 indices per 3 bytes). Implemented in v0.3.0.
 
 Norm storage is already optimal: one fp32 norm per 128-element vector (head_dim = block_size), matching the [block-size optimization](https://github.com/TheTom/turboquant_plus/blob/main/docs/papers/block-size-experiment.md) finding from turboquant_plus that block_size=128 eliminates redundant norm storage for free.
 
@@ -86,7 +90,7 @@ PyPI release coming soon.
 
 ## How it works
 
-Based on [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh et al., 2025). After a random rotation, vector coordinates follow a known Gaussian distribution, so precomputed optimal centroids replace learned codebooks. No calibration data needed.
+Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026). After a random rotation, vector coordinates become easier to quantize. Our implementation uses a Gaussian Lloyd-Max codebook as an approximation. No calibration data needed.
 
 Extended by [turboquant_plus](https://github.com/TheTom/turboquant_plus) for KV cache:
 
@@ -104,11 +108,14 @@ from turboquant_vllm import patch_vllm_attention
 # Symmetric 4-bit
 patch_vllm_attention(k_bits=4, v_bits=4)
 
-# Asymmetric: K precision preserved, V compressed more
-patch_vllm_attention(k_bits=4, v_bits=3)
+# Asymmetric K4/V3 with Phase 2 features (recommended)
+patch_vllm_attention(k_bits=4, v_bits=3, norm_correction=True,
+                     sink_tokens=4, boundary_layers=5)
 ```
 
-Then start vLLM normally. The patch covers both standard FlashAttention (Qwen3, Llama, Mistral) and MLA attention (GLM-4.7-Flash, DeepSeek-V3) via `MLACommonImpl`.
+Phase 2 features: **norm correction** fixes magnitude shrinkage at low bit widths. **Sink tokens** keep the first 4 positions at FP16 (attention sinks get universal attention). **Boundary layers** give the first/last 5 layers K=8-bit precision (they carry more signal through the residual stream). Validated on Gemma 4 26B: token-for-token identical output to FP16 baseline at temperature=0.
+
+The patch covers both standard FlashAttention (Qwen3, Llama, Mistral) and MLA attention (GLM-4.7-Flash, DeepSeek-V3) via `MLACommonImpl`.
 
 ### Standalone compression (without vLLM)
 
@@ -154,14 +161,21 @@ If CUDA compilation fails, the system automatically falls back to PyTorch ops (s
 
 | Kernel | Purpose | Key operation |
 |--------|---------|---------------|
-| `tq_weight_dequant_kernel` | Weight decompression | Unpack indices → codebook lookup → inverse WHT butterfly in shared memory → rescale by group norm |
+| `tq_weight_dequant_kernel` | Weight decompression (CUDA) | Unpack indices → codebook lookup → warp-shuffle + shared memory WHT butterfly → rescale |
 
-Weight dequant is 6.3x faster than the PyTorch fallback path (0.36ms vs 2.28ms for 4096x4096 on H100). Supports 2-bit, 3-bit, and 4-bit with group sizes 64/128/256, fp16 and fp32 output. Automatically used when CUDA is available, with PyTorch fallback otherwise.
+**Triton fused dequant-GEMM** in `turboquant_vllm/triton_ops.py`:
 
-Note: this is a **dequant + separate cuBLAS GEMM** approach, not a fused dequant-GEMM like Marlin (used by AWQ/GPTQ). A fused kernel would match AWQ speed but is significantly more complex to implement. The current kernel makes weight compression practical for batch workloads where AWQ checkpoints are not available.
+| Kernel | Purpose | Key operation |
+|--------|---------|---------------|
+| `_tq_fused_gemm_kernel` | Fused weight dequant + matmul | Unpack → codebook → pre-computed rotation matrix → scale → GEMM accumulate |
+
+The fused Triton kernel is **10.5x faster** than separate dequant + cuBLAS GEMM (0.57ms vs 5.9ms for 4096×4096 on A100). It eliminates the intermediate decompressed weight buffer entirely. Uses a pre-computed rotation matrix (128×128 = 64 KB, computed once) instead of the WHT butterfly, turning the inverse rotation into a small matmul that Triton optimizes well.
+
+The CUDA kernel (5x faster than PyTorch) serves as fallback when Triton is unavailable. Uses warp-shuffle operations for intra-warp butterfly stages, shared memory only for cross-warp stages.
 
 Design choices:
-- **Walsh-Hadamard Transform** over dense rotation: O(d log d) vs O(d²). 896 FLOPs vs 16,384 for d=128. Fits entirely in shared memory.
+- **Three-tier dispatch**: Triton fused GEMM → CUDA dequant + cuBLAS → PyTorch fallback. Auto-selected based on availability.
+- **Walsh-Hadamard Transform** over dense rotation: O(d log d) vs O(d²). 896 FLOPs vs 16,384 for d=128.
 - **Separate K/V codebooks** in constant memory for asymmetric bit widths.
 - **Constant memory caching**: codebook and sign vectors only re-uploaded when config changes.
 - **4-bit packing**: two indices per byte, halves cache bandwidth.
@@ -189,35 +203,62 @@ At 32K context with 32 layers, 32 KV heads, head_dim=128 (typical for Qwen3-235B
 
 MLA models store a compressed latent vector (`kv_c_normed`) plus positional encoding (`k_pe`) instead of standard K/V. The patch compresses `kv_c_normed` with PolarQuant MSE-only and passes `k_pe` through uncompressed. Validated on GLM-4.7-Flash across 20 scenarios.
 
-## Weight quantization (experimental)
+## Weight compression
 
-The same WHT rotation + codebook math that compresses the KV cache can also compress **model weights**. Load any BF16 checkpoint, compress at startup, serve. No calibration data, no separate quantization step.
+The same WHT rotation + codebook math compresses model weights. Load any BF16 checkpoint, compress at startup, serve. No calibration data.
 
 ```python
 from turboquant_vllm import enable_weight_quantization
 
-enable_weight_quantization(bits=4, group_size=128)  # before loading model
-# Weights compressed at load time. Any BF16 model from HuggingFace works.
+enable_weight_quantization(bits=3)  # TQ3: best compression
+# or bits=4 for TQ4 (more conservative)
 ```
 
-Inspired by [@coffeecup2020's TQ3_1S implementation](https://github.com/turbo-tan/llama.cpp) for llama.cpp.
+Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026). Our implementation uses a Gaussian Lloyd-Max codebook as an approximation. Weight compression inspired by @coffeecup2020's TQ3_1S proof-of-concept for llama.cpp.
 
-### Results (Qwen3-30B on H100)
+### Results
 
-| | BF16 baseline | TQ4-g128 |
-|---|---|---|
-| **GPU memory** | **59.7 GB** | **16.8 GB** |
-| Peak during generation | | 26.3 GB |
-| Perplexity | 4.19 | 4.33 (+3.4%) |
-| Compression time | | 4 seconds |
-| Layers compressed | | 192 linear + 96 MoE expert |
+| Model | BF16 | TQ4 (4-bit) | TQ3 (3-bit) |
+|-------|------|-------------|-------------|
+| **Gemma 4 26B** | 52 GB | 15 GB (3.4x) | **12 GB (4.3x)** |
+| **Qwen3-30B** | 61 GB | 17 GB (3.6x) | **13 GB (4.6x)** |
 
-All test prompts produce coherent, factually correct output (capitals, code, multilingual, reasoning). Compresses both standard linear layers and MoE expert weights (3D tensors detected by shape).
+Gemma 4 TQ3 quality: **4.76/5** on 20 multi-turn conversation scenarios (scored by Llama-3.3-70B judge). Matches Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost.
 
-### Current limitations
+Speed on A100: TQ3 serves at **14-17 tok/s**, faster than BF16 (9-16 tok/s). Smaller weights need less memory bandwidth.
 
-- **Speed:** Weight decompression uses a fused CUDA kernel (6.3x faster than PyTorch fallback, 0.36ms per 4096x4096 layer on H100). Still slower than pre-quantized formats like AWQ/GPTQ which use fused dequant-GEMM kernels (Marlin). Current approach: decompress to fp16, then cuBLAS GEMM. Practical for batch workloads and models without pre-quantized checkpoints.
-- **3-bit:** TQ3 works on 30B models but degrades on smaller ones. TQ4 is the safe default.
+3-bit sub-byte packing: 8 indices per 3 bytes. Norm correction: stores `original_norm / reconstruction_norm` ratio per group to fix 5-10% magnitude shrinkage at 3-bit.
+
+### Limitations
+
+- **V100 16GB**: model loads (12 GB) but not enough room for KV cache. Minimum practical is 24 GB.
+- **TQ2 (2-bit)** destroys quality. 4 centroids too few for MLP weight distributions.
+
+## Expert pruning (REAP)
+
+Integrated [REAP](https://arxiv.org/abs/2510.13999) (Cerebras, ICLR 2026) saliency scoring for MoE expert pruning. Measures actual expert contribution during inference, not just weight magnitude.
+
+```python
+from turboquant_vllm.expert_pruning import reap_prune
+
+reap_prune(model, tokenizer, prune_fraction=0.2, num_samples=512)
+```
+
+20% pruning preserves quality on Qwen3-30B. 50% pruning degrades quality (works on larger models per REAP paper).
+
+## AWQ export
+
+Export TQ-compressed weights to AWQ format for Marlin serving speed:
+
+```python
+from turboquant_vllm.export import compress_and_export
+
+compress_and_export("google/gemma-4-26B-A4B-it", "./gemma4-awq", bits=4)
+# ~2 minutes total (TQ compress + AutoAWQ pack)
+# Serve with: vllm serve ./gemma4-awq --quantization awq
+```
+
+Requires [AutoAWQ](https://github.com/casper-hansen/AutoAWQ). Replaces hours of AWQ calibration with ~2 minutes.
 
 ### Combined with KV cache compression
 
@@ -284,9 +325,17 @@ Code: [containers/deploy.py](https://github.com/varjoranta/verda-model-bench/blo
 - **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent implementation of TurboQuant for vLLM by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths (required for quantized weight models), and vLLM paged cache integration. The PyPI package for this project will be published as `turboquant-plus-vllm` to avoid confusion.
 - **[turbo-quant-lite](https://pypi.org/project/turbo-quant-lite/)** — Numpy-only TurboQuant for embedding compression in databases. Same math, different codebook and use case.
 - **[turboquant_plus](https://github.com/TheTom/turboquant_plus)** — Research implementation of the KV cache algorithm. This package builds production CUDA kernels on top of that work.
-- **[TQ3_1S for llama.cpp](https://github.com/turbo-tan/llama.cpp)** — @coffeecup2020's proof-of-concept applying TurboQuant to model weights (not just KV cache). Achieved near-Q4_0 quality at 3.5-bit on Qwen3.5-27B. Inspired the weight quantization feature in this package.
-- **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh et al., 2025. The underlying algorithm.
+- **TQ3_1S for llama.cpp** — @coffeecup2020's proof-of-concept applying TurboQuant to model weights (not just KV cache). Achieved near-Q4_0 quality at 3.5-bit. Inspired the weight quantization feature in this package.
+- **[TurboQuant paper](https://arxiv.org/abs/2504.19874)** — Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026. The underlying algorithm.
+- **[REAP](https://arxiv.org/abs/2510.13999)** — Cerebras, ICLR 2026. Router-weighted expert pruning for MoE compression.
+- **[SpinQuant](https://arxiv.org/abs/2405.16406)** — Facebook Research, ICLR 2025. Learned rotation optimization (up to 45% improvement over fixed Hadamard). Our `learned_rotation.py` implements a simplified version.
+- **[SqueezeLLM](https://arxiv.org/abs/2306.07629)** — ICML 2024. Sensitivity-weighted codebooks and sparse outlier extraction. Influenced our research direction.
+- **[AutoAWQ](https://github.com/casper-hansen/AutoAWQ)** — AWQ quantization and packing library. Used in our AWQ export pipeline.
+
+## Development Process
+
+This library was developed with the help of [Spegling](https://spegl.ing), a personal knowledge system built at Varjosoft. Spegling maintains a persistent wiki compiled from research papers and production systems, integrates with coding agents via MCP, and governs autonomous research with documented provenance. The research for v0.3.0 (TQ3 compression, REAP pruning, fused kernels) was conducted through Spegling analyzing relevant papers, implementing approaches, running benchmarks on Verda GPU instances, and iterating based on results. Total GPU cost: ~$18.
 
 ## License
 
-MIT — Varjosoft Oy
+MIT, Varjosoft Oy

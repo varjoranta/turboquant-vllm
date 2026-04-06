@@ -55,6 +55,26 @@ __global__ void tq_weight_dequant_kernel(
     if constexpr (BITS == 4) {
         uint8_t byte = group_ptr[tid / 2];
         index = (tid & 1) ? (byte >> 4) & 0xF : byte & 0xF;
+    } else if constexpr (BITS == 3) {
+        // 3-bit sub-byte packing: 8 indices per 3 bytes (24 bits).
+        // Layout: byte0 = idx0|(idx1<<3)|(idx2[0:2]<<6)
+        //         byte1 = idx2[2]|(idx3<<1)|(idx4<<4)|(idx5[0:1]<<7)
+        //         byte2 = idx5[1:3]|(idx6<<2)|(idx7<<5)
+        int group_of_8 = tid / 8;
+        int pos_in_group = tid % 8;
+        const uint8_t* base = group_ptr + group_of_8 * 3;
+        uint8_t b0 = base[0], b1 = base[1], b2 = base[2];
+        switch (pos_in_group) {
+            case 0: index = b0 & 0x7; break;
+            case 1: index = (b0 >> 3) & 0x7; break;
+            case 2: index = ((b0 >> 6) | (b1 << 2)) & 0x7; break;
+            case 3: index = (b1 >> 1) & 0x7; break;
+            case 4: index = (b1 >> 4) & 0x7; break;
+            case 5: index = ((b1 >> 7) | (b2 << 1)) & 0x7; break;
+            case 6: index = (b2 >> 2) & 0x7; break;
+            case 7: index = (b2 >> 5) & 0x7; break;
+            default: index = 0;
+        }
     } else if constexpr (BITS == 2) {
         uint8_t byte = group_ptr[tid / 4];
         index = (byte >> ((tid & 3) * 2)) & 0x3;
@@ -65,25 +85,45 @@ __global__ void tq_weight_dequant_kernel(
     // Codebook lookup + apply sign vector D2
     float val = c_centroids[index] * c_signs2[tid];
 
-    // Inverse WHT butterfly in shared memory
-    smem[tid] = val;
-    __syncthreads();
+    // Inverse WHT butterfly: warp shuffles for intra-warp stages,
+    // shared memory only for cross-warp stages.
+    // For group_size=128: stages 0-4 use warp shuffles (h=1..16, pairs within warp),
+    // stages 5-6 use shared memory (h=32..64, pairs across warps).
+    // This eliminates ~10 __syncthreads() calls vs the pure shared memory approach.
 
+    constexpr int LOG2_WARP = 5;  // log2(32)
+    constexpr int NUM_STAGES = (GROUP_SIZE == 256) ? 8 : (GROUP_SIZE == 128) ? 7 : 6;
+
+    // Stages 0..LOG2_WARP-1: intra-warp butterfly via warp shuffles (no sync needed)
+    // __shfl_xor_sync(mask, val, h) returns val from thread (tid ^ h).
+    // For butterfly: lower half (bit h clear) gets a+b, upper half gets b-a.
     #pragma unroll
-    for (int stage = 0; stage < 8; stage++) {
-        if ((1 << stage) >= GROUP_SIZE) break;
+    for (int stage = 0; stage < LOG2_WARP && stage < NUM_STAGES; stage++) {
         int h = 1 << stage;
-        int pair = ((tid % (2 * h)) < h) ? (tid + h) : (tid - h);
-        float a = smem[tid];
-        float b = smem[pair];
+        float other = __shfl_xor_sync(0xFFFFFFFF, val, h);
+        val = (tid & h) ? (other - val) : (val + other);
+    }
+
+    // Stages LOG2_WARP..NUM_STAGES-1: cross-warp butterfly via shared memory
+    if constexpr (NUM_STAGES > LOG2_WARP) {
+        smem[tid] = val;
         __syncthreads();
-        // Lower half gets a+b, upper half gets lower-upper (a-b in Python convention)
-        smem[tid] = ((tid % (2 * h)) < h) ? (a + b) : (b - a);
-        __syncthreads();
+
+        #pragma unroll
+        for (int stage = LOG2_WARP; stage < NUM_STAGES; stage++) {
+            int h = 1 << stage;
+            int pair = ((tid % (2 * h)) < h) ? (tid + h) : (tid - h);
+            float a = smem[tid];
+            float b = smem[pair];
+            __syncthreads();
+            smem[tid] = ((tid % (2 * h)) < h) ? (a + b) : (b - a);
+            __syncthreads();
+        }
+        val = smem[tid];
     }
 
     // Normalize, apply D1, rescale by group norm
-    val = smem[tid] * rsqrtf((float)GROUP_SIZE) * c_signs1[tid]
+    val = val * rsqrtf((float)GROUP_SIZE) * c_signs1[tid]
         * norms[row * n_groups + group];
 
     // Write output
@@ -123,6 +163,7 @@ void tq_weight_dequant(
     int n_groups = (in_dim + group_size - 1) / group_size;
     int packed_group_bytes;
     if (bits == 4) packed_group_bytes = group_size / 2;
+    else if (bits == 3) packed_group_bytes = (group_size / 8) * 3;  // 8 indices per 3 bytes
     else if (bits == 2) packed_group_bytes = group_size / 4;
     else packed_group_bytes = group_size;
 
