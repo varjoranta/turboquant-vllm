@@ -17,6 +17,7 @@ All features can be combined for maximum memory savings.
 
 from turboquant_vllm.vllm_patch import patch_vllm_attention
 from turboquant_vllm.weight_quant import enable_weight_quantization
+from turboquant_vllm.checkpoint import load_tq3_model, save_tq3_checkpoint
 from turboquant_vllm.torch_ops import (
     KVCacheCompressorTorch,
     PolarQuantTorch,
@@ -27,6 +28,8 @@ from turboquant_vllm.torch_ops import (
 __all__ = [
     "patch_vllm_attention",
     "enable_weight_quantization",
+    "load_tq3_model",
+    "save_tq3_checkpoint",
     "KVCacheCompressorTorch",
     "PolarQuantTorch",
     "QJLTorch",

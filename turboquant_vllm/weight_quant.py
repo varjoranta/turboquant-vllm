@@ -209,6 +209,36 @@ class TurboQuantWrapper(nn.Module):
             bits, group_size, out_dim, in_dim, self._ratio,
         )
 
+    @classmethod
+    def from_packed(cls, packed_weight: torch.Tensor, norms: torch.Tensor,
+                    in_features: int, out_features: int,
+                    bits: int = 3, group_size: int = 128,
+                    bias: torch.Tensor | None = None):
+        """Create a TurboQuantWrapper from pre-packed data (native TQ3 checkpoint).
+
+        Skips compression — the packed indices and norms are used directly.
+        This enables loading native TQ3 checkpoints without decompressing to FP16.
+        """
+        wrapper = object.__new__(cls)
+        nn.Module.__init__(wrapper)
+        wrapper.bits = bits
+        wrapper.group_size = group_size
+        wrapper.in_features = in_features
+        wrapper.out_features = out_features
+        wrapper._has_learned_rotation = False
+        wrapper.padded_in = ((in_features + group_size - 1) // group_size) * group_size
+        wrapper.n_groups = wrapper.padded_in // group_size
+
+        wrapper.register_buffer("packed_weight", packed_weight)
+        wrapper.register_buffer("norms", norms)
+        wrapper.bias = nn.Parameter(bias) if bias is not None else None
+
+        original_bytes = out_features * in_features * 2  # FP16 equivalent
+        compressed_bytes = packed_weight.numel() + norms.numel() * norms.element_size()
+        wrapper._ratio = original_bytes / max(compressed_bytes, 1)
+
+        return wrapper
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         global _triton_available, _tq_fused_gemm_fn
 
@@ -312,6 +342,30 @@ class Compressed3D:
 
         self.original_bytes = data.numel() * data.element_size()
         self.compressed_bytes = self.packed.numel() + self.norms.numel() * 4
+
+    @classmethod
+    def from_packed(cls, packed: torch.Tensor, norms: torch.Tensor,
+                    shape: tuple[int, int, int], dtype: torch.dtype,
+                    bits: int = 3, group_size: int = 128):
+        """Create a Compressed3D from pre-packed data (native TQ3 checkpoint).
+
+        Skips compression — the packed indices and norms are used directly.
+        """
+        obj = object.__new__(cls)
+        n_experts, out_dim, in_dim = shape
+        obj.shape = shape
+        obj.dtype = dtype
+        obj.device = packed.device
+        obj.bits = bits
+        obj.group_size = group_size
+        obj.in_dim = in_dim
+        obj.padded_in = ((in_dim + group_size - 1) // group_size) * group_size
+        obj.n_groups = obj.padded_in // group_size
+        obj.packed = packed
+        obj.norms = norms
+        obj.original_bytes = n_experts * out_dim * in_dim * 2  # FP16
+        obj.compressed_bytes = packed.numel() + norms.numel() * 4
+        return obj
 
     def decompress(self, buf: torch.Tensor | None = None) -> torch.Tensor:
         """Decompress back to (num_experts, out_dim, in_dim) at original dtype.

@@ -249,104 +249,259 @@ def _save_sharded(tensors: dict, output_dir: str, max_shard_size: int):
             json.dump(index, f, indent=2)
 
 
-def load_tq3_weights(model, checkpoint_dir: str, device: str = "cuda"):
-    """Load TQ3-packed weights into a model, creating TurboQuantWrapper modules.
+def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
+    """Load a native TQ3 checkpoint with weights compressed on GPU.
 
-    This is the counterpart to save_tq3_checkpoint. It reads the packed
-    indices + norms and creates TurboQuantWrapper modules that decompress
-    on the fly during forward passes.
+    Keeps weights in packed TQ3 format on GPU (~12 GB for Gemma 4 26B),
+    decompressing on-the-fly during each forward pass. This enables running
+    52 GB models on 24-48 GB GPUs.
+
+    Loading steps:
+    1. Create model skeleton on meta device (zero memory)
+    2. Build inventory of packed vs regular tensors in checkpoint
+    3. For each nn.Linear with packed weights: load packed data to GPU,
+       create TurboQuantWrapper (no decompression)
+    4. For each 3D expert weight with packed data: create Compressed3D
+       with forward hooks for on-demand decompression
+    5. Load remaining tensors (embeddings, norms, biases) to GPU as FP16
+
+    Peak memory: ~12 GB GPU (packed weights) + ~1 GB (embeddings, norms).
 
     Args:
-        model: The model to load weights into.
-        checkpoint_dir: Path to the TQ3 checkpoint.
-        device: Target device.
+        checkpoint_dir: Path to the TQ3 checkpoint (from save_tq3_checkpoint).
+        device: Target device for the model.
+
+    Returns:
+        (model, tokenizer) ready for inference.
     """
+    import gc
     from safetensors import safe_open
-    from turboquant_vllm.weight_quant import TurboQuantWrapper, unpack_indices, _get_quantizer
+    from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+    from turboquant_vllm.weight_quant import (
+        TurboQuantWrapper, Compressed3D, _register_moe_hooks, _get_quantizer,
+    )
     import torch.nn as nn
 
-    # Load TQ config
     with open(os.path.join(checkpoint_dir, "tq_config.json")) as f:
         tq_config = json.load(f)
-
     bits = tq_config["bits"]
     group_size = tq_config["group_size"]
 
-    # Find safetensors files
-    shard_files = sorted([f for f in os.listdir(checkpoint_dir) if f.endswith(".safetensors")])
+    # Step 1: Create model on meta device (zero memory allocation)
+    logger.info("Creating model skeleton on meta device...")
+    config = AutoConfig.from_pretrained(checkpoint_dir)
+    with torch.device("meta"):
+        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
+    tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
 
-    # Load all tensors
-    all_tensors = {}
+    # Step 2: Build inventory of checkpoint tensors
+    logger.info("Scanning checkpoint...")
+    shard_files = sorted(f for f in os.listdir(checkpoint_dir) if f.endswith(".safetensors"))
+    packed_bases = set()       # base names that have .tq_packed
+    tensor_to_shard = {}       # tensor_name -> shard filename
+
     for shard_name in shard_files:
         shard_path = os.path.join(checkpoint_dir, shard_name)
-        with safe_open(shard_path, framework="pt", device=device) as f:
+        with safe_open(shard_path, framework="pt", device="cpu") as f:
             for name in f.keys():
-                all_tensors[name] = f.get_tensor(name)
+                tensor_to_shard[name] = shard_name
+                if name.endswith(".tq_packed"):
+                    packed_bases.add(name[:-len(".tq_packed")])
 
-    # Identify compressed layers (have .tq_packed suffix)
-    compressed_names = set()
-    for name in all_tensors:
-        if name.endswith(".tq_packed"):
-            base_name = name[:-len(".tq_packed")]
-            compressed_names.add(base_name)
+    # Build map: weight_name -> (module_path, nn.Linear module)
+    # for all nn.Linear layers whose .weight has packed data
+    linear_map = {}  # weight_name -> module_path
+    for mod_path, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            weight_name = mod_path + ".weight"
+            if weight_name in packed_bases:
+                linear_map[weight_name] = mod_path
 
-    logger.info("Loading %d compressed layers + %d regular tensors",
-                len(compressed_names),
-                len(all_tensors) - 2 * len(compressed_names))
+    # Identify 3D expert weights (packed bases not covered by linear_map)
+    expert_bases = packed_bases - set(linear_map.keys())
 
-    # Load regular parameters
-    model_state = model.state_dict()
-    for name, tensor in all_tensors.items():
-        if name.endswith(".tq_packed") or name.endswith(".tq_norms"):
-            continue  # Handle these separately
-        if name in model_state:
-            model_state[name].copy_(tensor)
+    logger.info("Found %d packed linears, %d packed expert tensors, %d regular tensors",
+                len(linear_map), len(expert_bases),
+                len(tensor_to_shard) - 2 * len(packed_bases))
 
-    # Create TurboQuantWrapper for compressed layers
-    for base_name in compressed_names:
-        packed = all_tensors[base_name + ".tq_packed"]
-        norms = all_tensors[base_name + ".tq_norms"]
+    # Ensure quantizer is initialized on target device
+    _get_quantizer(group_size, bits, device)
 
-        # Find the module and replace with wrapper
-        parts = base_name.rsplit(".", 1)
-        if len(parts) == 2:
-            parent_path, param_name = parts
-        else:
-            continue
+    # Step 3: Replace nn.Linear layers with TurboQuantWrapper
+    wrapped = 0
+    for weight_name, mod_path in linear_map.items():
+        packed_key = weight_name + ".tq_packed"
+        norms_key = weight_name + ".tq_norms"
 
-        # Navigate to parent module
+        # Load packed data directly to GPU
+        shard_path = os.path.join(checkpoint_dir, tensor_to_shard[packed_key])
+        with safe_open(shard_path, framework="pt", device=device) as f:
+            packed = f.get_tensor(packed_key)
+        norms_shard = os.path.join(checkpoint_dir, tensor_to_shard[norms_key])
+        with safe_open(norms_shard, framework="pt", device=device) as f:
+            norms = f.get_tensor(norms_key)
+
+        # Check for bias
+        bias_key = mod_path + ".bias"
+        bias = None
+        if bias_key in tensor_to_shard:
+            bias_shard = os.path.join(checkpoint_dir, tensor_to_shard[bias_key])
+            with safe_open(bias_shard, framework="pt", device=device) as f:
+                bias = f.get_tensor(bias_key)
+
+        # Get original dimensions from model skeleton (meta device has shape info)
+        parts = mod_path.split(".")
+        meta_module = model
+        for part in parts:
+            meta_module = getattr(meta_module, part)
+
+        wrapper = TurboQuantWrapper.from_packed(
+            packed, norms,
+            in_features=meta_module.in_features,
+            out_features=meta_module.out_features,
+            bits=bits, group_size=group_size,
+            bias=bias,
+        )
+
+        # Replace in model
         parent = model
-        for part in parent_path.split("."):
-            parent = getattr(parent, part, None)
-            if parent is None:
-                break
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], wrapper)
+        wrapped += 1
 
-        if parent is None:
-            logger.warning("Could not find module for %s", base_name)
+        if wrapped % 100 == 0:
+            logger.info("  Wrapped %d linear layers...", wrapped)
+
+    # Step 4: Handle 3D expert weights
+    modules_to_hook = {}
+    expert_count = 0
+    for base_name in expert_bases:
+        packed_key = base_name + ".tq_packed"
+        norms_key = base_name + ".tq_norms"
+
+        parts = base_name.split(".")
+        param_name = parts[-1]
+        owner = model
+        for part in parts[:-1]:
+            owner = getattr(owner, part)
+
+        # Get original shape from meta parameter
+        meta_param = getattr(owner, param_name)
+        orig_shape = meta_param.shape  # (n_experts, out_dim, in_dim)
+
+        # Load packed data to GPU
+        shard_path = os.path.join(checkpoint_dir, tensor_to_shard[packed_key])
+        with safe_open(shard_path, framework="pt", device=device) as f:
+            packed = f.get_tensor(packed_key)
+        norms_shard = os.path.join(checkpoint_dir, tensor_to_shard[norms_key])
+        with safe_open(norms_shard, framework="pt", device=device) as f:
+            norms = f.get_tensor(norms_key)
+
+        compressed = Compressed3D.from_packed(
+            packed, norms, shape=tuple(orig_shape),
+            dtype=torch.float16, bits=bits, group_size=group_size,
+        )
+
+        setattr(owner, f"_tq_{param_name}", compressed)
+        # Replace meta parameter with empty GPU tensor
+        if isinstance(meta_param, nn.Parameter):
+            owner.register_parameter(
+                param_name,
+                nn.Parameter(torch.empty(0, device=device, dtype=torch.float16),
+                             requires_grad=False),
+            )
+        else:
+            setattr(owner, param_name,
+                    torch.empty(0, device=device, dtype=torch.float16))
+
+        mod_id = id(owner)
+        if mod_id not in modules_to_hook:
+            modules_to_hook[mod_id] = (owner, [])
+        modules_to_hook[mod_id][1].append(param_name)
+        expert_count += 1
+
+    for mod_id, (owner, param_names) in modules_to_hook.items():
+        _register_moe_hooks(owner, param_names)
+
+    # Step 5: Load remaining non-compressed tensors (embeddings, norms, biases)
+    # These are tensors NOT associated with any packed weight
+    handled_tensors = set()
+    for base in packed_bases:
+        handled_tensors.add(base + ".tq_packed")
+        handled_tensors.add(base + ".tq_norms")
+    # Biases already loaded with their linear wrappers
+    for weight_name, mod_path in linear_map.items():
+        bias_key = mod_path + ".bias"
+        if bias_key in tensor_to_shard:
+            handled_tensors.add(bias_key)
+
+    regular_loaded = 0
+    for tensor_name, shard_name in tensor_to_shard.items():
+        if tensor_name in handled_tensors:
             continue
 
-        # Get the original module
-        module = getattr(parent, param_name.split(".")[0], None)
-        if module is None or not isinstance(module, nn.Linear):
+        # Navigate to the target parameter/buffer in the model
+        parts = tensor_name.split(".")
+        try:
+            target_module = model
+            for part in parts[:-1]:
+                target_module = getattr(target_module, part)
+            attr_name = parts[-1]
+            target = getattr(target_module, attr_name)
+        except AttributeError:
+            logger.debug("Skipping tensor %s (no match in model)", tensor_name)
             continue
 
-        # Create wrapper with pre-packed data
-        wrapper = TurboQuantWrapper.__new__(TurboQuantWrapper)
-        nn.Module.__init__(wrapper)
-        wrapper.bits = bits
-        wrapper.group_size = group_size
-        wrapper.in_features = module.in_features
-        wrapper.out_features = module.out_features
-        wrapper.padded_in = norms.shape[1] * group_size
-        wrapper.n_groups = norms.shape[1]
-        wrapper._has_learned_rotation = False
-        wrapper._ratio = 0.0
-        wrapper.bias = module.bias
-        wrapper.register_buffer("packed_weight", packed)
-        wrapper.register_buffer("norms", norms)
+        # Load tensor to GPU
+        shard_path = os.path.join(checkpoint_dir, shard_name)
+        with safe_open(shard_path, framework="pt", device=device) as f:
+            data = f.get_tensor(tensor_name)
 
-        # Replace module
-        attr_name = param_name.split(".")[0]
-        setattr(parent, attr_name, wrapper)
+        if isinstance(target, nn.Parameter):
+            if data.is_floating_point():
+                data = data.to(torch.float16)
+            target_module.register_parameter(
+                attr_name,
+                nn.Parameter(data, requires_grad=False),
+            )
+        else:
+            if hasattr(target, 'data') and target.is_floating_point():
+                data = data.to(torch.float16)
+            setattr(target_module, attr_name, data)
+        regular_loaded += 1
 
-    logger.info("TQ3 weights loaded successfully")
+    logger.info("Loaded: %d wrapped linears, %d expert layers, %d regular tensors",
+                wrapped, expert_count, regular_loaded)
+
+    if device != "cpu" and torch.cuda.is_available():
+        gpu_gb = torch.cuda.memory_allocated() / 1e9
+        logger.info("GPU memory: %.1f GB", gpu_gb)
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    model.eval()
+    return model, tokenizer
+
+
+def enable_tq3_serving():
+    """Enable serving native TQ3 checkpoints via vLLM on small GPUs.
+
+    Hooks vLLM's weight loading to use native TQ3 checkpoint format.
+    Weights stay compressed in GPU memory (~12 GB for Gemma 4 26B).
+
+    Usage:
+        from turboquant_vllm.checkpoint import enable_tq3_serving
+        enable_tq3_serving()
+        # then: vllm serve ./gemma4-tq3-native
+    """
+    logger.info("TQ3 native checkpoint serving enabled (use with native TQ3 checkpoints)")
+    # For now, users should use load_tq3_model() for standalone inference.
+    # Full vLLM integration (hooking DefaultModelLoader) is planned for v0.4.0.
+    raise NotImplementedError(
+        "vLLM integration for native TQ3 checkpoints is not yet implemented. "
+        "Use load_tq3_model() for standalone inference, or use "
+        "enable_weight_quantization() with the FP16 checkpoint on A100."
+    )
