@@ -256,7 +256,7 @@ save_tq3_checkpoint("google/gemma-4-26B-A4B-it", "./gemma4-tq3-native")
 
 - **V100 16GB**: model loads (12 GB) but not enough room for KV cache. Minimum practical is 24 GB.
 - **TQ2 (2-bit)** destroys quality. 4 centroids too few for MLP weight distributions.
-- **Native TQ3 inference speed** is limited by PyTorch-based expert decompression (CUDA 3D kernel optimization pending).
+- **Native TQ3 inference speed** is slower than runtime compression due to per-forward-pass decompression overhead.
 
 ## Expert pruning (REAP)
 
