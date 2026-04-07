@@ -384,12 +384,31 @@ class Compressed3D:
     def decompress(self, buf: torch.Tensor | None = None) -> torch.Tensor:
         """Decompress back to (num_experts, out_dim, in_dim) at original dtype.
 
-        Uses chunked decompression (8 experts at a time) to limit GPU memory.
+        Uses CUDA kernel when available (fast), falls back to chunked PyTorch
+        (8 experts at a time) to limit GPU memory.
         """
+        cuda_mod = _get_cuda_module()
         n_experts, out_dim, in_dim = self.shape
 
-        # Chunked: process 8 experts at a time to keep FP32 temporaries
-        # small (~0.5 GB per chunk vs ~8 GB all at once).
+        if cuda_mod is not None:
+            output_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
+            if buf is not None and buf.shape == (n_experts, out_dim, in_dim) and buf.dtype == output_dtype:
+                output = buf
+            else:
+                output = torch.empty(n_experts, out_dim, in_dim,
+                                     dtype=output_dtype, device=self.packed.device)
+            quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
+            cuda_mod.weight_dequant_3d(
+                self.packed, self.norms,
+                quantizer.signs1, quantizer.signs2,
+                quantizer.centroids,
+                output,
+                self.group_size, self.bits,
+                n_experts, out_dim, in_dim,
+            )
+            return output.to(self.dtype)
+
+        # Fallback: chunked PyTorch (8 experts at a time)
         output_dtype = self.dtype
         if buf is not None and buf.shape == (n_experts, out_dim, in_dim):
             output = buf
