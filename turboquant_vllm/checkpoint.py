@@ -291,7 +291,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     logger.info("Creating model skeleton on meta device...")
     config = AutoConfig.from_pretrained(checkpoint_dir)
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.float16)
+        model = AutoModelForCausalLM.from_config(config, dtype=torch.float16)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint_dir)
 
     # Step 2: Build inventory of checkpoint tensors
@@ -474,6 +474,47 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     logger.info("Loaded: %d wrapped linears, %d expert layers, %d regular tensors",
                 wrapped, expert_count, regular_loaded)
 
+    # Step 6: Materialize any remaining meta-device tensors.
+    # Some models have computed buffers (e.g., embed_scale, inv_freq) that
+    # are created during __init__ but not saved in the checkpoint. These
+    # are still on meta device and need to be re-created on the target device.
+    meta_fixed = 0
+    for name, param in list(model.named_parameters()):
+        if param.device == torch.device("meta"):
+            # Re-initialize with zeros on target device
+            new_param = nn.Parameter(
+                torch.zeros(param.shape, dtype=param.dtype, device=device),
+                requires_grad=False,
+            )
+            parts = name.split(".")
+            target_module = model
+            for part in parts[:-1]:
+                target_module = getattr(target_module, part)
+            target_module.register_parameter(parts[-1], new_param)
+            meta_fixed += 1
+
+    for name, buf in list(model.named_buffers()):
+        if buf.device == torch.device("meta"):
+            # Re-create buffer on target device
+            parts = name.split(".")
+            target_module = model
+            for part in parts[:-1]:
+                target_module = getattr(target_module, part)
+            attr_name = parts[-1]
+
+            # Try to re-compute the buffer by calling the module's reset method
+            # or just create a zero tensor with the right shape/dtype
+            new_buf = torch.zeros(buf.shape, dtype=buf.dtype, device=device)
+            target_module.register_buffer(attr_name, new_buf)
+            meta_fixed += 1
+
+    if meta_fixed > 0:
+        logger.info("Materialized %d meta-device tensors", meta_fixed)
+
+    # Re-initialize computed buffers that depend on config values.
+    # Gemma models have embed_scale = sqrt(hidden_size) and rotary inv_freq.
+    _reinit_computed_buffers(model, config, device)
+
     if device != "cpu" and torch.cuda.is_available():
         gpu_gb = torch.cuda.memory_allocated() / 1e9
         logger.info("GPU memory: %.1f GB", gpu_gb)
@@ -484,6 +525,43 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
 
     model.eval()
     return model, tokenizer
+
+
+def _reinit_computed_buffers(model, config, device):
+    """Re-initialize computed buffers that aren't stored in checkpoints.
+
+    These are values computed from config during __init__, like:
+    - embed_scale: sqrt(hidden_size) for Gemma models
+    - inv_freq: rotary embedding frequencies
+    """
+    import math
+
+    # Fix embed_scale for Gemma models
+    hidden_size = getattr(config, 'hidden_size', None)
+    if hidden_size:
+        for name, module in model.named_modules():
+            if hasattr(module, 'embed_scale'):
+                scale = getattr(module, 'embed_scale')
+                if isinstance(scale, torch.Tensor) and (scale.device == torch.device("meta") or scale.item() == 0):
+                    new_scale = torch.tensor(
+                        math.sqrt(hidden_size), dtype=torch.float32, device=device
+                    )
+                    module.embed_scale = new_scale
+
+    # Fix rotary embedding inv_freq
+    for name, module in model.named_modules():
+        if hasattr(module, 'inv_freq'):
+            inv_freq = module.inv_freq
+            if isinstance(inv_freq, torch.Tensor) and inv_freq.device == torch.device("meta"):
+                # Recompute from config
+                head_dim = getattr(config, 'head_dim', None) or (
+                    hidden_size // getattr(config, 'num_attention_heads', 1)
+                )
+                rope_theta = getattr(config, 'rope_theta', 10000.0)
+                new_inv_freq = 1.0 / (rope_theta ** (
+                    torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim
+                ))
+                module.register_buffer('inv_freq', new_inv_freq)
 
 
 def enable_tq3_serving():
