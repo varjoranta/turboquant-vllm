@@ -145,20 +145,25 @@ if HAS_TRITON:
 
 def _build_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor,
                            group_size: int) -> torch.Tensor:
-    """Pre-compute W_rot = D1 @ H @ D2 / sqrt(n).
+    """Pre-compute inverse rotation matrix W_rot = H @ D2 @ D1 / sqrt(n).
+
+    Row i is the rotated basis vector i. Used by:
+    - dequant-GEMM: centroid_vec @ W_rot (weight-side inverse rotation)
+    - FWHT-on-input: x @ W_rot.T (input-side forward rotation, transposed)
+    - learned_rotation: initial R for Cayley optimization
 
     Computed once per (signs1, signs2, group_size) and cached.
-    128×128 = 64 KB — trivial memory cost.
+    128x128 = 64 KB -- trivial memory cost.
     """
     from turboquant_vllm.torch_ops import _fast_wht_batch
 
     n = group_size
     eye = torch.eye(n, device=signs1.device, dtype=torch.float32)
 
-    # Inverse rotation: D2 → H → D1
-    rotated = eye * signs2.unsqueeze(0)
-    rotated = _fast_wht_batch(rotated)
-    rotated = rotated * signs1.unsqueeze(0)
+    # Apply inverse rotation to identity rows: D2 -> H -> scale by D1
+    rotated = eye * signs2.unsqueeze(0)      # right-multiply by D2
+    rotated = _fast_wht_batch(rotated)       # H @ D2
+    rotated = rotated * signs1.unsqueeze(0)  # column-wise D1: H @ D2 @ D1
 
     return rotated
 
@@ -205,15 +210,8 @@ def tq_fused_gemm(
         # Fall back to non-fused path for layers with padding mismatch
         raise ValueError(f"K={K} not aligned with group_size={group_size}, n_groups={n_groups}")
 
-    # Cache rotation matrix (keyed by tensor identity, not data_ptr which
-    # can be reused after deallocation)
-    cache_key = (id(signs1), id(signs2), group_size)
-    if not hasattr(tq_fused_gemm, '_rot_cache'):
-        tq_fused_gemm._rot_cache = {}
-    if cache_key not in tq_fused_gemm._rot_cache:
-        tq_fused_gemm._rot_cache[cache_key] = _build_rotation_matrix(
-            signs1, signs2, group_size).contiguous()
-    w_rot = tq_fused_gemm._rot_cache[cache_key]
+    # Shared rotation matrix cache (also used by rotate_input / FWHT-on-input)
+    w_rot = _get_cached_rotation_matrix(signs1, signs2, group_size)
 
     output = torch.empty(M, N, dtype=x.dtype, device=x.device)
 
@@ -266,17 +264,21 @@ def tq_fused_gemm(
 #
 # The rotation moves from N weight rows to 1 input vector.
 
-_hadamard_cache: dict[tuple, torch.Tensor] = {}
+_rotation_matrix_cache: dict[tuple, torch.Tensor] = {}
 
 
-def _get_hadamard_matrix(n: int, device) -> torch.Tensor:
-    """Get cached normalized Hadamard matrix H (n x n). H @ H = I."""
-    key = (n, str(device))
-    if key not in _hadamard_cache:
-        from turboquant_vllm.torch_ops import _fast_wht_batch
-        eye = torch.eye(n, device=device, dtype=torch.float32)
-        _hadamard_cache[key] = _fast_wht_batch(eye).contiguous()
-    return _hadamard_cache[key]
+def _get_cached_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor,
+                                group_size: int) -> torch.Tensor:
+    """Get cached rotation matrix for (signs1, signs2, group_size).
+
+    Keyed by tensor identity (id) since sign vectors are long-lived module
+    attributes. Returns W_rot such that W_rot.T applies the forward rotation.
+    """
+    key = (id(signs1), id(signs2), group_size)
+    if key not in _rotation_matrix_cache:
+        _rotation_matrix_cache[key] = _build_rotation_matrix(
+            signs1, signs2, group_size).contiguous()
+    return _rotation_matrix_cache[key]
 
 
 class FWHTInputCache:
@@ -284,29 +286,41 @@ class FWHTInputCache:
 
     Saves ~67% of FWHT calls in a standard attention block.
     Clear between model forward passes via a pre-hook.
+
+    Identity check uses data_ptr + storage data_ptr + shape to avoid
+    false hits from recycled pointers or same-shape different tensors.
     """
 
     def __init__(self):
         self._ptr: int = -1
+        self._storage_ptr: int = -1
         self._shape: tuple = ()
         self._result: torch.Tensor | None = None
 
     def get(self, x: torch.Tensor) -> torch.Tensor | None:
-        if x.data_ptr() == self._ptr and x.shape == self._shape:
+        if (x.data_ptr() == self._ptr
+                and x.untyped_storage().data_ptr() == self._storage_ptr
+                and x.shape == self._shape):
             return self._result
         return None
 
     def put(self, x: torch.Tensor, result: torch.Tensor):
         self._ptr = x.data_ptr()
+        self._storage_ptr = x.untyped_storage().data_ptr()
         self._shape = x.shape
         self._result = result
 
     def clear(self):
         self._ptr = -1
+        self._storage_ptr = -1
+        self._shape = ()
+        result = self._result
         self._result = None
+        del result
 
 
-# Global cache instance
+# Default cache instance. For multi-model setups, pass a per-model
+# FWHTInputCache to tq_fwht_input_gemm(..., cache=my_cache) instead.
 _fwht_input_cache = FWHTInputCache()
 
 
@@ -316,9 +330,13 @@ def rotate_input(
     signs2: torch.Tensor,
     group_size: int,
 ) -> torch.Tensor:
-    """Apply D2 @ H @ D1 to each group of the input. Returns (batch, in_f_padded).
+    """Apply forward rotation (D2 @ H @ D1) to each group of the input.
 
-    Uses matmul FWHT (1 kernel launch) instead of butterfly (log2 launches).
+    Returns (batch, in_f_padded). Uses matmul with the cached rotation matrix
+    (1 kernel launch per group) instead of butterfly WHT (log2 launches).
+
+    This is the transpose of _build_rotation_matrix, which encodes the inverse
+    rotation. The identity: x @ W_rot.T = D2 @ H @ D1 @ x.
     """
     batch = x.shape[0]
     K = x.shape[1]
@@ -327,13 +345,11 @@ def rotate_input(
     if padded_K > K:
         x = torch.nn.functional.pad(x, (0, padded_K - K))
 
-    H = _get_hadamard_matrix(group_size, x.device)
+    # W_rot encodes inverse rotation; transpose gives forward rotation
+    w_rot = _get_cached_rotation_matrix(signs1, signs2, group_size)
 
-    # Reshape to (batch * n_groups, group_size)
     x_grouped = x.reshape(-1, group_size)
-    x_grouped = x_grouped * signs1                    # D1
-    x_grouped = torch.matmul(x_grouped, H)            # H (matmul, 1 kernel)
-    x_grouped = x_grouped * signs2                    # D2
+    x_grouped = torch.matmul(x_grouped, w_rot.T)
 
     return x_grouped.reshape(batch, padded_K)
 
@@ -401,6 +417,9 @@ if HAS_TRITON:
             x_tile = tl.load(x_rot_ptr + x_ptrs, mask=mask_m[:, None], other=0.0)
 
             # Load and unpack codes: (BLOCK_N, BLOCK_K)
+            # NOTE: unpack logic mirrors _tq_fused_gemm_kernel. Triton @jit
+            # doesn't support shared helper functions, so the duplication is
+            # unavoidable. Keep the two in sync when changing bit-packing.
             if BITS == 4:
                 byte_idx = offs_k // 2
                 is_hi = offs_k % 2
@@ -452,6 +471,7 @@ def tq_fwht_input_gemm(
     group_size: int = 128,
     bits: int = 4,
     bias: torch.Tensor | None = None,
+    cache: FWHTInputCache | None = None,
 ) -> torch.Tensor:
     """FWHT-on-input fused GEMM. Rotates input once, then codebook dot product.
 
@@ -459,6 +479,11 @@ def tq_fwht_input_gemm(
     - FWHT applied to input (1 vector) not weights (N rows)
     - No intermediate decompressed weight buffer
     - FWHT cacheable across Q/K/V projections (67% cache hit rate)
+
+    Args:
+        cache: Optional per-model FWHTInputCache. Defaults to the global
+               singleton. Pass a dedicated instance for multi-model or
+               multi-threaded inference to avoid stale cache hits.
     """
     if not HAS_TRITON:
         raise ImportError("Triton required")
@@ -472,20 +497,16 @@ def tq_fwht_input_gemm(
     n_groups = norms.shape[1]
 
     padded_K = n_groups * group_size
-    if K != padded_K and K % group_size != 0:
-        raise ValueError(f"K={K} not aligned with group_size={group_size}")
+    if K != padded_K:
+        raise ValueError(f"K={K} not aligned with group_size={group_size}, expected {padded_K}")
 
-    # Step 1: Rotate input (check cache first)
-    cached = _fwht_input_cache.get(x)
+    input_cache = cache if cache is not None else _fwht_input_cache
+    cached = input_cache.get(x)
     if cached is not None:
         x_rot = cached
     else:
         x_rot = rotate_input(x.float(), signs1, signs2, group_size)
-        _fwht_input_cache.put(x, x_rot)
-
-    # Pre-scale centroids by 1/sqrt(group_size) if not already done
-    # (This matches the WHT normalization factor)
-    # Actually, our norms already include all scaling. Centroids are raw.
+        input_cache.put(x, x_rot)
 
     output = torch.empty(M, N, dtype=x.dtype, device=x.device)
 

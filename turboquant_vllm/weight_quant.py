@@ -268,37 +268,32 @@ class TurboQuantWrapper(nn.Module):
             except (ImportError, Exception):
                 _triton_available = False
 
-        if _triton_available and x.is_cuda:
+        if _triton_available and x.is_cuda and self.bits != 3:
             quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
 
-            # Fastest path: FWHT on input + fused codebook dot product
-            # Rotates input once (cacheable across Q/K/V), no weight decompression.
-            # Supports TQ2 and TQ4 (not TQ3 sub-byte packing yet in the kernel).
-            if self.bits != 3:
-                try:
-                    return _tq_fwht_input_fn(
-                        x, self.packed_weight, self.norms,
-                        quantizer.signs1, quantizer.signs2, quantizer.centroids,
-                        group_size=self.group_size, bits=self.bits, bias=self.bias,
-                    )
-                except (ValueError, RuntimeError):
-                    pass
+            # FWHT on input + fused codebook dot product (no weight decompression)
+            try:
+                return _tq_fwht_input_fn(
+                    x, self.packed_weight, self.norms,
+                    quantizer.signs1, quantizer.signs2, quantizer.centroids,
+                    group_size=self.group_size, bits=self.bits, bias=self.bias,
+                )
+            except (ValueError, RuntimeError):
+                pass
 
-            # Fallback Triton: fused dequant-GEMM (decompresses weights, but single kernel)
-            if self.bits != 3:
-                try:
-                    return _tq_fused_gemm_fn(
-                        x, self.packed_weight, self.norms,
-                        quantizer.signs1, quantizer.signs2, quantizer.centroids,
-                        group_size=self.group_size, bits=self.bits, bias=self.bias,
-                    )
-                except (ValueError, RuntimeError):
-                    pass
+            # Fused dequant-GEMM (decompresses weights in single kernel)
+            try:
+                return _tq_fused_gemm_fn(
+                    x, self.packed_weight, self.norms,
+                    quantizer.signs1, quantizer.signs2, quantizer.centroids,
+                    group_size=self.group_size, bits=self.bits, bias=self.bias,
+                )
+            except (ValueError, RuntimeError):
+                pass
 
         cuda_mod = _get_cuda_module()
 
         if cuda_mod is not None:
-            # CUDA dequant kernel + cuBLAS GEMM (intermediate buffer)
             output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
             w_deq = torch.empty(self.out_features, self.in_features,
                                 dtype=output_dtype, device=x.device)
@@ -313,7 +308,6 @@ class TurboQuantWrapper(nn.Module):
                 self.out_features, self.in_features,
             )
         else:
-            # Fallback: PyTorch dequant
             indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
             norms_flat = self.norms.reshape(-1)
 

@@ -69,17 +69,15 @@ def optimize_rotation(
     device = weight_groups.device
 
     # Initialize with WHT-like rotation (our current approach)
-    from turboquant_vllm.torch_ops import _fast_wht_batch, optimal_centroids
+    from turboquant_vllm.torch_ops import optimal_centroids
+    from turboquant_vllm.triton_ops import _build_rotation_matrix
 
     gen = torch.Generator(device="cpu").manual_seed(seed)
     signs1 = (torch.randint(0, 2, (n,), generator=gen) * 2 - 1).float().to(device)
     signs2 = (torch.randint(0, 2, (n,), generator=gen) * 2 - 1).float().to(device)
 
-    # Build initial rotation matrix from WHT
-    eye = torch.eye(n, device=device, dtype=torch.float32)
-    R_init = (eye * signs2.unsqueeze(0))
-    R_init = _fast_wht_batch(R_init)
-    R_init = R_init * signs1.unsqueeze(0)
+    # Build initial rotation matrix from WHT (shared helper with triton_ops)
+    R_init = _build_rotation_matrix(signs1, signs2, n)
 
     # Codebook for target bit width
     centroids = torch.tensor(optimal_centroids(bits, n), device=device, dtype=torch.float32)
