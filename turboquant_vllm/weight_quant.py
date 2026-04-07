@@ -270,26 +270,22 @@ class TurboQuantWrapper(nn.Module):
 
         if _triton_available and x.is_cuda and self.bits != 3:
             quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
+            args = (x, self.packed_weight, self.norms,
+                    quantizer.signs1, quantizer.signs2, quantizer.centroids)
+            kwargs = dict(group_size=self.group_size, bits=self.bits, bias=self.bias)
 
-            # FWHT on input + fused codebook dot product (no weight decompression)
+            # FWHT-on-input wins for large output dims (saves N inverse rotations).
+            # Dequant-GEMM wins for small layers (lower fixed overhead).
+            # Crossover ~4K output features on H100.
+            primary = _tq_fwht_input_fn if self.out_features >= 4096 else _tq_fused_gemm_fn
+            fallback = _tq_fused_gemm_fn if self.out_features >= 4096 else _tq_fwht_input_fn
             try:
-                return _tq_fwht_input_fn(
-                    x, self.packed_weight, self.norms,
-                    quantizer.signs1, quantizer.signs2, quantizer.centroids,
-                    group_size=self.group_size, bits=self.bits, bias=self.bias,
-                )
+                return primary(*args, **kwargs)
             except (ValueError, RuntimeError):
-                pass
-
-            # Fused dequant-GEMM (decompresses weights in single kernel)
-            try:
-                return _tq_fused_gemm_fn(
-                    x, self.packed_weight, self.norms,
-                    quantizer.signs1, quantizer.signs2, quantizer.centroids,
-                    group_size=self.group_size, bits=self.bits, bias=self.bias,
-                )
-            except (ValueError, RuntimeError):
-                pass
+                try:
+                    return fallback(*args, **kwargs)
+                except (ValueError, RuntimeError):
+                    pass
 
         cuda_mod = _get_cuda_module()
 
