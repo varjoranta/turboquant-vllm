@@ -268,7 +268,7 @@ class TurboQuantWrapper(nn.Module):
             except (ImportError, Exception):
                 _triton_available = False
 
-        if _triton_available and x.is_cuda and self.bits != 3:
+        if _triton_available and x.is_cuda:
             quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
             args = (x, self.packed_weight, self.norms,
                     quantizer.signs1, quantizer.signs2, quantizer.centroids)

@@ -424,6 +424,27 @@ if HAS_TRITON:
                 code_ptrs = packed_row[:, None] * stride_cn + byte_idx[None, :] * stride_ck
                 packed = tl.load(codes_ptr + code_ptrs, mask=mask_n[:, None], other=0).to(tl.int32)
                 codes = tl.where(is_hi[None, :] > 0, (packed >> 4) & 0xF, packed & 0xF)
+            elif BITS == 3:
+                # 3-bit sub-byte: 8 indices per 3 bytes (24 bits).
+                # For position k: bit_offset = (k%8)*3, spans 1-2 bytes.
+                group_of_8 = offs_k // 8
+                pos_in_8 = offs_k % 8
+                bit_off_in_3 = pos_in_8 * 3  # 0,3,6,9,12,15,18,21
+                first_byte = bit_off_in_3 // 8  # 0,0,0,1,1,1,2,2
+                bit_in_byte = (bit_off_in_3 % 8).to(tl.int32)
+                crosses = bit_in_byte > 5  # True for pos 2 (bit=6) and 5 (bit=7)
+
+                byte_idx0 = group_of_8 * 3 + first_byte
+                byte_idx1 = byte_idx0 + 1
+
+                ptrs0 = packed_row[:, None] * stride_cn + byte_idx0[None, :] * stride_ck
+                b0 = tl.load(codes_ptr + ptrs0, mask=mask_n[:, None], other=0).to(tl.int32)
+                ptrs1 = packed_row[:, None] * stride_cn + byte_idx1[None, :] * stride_ck
+                b1 = tl.load(codes_ptr + ptrs1, mask=mask_n[:, None], other=0).to(tl.int32)
+
+                single = (b0 >> bit_in_byte[None, :]) & 0x7
+                cross = ((b0 >> bit_in_byte[None, :]) | (b1 << (8 - bit_in_byte[None, :]))) & 0x7
+                codes = tl.where(crosses[None, :], cross, single)
             elif BITS == 2:
                 byte_idx = offs_k // 4
                 shift = (offs_k % 4).to(tl.int32) * 2
