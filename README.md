@@ -239,7 +239,7 @@ Runtime compression (`enable_weight_quantization`) needs the full BF16 checkpoin
 ```python
 from turboquant_vllm import load_tq3_model
 
-# 12 GB checkpoint → 13.5 GB GPU memory, ~12 seconds
+# 12 GB checkpoint → 13.7 GB GPU peak, tested on L40S 48GB and H100 80GB
 model, tokenizer = load_tq3_model("varjosoft/gemma-4-26B-A4B-it-TQ3-native")
 output = model.generate(...)
 ```
