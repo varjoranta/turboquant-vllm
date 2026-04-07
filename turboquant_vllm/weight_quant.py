@@ -396,12 +396,39 @@ class Compressed3D:
             )
             return output.to(self.dtype)
         else:
-            indices = unpack_indices(self.packed, self.bits, self.group_size)
-            norms_flat = self.norms.reshape(-1)
+            # Chunked decompression to limit peak GPU memory.
+            # Process a few experts at a time instead of all at once,
+            # so FP32 temporaries stay small (~0.5 GB per chunk vs ~8 GB all at once).
+            output_dtype = self.dtype
+            if buf is not None and buf.shape == (n_experts, out_dim, in_dim):
+                output = buf
+            else:
+                output = torch.empty(n_experts, out_dim, in_dim,
+                                     dtype=output_dtype, device=self.packed.device)
+
             quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
-            groups = quantizer.dequantize(indices, norms_flat)
-            result = groups.reshape(-1, self.padded_in)[:, :self.in_dim]
-            return result.reshape(self.shape).to(self.dtype)
+            rows_per_expert = out_dim
+            chunk_experts = max(1, min(8, n_experts))  # 8 experts per chunk
+
+            for start in range(0, n_experts, chunk_experts):
+                end = min(start + chunk_experts, n_experts)
+                start_row = start * rows_per_expert
+                end_row = end * rows_per_expert
+
+                chunk_packed = self.packed[start_row:end_row]
+                chunk_norms = self.norms[start_row:end_row]
+
+                chunk_idx = unpack_indices(chunk_packed, self.bits, self.group_size)
+                chunk_groups = quantizer.dequantize(chunk_idx, chunk_norms.reshape(-1))
+                del chunk_idx
+
+                chunk_result = chunk_groups.reshape(-1, self.padded_in)[:, :self.in_dim]
+                output[start:end] = chunk_result.reshape(
+                    end - start, out_dim, in_dim
+                ).to(output_dtype)
+                del chunk_groups, chunk_result
+
+            return output
 
     @property
     def ratio(self) -> float:
