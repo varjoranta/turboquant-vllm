@@ -583,7 +583,12 @@ def _reinit_computed_buffers(model, config, device):
     import math
 
     # Fix embed_scale for Gemma models
+    # Handle nested configs (e.g., Gemma4Config has text_config.hidden_size)
     hidden_size = getattr(config, 'hidden_size', None)
+    if hidden_size is None:
+        text_config = getattr(config, 'text_config', None)
+        if text_config is not None:
+            hidden_size = getattr(text_config, 'hidden_size', None)
     if hidden_size:
         for name, module in model.named_modules():
             if hasattr(module, 'embed_scale'):
@@ -595,15 +600,16 @@ def _reinit_computed_buffers(model, config, device):
                     module.embed_scale = new_scale
 
     # Fix rotary embedding inv_freq
+    # Use text_config for nested configs (multimodal models)
+    rope_config = text_config if text_config is not None else config
     for name, module in model.named_modules():
         if hasattr(module, 'inv_freq'):
             inv_freq = module.inv_freq
             if isinstance(inv_freq, torch.Tensor) and inv_freq.device == torch.device("meta"):
-                # Recompute from config
-                head_dim = getattr(config, 'head_dim', None) or (
-                    hidden_size // getattr(config, 'num_attention_heads', 1)
+                head_dim = getattr(rope_config, 'head_dim', None) or (
+                    hidden_size // getattr(rope_config, 'num_attention_heads', 1)
                 )
-                rope_theta = getattr(config, 'rope_theta', 10000.0)
+                rope_theta = getattr(rope_config, 'rope_theta', 10000.0)
                 new_inv_freq = 1.0 / (rope_theta ** (
                     torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim
                 ))
