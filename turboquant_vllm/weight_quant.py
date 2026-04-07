@@ -14,6 +14,8 @@ scales) showing TurboQuant weight compression achieves near-Q4_0 quality.
 """
 
 import logging
+import os
+
 import torch
 import torch.nn as nn
 
@@ -755,6 +757,25 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
     return total
 
 
+def patch_vllm_loader(**replace_kwargs) -> None:
+    """Monkey-patch vLLM's process_weights_after_loading to call _replace_linear_layers.
+
+    Wraps the original function so that after normal weight loading,
+    _replace_linear_layers is called with the given keyword arguments.
+
+    Raises ImportError if vLLM is not installed.
+    """
+    import vllm.model_executor.model_loader.utils as loader_utils
+
+    _original = loader_utils.process_weights_after_loading
+
+    def patched_process_weights(model, model_config, target_device):
+        _original(model, model_config, target_device)
+        _replace_linear_layers(model, **replace_kwargs)
+
+    loader_utils.process_weights_after_loading = patched_process_weights
+
+
 def enable_weight_quantization(bits: int = 3, group_size: int = 128,
                                 min_layer_size: int = 1024, kurtosis_aware: bool = False,
                                 prune_experts: float = 0.0, routed_expert_bits: int | None = None):
@@ -773,32 +794,22 @@ def enable_weight_quantization(bits: int = 3, group_size: int = 128,
         routed_expert_bits: Override bit width for routed expert weights.
             Set to 2 for aggressive compression (viable for routed experts).
     """
-    import os
     assert 2 <= bits <= 8, f"bits must be 2-8, got {bits}"
     assert group_size in (64, 128, 256), f"group_size must be 64/128/256, got {group_size}"
     assert 0.0 <= prune_experts < 1.0, f"prune_experts must be 0.0-1.0, got {prune_experts}"
 
-    # Set env vars so the vLLM plugin can re-apply in spawned subprocesses (V1 engine).
-    # The plugin (turboquant_vllm._vllm_plugin) is loaded by vLLM's plugin system
-    # in every process and checks these vars.
     os.environ["TQ_WEIGHT_BITS"] = str(bits)
     os.environ["TQ_WEIGHT_GROUP_SIZE"] = str(group_size)
 
     try:
-        from vllm.model_executor.model_loader.utils import process_weights_after_loading as _original_process
+        patch_vllm_loader(
+            bits=bits, group_size=group_size, min_size=min_layer_size,
+            kurtosis_aware=kurtosis_aware, prune_experts=prune_experts,
+            routed_expert_bits=routed_expert_bits,
+        )
     except ImportError:
         logger.error("Cannot import vLLM model loader. Is vLLM installed?")
         raise
-
-    def patched_process_weights(model, model_config, target_device):
-        _original_process(model, model_config, target_device)
-        _replace_linear_layers(model, bits=bits, group_size=group_size,
-                                min_size=min_layer_size, kurtosis_aware=kurtosis_aware,
-                                prune_experts=prune_experts,
-                                routed_expert_bits=routed_expert_bits)
-
-    import vllm.model_executor.model_loader.utils as loader_utils
-    loader_utils.process_weights_after_loading = patched_process_weights
 
     prune_msg = f", {prune_experts*100:.0f}% expert pruning" if prune_experts > 0 else ""
     expert_msg = f", routed@TQ{routed_expert_bits}" if routed_expert_bits else ""
@@ -830,8 +841,6 @@ def save_compressed_checkpoint(
         bits: Quantization bits (3 or 4).
         group_size: Group size (128).
     """
-    import os
-
     logger.info("Loading %s to CPU for compression...", model_id)
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -841,7 +850,6 @@ def save_compressed_checkpoint(
     )
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    # Compress each linear layer on CPU
     quantizer = _get_quantizer(group_size, bits, "cpu")
     compressed_count = 0
 
@@ -876,7 +884,6 @@ def save_compressed_checkpoint(
 
     logger.info("Compressed %d layers on CPU", compressed_count)
 
-    # Convert to FP16 (halves checkpoint size, fits on 48 GB GPUs)
     for param in model.parameters():
         param.data = param.data.half()
     for buf_name, buf in model.named_buffers():
@@ -884,12 +891,10 @@ def save_compressed_checkpoint(
             buf.data = buf.data.half()
     model.config.torch_dtype = "float16"
 
-    # Save
     os.makedirs(output_dir, exist_ok=True)
     model.save_pretrained(output_dir, safe_serialization=True)
     tokenizer.save_pretrained(output_dir)
 
-    # Calculate size
     total_size = sum(
         os.path.getsize(os.path.join(output_dir, f))
         for f in os.listdir(output_dir)

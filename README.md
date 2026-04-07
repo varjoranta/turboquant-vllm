@@ -212,7 +212,10 @@ from turboquant_vllm import enable_weight_quantization
 
 enable_weight_quantization(bits=3)  # TQ3: best compression
 # or bits=4 for TQ4 (more conservative)
+# then: vllm serve google/gemma-4-26B-A4B-it
 ```
+
+Works with vLLM V1 engine (multiprocessing spawn) via the `vllm.general_plugins` entry point. The hook is automatically re-applied in spawned subprocesses.
 
 Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026). Our implementation uses a Gaussian Lloyd-Max codebook as an approximation. Weight compression inspired by @coffeecup2020's TQ3_1S proof-of-concept for llama.cpp.
 

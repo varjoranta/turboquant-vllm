@@ -10,33 +10,26 @@ Environment variables:
 """
 import os
 
+_patched = False
+
 
 def register():
     """Called by vLLM's plugin loader in every process."""
+    global _patched
+
     bits = os.environ.get("TQ_WEIGHT_BITS")
     if bits is None:
         return
+
+    if _patched:
+        return
+    _patched = True
 
     bits = int(bits)
     group_size = int(os.environ.get("TQ_WEIGHT_GROUP_SIZE", "128"))
 
     try:
-        from vllm.model_executor.model_loader.utils import (
-            process_weights_after_loading as _original,
-        )
+        from turboquant_vllm.weight_quant import patch_vllm_loader
+        patch_vllm_loader(bits=bits, group_size=group_size, min_size=128)
     except ImportError:
         return
-
-    from turboquant_vllm.weight_quant import _replace_linear_layers
-
-    # Only patch once per process (idempotent check)
-    if getattr(register, "_patched", False):
-        return
-    register._patched = True
-
-    def patched_process_weights(model, model_config, target_device):
-        _original(model, model_config, target_device)
-        _replace_linear_layers(model, bits=bits, group_size=group_size, min_size=128)
-
-    import vllm.model_executor.model_loader.utils as loader_utils
-    loader_utils.process_weights_after_loading = patched_process_weights
