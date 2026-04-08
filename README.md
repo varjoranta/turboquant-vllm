@@ -242,6 +242,17 @@ TQ3 is faster at every concurrency level. The gap widens under load because smal
 
 3-bit sub-byte packing: 8 indices per 3 bytes. Norm correction: stores `original_norm / reconstruction_norm` ratio per group to fix 5-10% magnitude shrinkage at 3-bit.
 
+### Perplexity (WikiText-2, Gemma 4 26B-A4B-it, H100 80GB)
+
+| Config | PPL | Memory | vs BF16 |
+|--------|-----|--------|---------|
+| BF16 baseline | 540 | 51,612 MB | -- |
+| TQ4 (4-bit) | 1,415 | 15,265 MB | +162% |
+| TQ3 (3-bit) | 1,190 | 12,040 MB | +120% |
+| TQ3 native checkpoint | 1,152 | 12,104 MB | +113% |
+
+Note: Gemma 4 26B-A4B-it is an instruction-tuned model. IT models have high WikiText-2 PPL baselines (540 vs ~6 for base models) because their output distribution is trained for chat, not language modeling. The PPL deltas are proportionally larger than for base models but do not reflect proportional quality degradation in chat -- the same compression scores 4.79/5 on our 20-scenario benchmark. TQ3 outperforms TQ4 on PPL because fewer centroids means fewer quantization boundary errors for this model's weight distribution. Native checkpoint matches runtime, confirming the two paths are numerically equivalent.
+
 ### Native TQ3 checkpoint (small GPUs)
 
 Runtime compression (`enable_weight_quantization`) needs the full BF16 checkpoint in GPU memory during loading. For GPUs that can't fit the original checkpoint (e.g., L40S 48GB for a 52 GB model), use a native TQ3 checkpoint instead:
