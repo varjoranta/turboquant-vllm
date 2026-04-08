@@ -102,6 +102,26 @@ if HAS_TRITON:
                 indices = tl.where(is_hi[None, :] > 0,
                                    (packed_bytes >> 4) & 0xF,
                                    packed_bytes & 0xF)
+            elif BITS == 3:
+                # 3-bit sub-byte: 8 indices per 3 bytes
+                group_of_8 = offs_k // 8
+                pos_in_8 = offs_k % 8
+                bit_off_in_3 = pos_in_8 * 3
+                first_byte = bit_off_in_3 // 8
+                bit_in_byte = (bit_off_in_3 % 8).to(tl.int32)
+                crosses = bit_in_byte > 5
+
+                byte_idx0 = group_of_8 * 3 + first_byte
+                byte_idx1 = byte_idx0 + 1
+
+                ptrs0 = packed_row[:, None] * stride_packed_n + byte_idx0[None, :] * stride_packed_k
+                b0 = tl.load(packed_ptr + ptrs0, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                ptrs1 = packed_row[:, None] * stride_packed_n + byte_idx1[None, :] * stride_packed_k
+                b1 = tl.load(packed_ptr + ptrs1, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+
+                single = (b0 >> bit_in_byte[None, :]) & 0x7
+                cross = ((b0 >> bit_in_byte[None, :]) | (b1 << (8 - bit_in_byte[None, :]))) & 0x7
+                indices = tl.where(crosses[None, :], cross, single)
             elif BITS == 2:
                 byte_idx = offs_k // 4
                 shift = (offs_k % 4).to(tl.int32) * 2
@@ -111,7 +131,6 @@ if HAS_TRITON:
                                        mask=offs_n[:, None] < N, other=0).to(tl.int32)
                 indices = (packed_bytes >> shift[None, :]) & 0x3
             else:
-                # 3-bit or other: 1 byte per index
                 packed_elem_offs = (packed_row[:, None] * stride_packed_n
                                    + offs_k[None, :] * stride_packed_k)
                 indices = tl.load(packed_ptr + packed_elem_offs,
