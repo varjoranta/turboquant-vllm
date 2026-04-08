@@ -8,6 +8,8 @@ TurboQuant+ compression for vLLM. Three features from one algorithm:
 
 Gemma 4 26B: ~52 GB checkpoint → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost. **+33% throughput** over BF16 at 16 concurrent requests (364 vs 275 tok/s on H100).
 
+GLM-4.7-Flash 355B MoE: 62.4 GB → **14.7 GB** (4.2x). Native TQ3 checkpoint with MoE expert regrouping, 13.3 GB GPU memory. Tested on A100 80GB.
+
 Qwen3-30B: 61 GB → **13 GB** (4.6x). On MLA models, TQ+ KV cache works where vLLM's FP8 is broken.
 
 ```python
@@ -58,7 +60,7 @@ Norm storage is already optimal: one fp32 norm per 128-element vector (head_dim 
 - **TQ+ works on MLA models.** First validated benchmark of TurboQuant+ on Multi-head Latent Attention (GLM-4.7-Flash). The patch compresses MLA's latent vectors correctly.
 - **FP8 KV cache is broken on MLA models.** vLLM's FP8 KV on GLM-Flash scores 1.07/5. Single-turn responses are coherent, but multi-turn conversations degrade to garbage. Root cause: the FLASHMLA backend applies FP8 without proper per-tensor scaling, and quantization error compounds with context length. FP8 works fine on standard attention (Qwen3-235B: 4.71). TQ+ does not have this problem because PolarQuant normalizes each vector independently before quantization.
 
-GLM-4.7 355B and DeepSeek-V3 671B benchmarks pending (require larger disk provisioning).
+GLM-4.7 355B: native TQ3 checkpoint verified (14.7 GB, 4.2x compression). Full quality benchmark pending. DeepSeek-V3 671B benchmark pending (requires larger disk provisioning).
 
 ### Tested models and known issues
 
@@ -66,7 +68,7 @@ GLM-4.7 355B and DeepSeek-V3 671B benchmarks pending (require larger disk provis
 |---|---|---|---|
 | Qwen3 (0.6B-235B) | GQA | Works | Tested extensively, including 235B AWQ |
 | Qwen3-8B | GQA | Works | Native vLLM backend confirmed on A100 |
-| GLM-4.7-Flash | MLA | Works | TQ+ handles MLA correctly (FP8 does not) |
+| GLM-4.7-Flash 355B | MLA | Works | TQ+ handles MLA correctly (FP8 does not). Native TQ3 checkpoint tested. |
 | DeepSeek-V3 | MLA | Works | Via MLACommonImpl patch |
 | Qwen3.5 (hybrid) | GatedDeltaNet + GQA | Untested | Hybrid architecture, may need layer-specific handling |
 | gpt-oss-20b | Alternating full/sliding window + sinks | Not yet | Returns empty output. Sliding window + attention sinks need pass-through support |
@@ -222,12 +224,15 @@ Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Had
 
 ### Results
 
-| Model | BF16 | TQ4 (4-bit) | TQ3 (3-bit) |
-|-------|------|-------------|-------------|
-| **Gemma 4 26B** | 52 GB | 15 GB (3.4x) | **12 GB (4.3x)** |
-| **Qwen3-30B** | 61 GB | 17 GB (3.6x) | **13 GB (4.6x)** |
+| Model | BF16 | TQ3 (3-bit) | Compression | Quality |
+|-------|------|-------------|-------------|---------|
+| **Gemma 4 26B** | 52 GB | **12 GB** | 4.3x | 4.79/5 |
+| **GLM-4.7-Flash 355B** | 62.4 GB | **14.7 GB** | 4.2x | Tested ✓ |
+| **Qwen3-30B** | 61 GB | **13 GB** | 4.6x | -- |
 
 Gemma 4 TQ3 quality: **4.79/5** on 20 multi-turn conversation scenarios (scored by Llama-3.3-70B judge). Matches Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost.
+
+GLM-4.7-Flash is a 355B MoE model (64 experts, 4 active). The native TQ3 checkpoint handles per-expert weight regrouping and gate_proj+up_proj → gate_up_proj fusion automatically.
 
 ### Throughput (H100 80GB, vLLM 0.19.0, Gemma 4 26B)
 
@@ -267,11 +272,19 @@ output = model.generate(...)
 
 The native checkpoint stores packed 3-bit indices directly (12 GB on disk). The loader creates the model on a meta device (zero memory), loads packed weights to GPU, and decompresses on-the-fly during each forward pass.
 
+Supports MoE models: per-expert 2D weights are automatically regrouped into fused 3D parameters (e.g., GLM-4.7-Flash's 64 experts with gate_proj+up_proj → gate_up_proj fusion). Router/gate weights are decompressed in-place.
+
 Create your own native checkpoint:
 ```python
 from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+# Dense model (Gemma 4, Qwen3, etc.)
 save_tq3_checkpoint("google/gemma-4-26B-A4B-it", "./gemma4-tq3-native")
 # CPU only, ~60 GB RAM, ~2 minutes
+
+# MoE model (GLM-4.7-Flash, GLM-5.1, etc.) — streaming, low memory
+save_tq3_checkpoint("zai-org/GLM-4.7-Flash", "./glm47-tq3")
+# Streams shards from HuggingFace, ~5 GB peak RAM, ~14 minutes
 ```
 
 **Important: Gemma 4 requires `transformers >= 5.5.0`** (the `gemma4` model type was added in that version). vLLM 0.19.0 pins `transformers < 5`, so Gemma 4 loading requires a manual override: `pip install 'transformers>=5.5'`.
