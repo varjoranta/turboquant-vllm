@@ -442,16 +442,22 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         if wrapped % 100 == 0:
             logger.info("  Wrapped %d linear layers...", wrapped)
 
-    # Step 4: Handle 3D expert weights
+    # Step 4: Handle 3D expert weights (two sub-cases)
     modules_to_hook = {}
     expert_count = 0
+
+    # 4a: Already-3D expert tensors in checkpoint (e.g., Gemma 4's experts.gate_up_proj)
+    resolved_expert_bases = set()
     for base_name in expert_bases:
+        try:
+            owner, param_name = _resolve_parent_and_attr(model, base_name)
+            meta_param = getattr(owner, param_name)
+        except (AttributeError, TypeError):
+            continue  # handle in 4b
+
         packed = loaded[base_name + ".tq_packed"]
         norms = loaded[base_name + ".tq_norms"]
-
-        owner, param_name = _resolve_parent_and_attr(model, base_name)
-        meta_param = getattr(owner, param_name)
-        orig_shape = meta_param.shape  # (n_experts, out_dim, in_dim)
+        orig_shape = meta_param.shape
 
         compressed = Compressed3D.from_packed(
             packed, norms, shape=tuple(orig_shape),
@@ -474,6 +480,95 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             modules_to_hook[mod_id] = (owner, [])
         modules_to_hook[mod_id][1].append(param_name)
         expert_count += 1
+        resolved_expert_bases.add(base_name)
+
+    # 4b: Per-expert 2D tensors that need regrouping into 3D
+    # Pattern: "prefix.N.suffix.weight" where N is numeric and model has
+    # "prefix.suffix" as a fused 3D parameter (e.g., GLM-4.7 experts)
+    import re
+    unresolved_bases = expert_bases - resolved_expert_bases
+    # Also check linear_map for per-expert linears that couldn't resolve
+    unresolved_linears = set()
+    for weight_name, mod_path in linear_map.items():
+        try:
+            _resolve_module(model, mod_path)
+        except (AttributeError, TypeError):
+            unresolved_linears.add(weight_name)
+
+    all_unresolved = unresolved_bases | unresolved_linears
+    if all_unresolved:
+        # Group by fused parameter path: strip the numeric expert index
+        expert_groups: dict[str, list[tuple[int, str]]] = {}
+        pattern = re.compile(r'^(.*?)\.(\d+)\.(.+)$')
+        for base_name in all_unresolved:
+            m = pattern.match(base_name)
+            if not m:
+                continue
+            prefix, idx_str, suffix = m.group(1), m.group(2), m.group(3)
+            fused_key = f"{prefix}.{suffix}"
+            if fused_key not in expert_groups:
+                expert_groups[fused_key] = []
+            expert_groups[fused_key].append((int(idx_str), base_name))
+
+        for fused_key, members in expert_groups.items():
+            members.sort(key=lambda x: x[0])
+            try:
+                owner, param_name = _resolve_parent_and_attr(model, fused_key)
+                meta_param = getattr(owner, param_name)
+            except (AttributeError, TypeError):
+                logger.debug("Cannot resolve fused expert path %s", fused_key)
+                continue
+
+            # Stack individual packed/norms into combined 3D
+            all_packed = []
+            all_norms = []
+            for idx, base_name in members:
+                pk = base_name + ".tq_packed"
+                nk = base_name + ".tq_norms"
+                if pk in loaded and nk in loaded:
+                    all_packed.append(loaded[pk])
+                    all_norms.append(loaded[nk])
+                    handled_tensors.add(pk)
+                    handled_tensors.add(nk)
+
+            if not all_packed:
+                continue
+
+            # Stack: each expert's packed is (n_groups, packed_cols),
+            # norms is (out_dim, n_groups_per_row)
+            stacked_packed = torch.cat(all_packed, dim=0)
+            stacked_norms = torch.cat(all_norms, dim=0)
+
+            n_experts = len(all_packed)
+            orig_shape = meta_param.shape
+            if orig_shape[0] != n_experts:
+                logger.warning("Expert count mismatch for %s: model=%d, checkpoint=%d",
+                               fused_key, orig_shape[0], n_experts)
+                continue
+
+            compressed = Compressed3D.from_packed(
+                stacked_packed, stacked_norms, shape=tuple(orig_shape),
+                dtype=torch.float16, bits=bits, group_size=group_size,
+            )
+
+            setattr(owner, f"_tq_{param_name}", compressed)
+            if isinstance(meta_param, nn.Parameter):
+                owner.register_parameter(
+                    param_name,
+                    nn.Parameter(torch.empty(0, device=device, dtype=torch.float16),
+                                 requires_grad=False),
+                )
+            else:
+                setattr(owner, param_name,
+                        torch.empty(0, device=device, dtype=torch.float16))
+
+            mod_id = id(owner)
+            if mod_id not in modules_to_hook:
+                modules_to_hook[mod_id] = (owner, [])
+            if param_name not in modules_to_hook[mod_id][1]:
+                modules_to_hook[mod_id][1].append(param_name)
+            expert_count += n_experts
+            logger.info("  Regrouped %d experts into %s", n_experts, fused_key)
 
     # Disable buffer pooling on memory-constrained GPUs to avoid
     # keeping ~40 GB of decompression buffers across all MoE layers.
