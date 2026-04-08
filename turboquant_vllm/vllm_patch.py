@@ -19,8 +19,10 @@ Known limitations of the monkey-patch approach:
   blocks. Long-running servers need periodic restarts until native backend lands.
 """
 
-import torch
 import logging
+import os
+
+import torch
 from functools import wraps
 
 from turboquant_vllm.torch_ops import KVCacheCompressorTorch, CompressedKV
@@ -287,7 +289,6 @@ def patch_vllm_attention(
             Identify via attention entropy analysis or set empirically.
             Default None (compress all heads).
     """
-    import os
     global _k_bits, _v_bits, _norm_correction, _use_qjl, _sink_tokens, _boundary_layers, _fp16_heads
     _k_bits = k_bits
     _v_bits = v_bits

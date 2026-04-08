@@ -783,7 +783,6 @@ def patch_vllm_loader(**replace_kwargs) -> None:
         logger.info("Applying TurboQuant weight compression...")
         count = _replace_linear_layers(model, **replace_kwargs)
         if count > 0:
-            import torch
             mem_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
             logger.info("TurboQuant: %d layers compressed, GPU memory: %.1f GB", count, mem_gb)
 
