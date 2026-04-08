@@ -138,9 +138,13 @@ def save_tq3_checkpoint(
         current_shard_bytes += tensor_bytes
         total_size += tensor_bytes
 
+    import tempfile
+    _tmp_download_dir = tempfile.mkdtemp(prefix="tq3_dl_")
+
     for shard_name in shard_files:
         logger.info("Processing shard: %s", shard_name)
-        shard_path = hf_hub_download(model_id, shard_name)
+        shard_path = hf_hub_download(model_id, shard_name,
+                                     local_dir=_tmp_download_dir)
 
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             for tensor_name in f.keys():
@@ -178,7 +182,17 @@ def save_tq3_checkpoint(
 
                 del tensor  # free input tensor immediately
 
+        # Delete downloaded shard to save disk (critical for TB-scale models)
+        try:
+            os.remove(shard_path)
+        except OSError:
+            pass
+
     _flush_shard()  # write remaining tensors
+
+    # Clean up temp download directory
+    import shutil
+    shutil.rmtree(_tmp_download_dir, ignore_errors=True)
 
     # Rename shards with correct total count
     total_shards = shard_idx
