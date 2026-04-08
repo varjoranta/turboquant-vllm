@@ -37,11 +37,17 @@ _SKIP_PATTERNS = ("lm_head", "embed", "norm", "head")
 def _resolve_module(root, dotted_path: str):
     """Navigate a module tree by dotted path, returning the final attribute.
 
-    Example: _resolve_module(model, "layers.0.self_attn") returns model.layers[0].self_attn
+    Handles both nn.Module children (via getattr) and indexed containers
+    like ModuleList/plain lists (via integer indexing).
     """
     obj = root
     for part in dotted_path.split("."):
-        obj = getattr(obj, part)
+        try:
+            obj = getattr(obj, part)
+        except AttributeError:
+            # Some MoE implementations use plain lists or custom containers
+            # where getattr("5") fails but obj[5] works
+            obj = obj[int(part)]
     return obj
 
 
