@@ -64,6 +64,7 @@ def load_wikitext2(tokenizer):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="google/gemma-4-26B-A4B-it")
+    parser.add_argument("--native-checkpoint", default=None, help="Path to native TQ3 checkpoint (also runs native PPL)")
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--stride", type=int, default=512)
     args = parser.parse_args()
@@ -84,26 +85,45 @@ def main():
 
     results = {}
 
-    for bits, label in [(16, "BF16"), (4, "TQ4"), (3, "TQ3")]:
+    configs = [
+        ("BF16", 16, None),
+        ("TQ4", 4, None),
+        ("TQ3", 3, None),
+    ]
+
+    # Add native checkpoint if available
+    native_dir = args.native_checkpoint
+    if native_dir:
+        configs.append(("TQ3-native", 3, native_dir))
+
+    for label, bits, native_path in configs:
         print(f"\n── {label} ──", flush=True)
 
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model, dtype=torch.bfloat16, device_map="cuda"
-        )
-        mem_bf16 = torch.cuda.memory_allocated() / 1e6
-
-        if bits < 16:
-            from turboquant_vllm.weight_quant import _replace_linear_layers
+        if native_path:
+            from turboquant_vllm.checkpoint import load_tq3_model
             t0 = time.time()
-            _replace_linear_layers(model, bits=bits, group_size=128)
-            gc.collect()
-            torch.cuda.empty_cache()
-            compress_time = time.time() - t0
+            model, _ = load_tq3_model(native_path, device="cuda")
+            load_time = time.time() - t0
             mem = torch.cuda.memory_allocated() / 1e6
-            print(f"Compressed: {mem_bf16:.0f} → {mem:.0f} MB ({mem_bf16/mem:.1f}x), {compress_time:.0f}s", flush=True)
+            print(f"Native loaded: {mem:.0f} MB ({load_time:.0f}s)", flush=True)
         else:
-            mem = mem_bf16
-            print(f"Loaded: {mem:.0f} MB", flush=True)
+            model = AutoModelForCausalLM.from_pretrained(
+                args.model, dtype=torch.bfloat16, device_map="cuda"
+            )
+            mem_bf16 = torch.cuda.memory_allocated() / 1e6
+
+            if bits < 16:
+                from turboquant_vllm.weight_quant import _replace_linear_layers
+                t0 = time.time()
+                _replace_linear_layers(model, bits=bits, group_size=128)
+                gc.collect()
+                torch.cuda.empty_cache()
+                compress_time = time.time() - t0
+                mem = torch.cuda.memory_allocated() / 1e6
+                print(f"Compressed: {mem_bf16:.0f} → {mem:.0f} MB ({mem_bf16/mem:.1f}x), {compress_time:.0f}s", flush=True)
+            else:
+                mem = mem_bf16
+                print(f"Loaded: {mem:.0f} MB", flush=True)
 
         model.eval()
         t0 = time.time()
@@ -123,15 +143,15 @@ def main():
     print("SUMMARY", flush=True)
     print(f"{'='*60}", flush=True)
     print(f"Model: {args.model}", flush=True)
-    print(f"{'Config':<10} {'PPL':>8} {'Memory':>10} {'vs BF16':>10}", flush=True)
-    print("-" * 40, flush=True)
+    print(f"{'Config':<12} {'PPL':>8} {'Memory':>10} {'vs BF16':>10}", flush=True)
+    print("-" * 44, flush=True)
     bf16_ppl = results.get("BF16", {}).get("ppl", 0)
-    for label in ["BF16", "TQ4", "TQ3"]:
+    for label in [l for l, _, _ in configs]:
         r = results.get(label, {})
         ppl = r.get("ppl", 0)
         mem = r.get("memory_mb", 0)
         delta = f"+{((ppl/bf16_ppl)-1)*100:.1f}%" if bf16_ppl > 0 and label != "BF16" else ""
-        print(f"{label:<10} {ppl:>8.2f} {mem:>8} MB {delta:>10}", flush=True)
+        print(f"{label:<12} {ppl:>8.2f} {mem:>8} MB {delta:>10}", flush=True)
 
 
 if __name__ == "__main__":
