@@ -582,3 +582,169 @@ def tq_fwht_input_gemm(
         output = output.reshape(*orig_shape[:-1], N)
 
     return output
+
+
+# ── PlanarQuant Triton kernels (2D Givens rotation) ─────────────────
+# Based on RotorQuant/PlanarQuant by scrya-com/ParaMind2025.
+# 4 FMAs per pair, fully parallel, O(d) — replaces O(d log d) WHT.
+
+if HAS_TRITON:
+
+    @triton.jit
+    def _quantize_nearest(val, centroids_ptr, n_levels: tl.constexpr):
+        """Find nearest centroid index for a scalar value."""
+        best_idx = tl.zeros_like(val).to(tl.int32)
+        best_dist = tl.abs(val - tl.load(centroids_ptr))
+        for i in tl.static_range(1, n_levels):
+            c = tl.load(centroids_ptr + i)
+            d = tl.abs(val - c)
+            mask = d < best_dist
+            best_dist = tl.where(mask, d, best_dist)
+            best_idx = tl.where(mask, i, best_idx)
+        return best_idx
+
+    @triton.jit
+    def _planar_quantize_kernel(
+        input_ptr, indices_ptr, norms_out_ptr,
+        cos_sin_ptr, centroids_ptr,
+        batch_size, emb_dim,
+        n_pairs: tl.constexpr,
+        n_levels: tl.constexpr,
+        stride_in_b, stride_in_d,
+        stride_idx_b, stride_idx_d,
+        BLOCK_P: tl.constexpr,
+    ):
+        """Quantize only — returns uint8 indices. Norms stored separately."""
+        pid_b = tl.program_id(0)
+        pid_p = tl.program_id(1)
+
+        p_offs = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = p_offs < n_pairs
+
+        cos_t = tl.load(cos_sin_ptr + p_offs * 2 + 0, mask=p_mask, other=1.0)
+        sin_t = tl.load(cos_sin_ptr + p_offs * 2 + 1, mask=p_mask, other=0.0)
+
+        d0 = p_offs * 2
+        d1 = d0 + 1
+        v0 = tl.load(input_ptr + pid_b * stride_in_b + d0 * stride_in_d,
+                      mask=p_mask & (d0 < emb_dim), other=0.0)
+        v1 = tl.load(input_ptr + pid_b * stride_in_b + d1 * stride_in_d,
+                      mask=p_mask & (d1 < emb_dim), other=0.0)
+
+        r0 = cos_t * v0 - sin_t * v1
+        r1 = sin_t * v0 + cos_t * v1
+
+        idx0 = _quantize_nearest(r0, centroids_ptr, n_levels)
+        idx1 = _quantize_nearest(r1, centroids_ptr, n_levels)
+
+        tl.store(indices_ptr + pid_b * stride_idx_b + d0 * stride_idx_d,
+                 idx0.to(tl.int8), mask=p_mask & (d0 < emb_dim))
+        tl.store(indices_ptr + pid_b * stride_idx_b + d1 * stride_idx_d,
+                 idx1.to(tl.int8), mask=p_mask & (d1 < emb_dim))
+
+    @triton.jit
+    def _planar_dequantize_kernel(
+        indices_ptr, output_ptr,
+        cos_sin_ptr, centroids_ptr,
+        batch_size, emb_dim,
+        n_pairs: tl.constexpr,
+        n_levels: tl.constexpr,
+        stride_idx_b, stride_idx_d,
+        stride_out_b, stride_out_d,
+        BLOCK_P: tl.constexpr,
+    ):
+        """Dequantize: indices → inverse rotation → vectors."""
+        pid_b = tl.program_id(0)
+        pid_p = tl.program_id(1)
+
+        p_offs = pid_p * BLOCK_P + tl.arange(0, BLOCK_P)
+        p_mask = p_offs < n_pairs
+
+        cos_t = tl.load(cos_sin_ptr + p_offs * 2 + 0, mask=p_mask, other=1.0)
+        sin_t = tl.load(cos_sin_ptr + p_offs * 2 + 1, mask=p_mask, other=0.0)
+
+        d0 = p_offs * 2
+        d1 = d0 + 1
+
+        idx0 = tl.load(indices_ptr + pid_b * stride_idx_b + d0 * stride_idx_d,
+                        mask=p_mask & (d0 < emb_dim), other=0).to(tl.int32)
+        idx1 = tl.load(indices_ptr + pid_b * stride_idx_b + d1 * stride_idx_d,
+                        mask=p_mask & (d1 < emb_dim), other=0).to(tl.int32)
+
+        q0 = tl.load(centroids_ptr + idx0, mask=p_mask, other=0.0)
+        q1 = tl.load(centroids_ptr + idx1, mask=p_mask, other=0.0)
+
+        f0 = cos_t * q0 + sin_t * q1
+        f1 = -sin_t * q0 + cos_t * q1
+
+        tl.store(output_ptr + pid_b * stride_out_b + d0 * stride_out_d,
+                 f0, mask=p_mask & (d0 < emb_dim))
+        tl.store(output_ptr + pid_b * stride_out_b + d1 * stride_out_d,
+                 f1, mask=p_mask & (d1 < emb_dim))
+
+
+def planar_quantize(
+    x: torch.Tensor,        # [batch, dim]
+    cos_sin: torch.Tensor,   # [n_pairs, 2]
+    centroids: torch.Tensor,  # [n_levels]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Triton PlanarQuant quantize: normalize → rotate → quantize. Returns (indices, norms)."""
+    if not HAS_TRITON:
+        raise ImportError("Triton required for planar_quantize")
+
+    batch_size, emb_dim = x.shape
+    n_pairs = cos_sin.shape[0]
+    n_levels = centroids.shape[0]
+
+    x_f32 = x.float()
+    norms = x_f32.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    x_unit = (x_f32 / norms).contiguous()
+    norms = norms.squeeze(-1)
+
+    indices = torch.empty(batch_size, emb_dim, dtype=torch.int8, device=x.device)
+
+    BLOCK_P = min(triton.next_power_of_2(n_pairs), 256)
+    grid = (batch_size, triton.cdiv(n_pairs, BLOCK_P))
+
+    _planar_quantize_kernel[grid](
+        x_unit, indices, norms,
+        cos_sin.float().contiguous(), centroids.float().contiguous(),
+        batch_size, emb_dim, n_pairs, n_levels,
+        x_unit.stride(0), x_unit.stride(1),
+        indices.stride(0), indices.stride(1),
+        BLOCK_P=BLOCK_P,
+    )
+    return indices, norms
+
+
+def planar_dequantize(
+    indices: torch.Tensor,    # [batch, dim] int8
+    norms: torch.Tensor,      # [batch]
+    cos_sin: torch.Tensor,    # [n_pairs, 2]
+    centroids: torch.Tensor,  # [n_levels]
+) -> torch.Tensor:
+    """Triton PlanarQuant dequantize: indices → inverse rotation → rescale."""
+    if not HAS_TRITON:
+        raise ImportError("Triton required for planar_dequantize")
+
+    batch_size, emb_dim = indices.shape
+    n_pairs = cos_sin.shape[0]
+    n_levels = centroids.shape[0]
+
+    output = torch.empty(batch_size, emb_dim, dtype=torch.float32, device=indices.device)
+
+    BLOCK_P = min(triton.next_power_of_2(n_pairs), 256)
+    grid = (batch_size, triton.cdiv(n_pairs, BLOCK_P))
+
+    _planar_dequantize_kernel[grid](
+        indices, output,
+        cos_sin.float().contiguous(), centroids.float().contiguous(),
+        batch_size, emb_dim, n_pairs, n_levels,
+        indices.stride(0), indices.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_P=BLOCK_P,
+    )
+
+    if norms.dim() == 1:
+        norms = norms.unsqueeze(-1)
+    return (output * norms).to(indices.device)
