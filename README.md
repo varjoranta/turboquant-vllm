@@ -80,15 +80,13 @@ Standard GQA/MHA models work. MLA models work via the monkey-patch library. Mode
 ## Install
 
 ```bash
+pip install turboquant-plus-vllm
+```
+
+Or from git for the latest:
+```bash
 pip install turboquant-plus-vllm@git+https://github.com/varjoranta/turboquant-vllm.git
 ```
-
-For vLLM integration:
-```bash
-pip install "turboquant-plus-vllm[vllm] @ git+https://github.com/varjoranta/turboquant-vllm.git"
-```
-
-PyPI release coming soon.
 
 ## How it works
 
@@ -218,7 +216,19 @@ enable_weight_quantization(bits=3)  # TQ3: best compression
 # then: vllm serve google/gemma-4-26B-A4B-it
 ```
 
-Works with vLLM V1 engine (multiprocessing spawn) via the `vllm.general_plugins` entry point. The hook is automatically re-applied in spawned subprocesses.
+Works with vLLM V1 engine (multiprocessing spawn) via the `vllm.general_plugins` entry point. After `pip install turboquant-plus-vllm`, set environment variables and vLLM picks it up automatically — no code changes needed:
+
+```bash
+# Docker / production
+FROM vllm/vllm-openai:v0.19.0
+RUN pip install turboquant-plus-vllm
+ENV TQ_WEIGHT_BITS=3
+```
+
+```bash
+# CLI
+TQ_WEIGHT_BITS=3 vllm serve google/gemma-4-26B-A4B-it
+```
 
 Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Hadian, Mirrokni; ICLR 2026). Our implementation uses a Gaussian Lloyd-Max codebook as an approximation. Weight compression inspired by @coffeecup2020's TQ3_1S proof-of-concept for llama.cpp.
 
@@ -228,6 +238,7 @@ Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Had
 |-------|------|-------------|-------------|---------|
 | **Gemma 4 26B** | 52 GB | **12 GB** | 4.3x | 4.79/5 |
 | **GLM-4.7-Flash 355B** | 62.4 GB | **14.7 GB** | 4.2x | Tested ✓ |
+| **GLM-5.1 769B** | 1,510 GB | **309 GB** | 4.9x | [Pending](https://huggingface.co/varjosoft/GLM-5.1-Open-TQ3) |
 | **Qwen3-30B** | 61 GB | **13 GB** | 4.6x | -- |
 
 Gemma 4 TQ3 quality: **4.79/5** on 20 multi-turn conversation scenarios (scored by Llama-3.3-70B judge). Matches Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost.
@@ -383,7 +394,7 @@ Code: [containers/deploy.py](https://github.com/varjoranta/verda-model-bench/blo
 
 ## Related projects
 
-- **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent implementation of TurboQuant for vLLM by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths (required for quantized weight models), and vLLM paged cache integration. The PyPI package for this project will be published as `turboquant-plus-vllm` to avoid confusion.
+- **[turboquant-vllm on PyPI](https://pypi.org/project/turboquant-vllm/)** — A separate, independent implementation of TurboQuant for vLLM by Alberto-Codes. Uses Triton kernels and HuggingFace `DynamicCache`, targeting consumer GPUs (RTX 4090). This project differs: fused CUDA kernels for production A100/H100, asymmetric K/V bit widths (required for quantized weight models), and vLLM paged cache integration. This project is published as [`turboquant-plus-vllm`](https://pypi.org/project/turboquant-plus-vllm/).
 - **[turbo-quant-lite](https://pypi.org/project/turbo-quant-lite/)** — Numpy-only TurboQuant for embedding compression in databases. Same math, different codebook and use case.
 - **[turboquant_plus](https://github.com/TheTom/turboquant_plus)** — Research implementation of the KV cache algorithm. This package builds production CUDA kernels on top of that work.
 - **TQ3_1S for llama.cpp** — @coffeecup2020's proof-of-concept applying TurboQuant to model weights (not just KV cache). Achieved near-Q4_0 quality at 3.5-bit. Inspired the weight quantization feature in this package.
