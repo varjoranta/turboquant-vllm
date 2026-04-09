@@ -200,6 +200,13 @@ def main():
 
         from turboquant_vllm.checkpoint import load_tq3_model
         model_tq3, _ = load_tq3_model(tq3_dir, device=device)
+        # Cast non-quantized params to bfloat16 for DFlash compatibility
+        for name, param in model_tq3.named_parameters():
+            if param.dtype == torch.float16 and "tq_packed" not in name:
+                param.data = param.data.to(torch.bfloat16)
+        for name, buf in model_tq3.named_buffers():
+            if buf.dtype == torch.float16:
+                buf.data = buf.data.to(torch.bfloat16)
         mem_tq3 = torch.cuda.memory_allocated() / 1e9
         logger.info("TQ3 model loaded: %.1f GB", mem_tq3)
 
@@ -245,6 +252,13 @@ def main():
             save_tq3_checkpoint(args.target, tq3_dir, bits=3, group_size=128)
         from turboquant_vllm.checkpoint import load_tq3_model
         target_tq3, _ = load_tq3_model(tq3_dir, device=device)
+        # Cast non-quantized params to bfloat16 for DFlash compatibility
+        for name, param in target_tq3.named_parameters():
+            if param.dtype == torch.float16 and "tq_packed" not in name:
+                param.data = param.data.to(torch.bfloat16)
+        for name, buf in target_tq3.named_buffers():
+            if buf.dtype == torch.float16:
+                buf.data = buf.data.to(torch.bfloat16)
 
     draft = DFlashDraftModel.from_pretrained(
         args.draft, attn_implementation="sdpa", dtype=torch.bfloat16
