@@ -21,7 +21,11 @@ import torch.nn as nn
 
 from turboquant_vllm.torch_ops import PolarQuantTorch
 
-logger = logging.getLogger(__name__)
+try:
+    from vllm.logger import init_logger
+    logger = init_logger(__name__)
+except ImportError:
+    logger = logging.getLogger(__name__)
 
 _quantizers: dict[tuple[int, int], PolarQuantTorch] = {}
 _cuda_mod = None
@@ -789,6 +793,7 @@ def patch_vllm_loader(**replace_kwargs) -> None:
     Raises ImportError if vLLM is not installed.
     """
     import vllm.model_executor.model_loader.utils as loader_utils
+    import vllm.model_executor.model_loader.base_loader as base_loader
 
     _original = loader_utils.process_weights_after_loading
 
@@ -800,7 +805,16 @@ def patch_vllm_loader(**replace_kwargs) -> None:
             mem_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
             logger.info("TurboQuant: %d layers compressed, GPU memory: %.1f GB", count, mem_gb)
 
+    # Patch both the module-level function AND all imported references.
+    # Python's `from X import Y` binds a local name that doesn't see
+    # later module-level replacements, so we must patch every importer.
     loader_utils.process_weights_after_loading = patched_process_weights
+    base_loader.process_weights_after_loading = patched_process_weights
+    try:
+        import vllm.model_executor.model_loader.gguf_loader as gguf_loader
+        gguf_loader.process_weights_after_loading = patched_process_weights
+    except (ImportError, AttributeError):
+        pass
 
 
 def enable_weight_quantization(bits: int = 3, group_size: int = 128,

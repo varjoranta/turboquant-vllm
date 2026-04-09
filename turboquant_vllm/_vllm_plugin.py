@@ -12,8 +12,20 @@ Environment variables:
 """
 import logging
 import os
+import sys
 
-logger = logging.getLogger("turboquant_vllm.plugin")
+# Use vLLM's logger if available (ensures our messages appear in vLLM output),
+# fall back to standard logging
+try:
+    from vllm.logger import init_logger
+    logger = init_logger("turboquant_vllm.plugin")
+except ImportError:
+    logger = logging.getLogger("turboquant_vllm.plugin")
+    if not logger.handlers:
+        handler = logging.StreamHandler(sys.stderr)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
 
 _patched = False
 
