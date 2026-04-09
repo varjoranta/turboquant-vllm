@@ -22,11 +22,17 @@ def register():
     """Called by vLLM's plugin loader in every process."""
     global _patched
 
+    # Always register the quantization config (needed for TQ3 checkpoint loading)
+    try:
+        from turboquant_vllm.vllm_quant import register as register_quant_config
+        register_quant_config()
+    except Exception as e:
+        logger.debug("Could not register TurboQuant quant config: %s", e)
+
     weight_bits = os.environ.get("TQ_WEIGHT_BITS")
     kv_k_bits = os.environ.get("TQ_KV_K_BITS")
 
     if weight_bits is None and kv_k_bits is None:
-        logger.debug("No TQ env vars set, plugin inactive")
         return
 
     if _patched:

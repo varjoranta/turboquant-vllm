@@ -97,6 +97,15 @@ def save_tq3_checkpoint(
     logger.info("Downloading config and tokenizer for %s...", model_id)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # Inject quantization_config so vLLM auto-detects the format
+    if not hasattr(config, "quantization_config") or config.quantization_config is None:
+        config.quantization_config = {
+            "quant_method": "turboquant",
+            "bits": bits,
+            "group_size": group_size,
+        }
+        if sensitive_bits is not None:
+            config.quantization_config["sensitive_bits"] = sensitive_bits
     config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
 
@@ -177,8 +186,13 @@ def save_tq3_checkpoint(
                     packed, norms = _compress_tensor(
                         tensor, tensor_quantizer, tensor_bits, group_size
                     )
-                    _add_tensor(tensor_name + ".tq_packed", packed)
-                    _add_tensor(tensor_name + ".tq_norms", norms)
+                    # Strip .weight suffix for vLLM compatibility:
+                    # vLLM layers have tq_packed/tq_norms as direct parameters,
+                    # not sub-attributes of .weight
+                    base_name = (tensor_name.removesuffix(".weight")
+                                 if tensor_name.endswith(".weight") else tensor_name)
+                    _add_tensor(base_name + ".tq_packed", packed)
+                    _add_tensor(base_name + ".tq_norms", norms)
 
                     comp_bytes = packed.numel() + norms.numel() * norms.element_size()
                     total_compressed += comp_bytes
@@ -399,12 +413,17 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
                 if name.endswith(".tq_packed"):
                     packed_bases.add(name[:-len(".tq_packed")])
 
-    linear_map = {}  # weight_name -> module_path for packed nn.Linear layers
+    linear_map = {}  # base_name -> module_path for packed nn.Linear layers
     for mod_path, module in model.named_modules():
         if isinstance(module, nn.Linear):
+            # Support both naming conventions:
+            # Old: q_proj.weight.tq_packed → base = q_proj.weight
+            # New: q_proj.tq_packed → base = q_proj (vLLM compatible)
             weight_name = mod_path + ".weight"
             if weight_name in packed_bases:
                 linear_map[weight_name] = mod_path
+            elif mod_path in packed_bases:
+                linear_map[mod_path] = mod_path
 
     expert_bases = packed_bases - set(linear_map.keys())
 
