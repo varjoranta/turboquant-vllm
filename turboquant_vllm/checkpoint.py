@@ -69,6 +69,7 @@ def save_tq3_checkpoint(
     output_dir: str,
     bits: int = 3,
     group_size: int = 128,
+    sensitive_bits: int | None = None,
     max_shard_bytes: int = 5 * 1024 * 1024 * 1024,
 ):
     """Convert a HuggingFace checkpoint to native TQ3 packed format.
@@ -80,8 +81,9 @@ def save_tq3_checkpoint(
     Args:
         model_id: HuggingFace model ID or local path.
         output_dir: Where to save the TQ3 checkpoint.
-        bits: Quantization bits (default 3).
+        bits: Quantization bits for most tensors (default 3).
         group_size: Group size (default 128).
+        sensitive_bits: Higher precision bits for o_proj/down_proj (default None = uniform).
         max_shard_bytes: Max bytes per output shard (default 5 GB).
     """
     from safetensors import safe_open
@@ -102,7 +104,15 @@ def save_tq3_checkpoint(
     repo_files = api.list_repo_files(model_id)
     shard_files = sorted([f for f in repo_files if f.endswith(".safetensors")])
 
+    from turboquant_vllm.weight_quant import select_bits, _SENSITIVE_PATTERNS
+
     quantizer = PolarQuantTorch(group_size, bits, seed=42, device="cpu")
+    # Create second quantizer for sensitive layers if needed
+    sensitive_quantizer = (
+        PolarQuantTorch(group_size, sensitive_bits, seed=42, device="cpu")
+        if sensitive_bits is not None and sensitive_bits != bits
+        else None
+    )
 
     # Streaming: accumulate tensors into current shard, flush when full
     current_shard: dict[str, torch.Tensor] = {}
@@ -159,8 +169,13 @@ def save_tq3_checkpoint(
                 is_large = tensor.shape[-1] >= 128 or (tensor.dim() >= 2 and tensor.shape[-2] >= 128)
 
                 if is_weight and not is_skip and is_large:
+                    tensor_bits = select_bits(tensor_name, bits, sensitive_bits)
+                    tensor_quantizer = (
+                        sensitive_quantizer if tensor_bits != bits and sensitive_quantizer is not None
+                        else quantizer
+                    )
                     packed, norms = _compress_tensor(
-                        tensor, quantizer, bits, group_size
+                        tensor, tensor_quantizer, tensor_bits, group_size
                     )
                     _add_tensor(tensor_name + ".tq_packed", packed)
                     _add_tensor(tensor_name + ".tq_norms", norms)
@@ -226,6 +241,9 @@ def save_tq3_checkpoint(
         "compressed_layers": compressed_count,
         "original_model": model_id,
     }
+    if sensitive_bits is not None:
+        tq_config["sensitive_bits"] = sensitive_bits
+        tq_config["sensitive_patterns"] = list(_SENSITIVE_PATTERNS)
     with open(os.path.join(output_dir, "tq_config.json"), "w") as f:
         json.dump(tq_config, f, indent=2)
 
@@ -349,6 +367,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
     from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
     from turboquant_vllm.weight_quant import (
         TurboQuantWrapper, Compressed3D, _register_moe_hooks, _get_quantizer,
+        select_bits, _SENSITIVE_PATTERNS,
     )
     import torch.nn as nn
 
@@ -356,6 +375,8 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         tq_config = json.load(f)
     bits = tq_config["bits"]
     group_size = tq_config["group_size"]
+    sensitive_bits = tq_config.get("sensitive_bits")
+    sensitive_patterns = tuple(tq_config.get("sensitive_patterns", _SENSITIVE_PATTERNS))
 
     # Step 1: Create model on meta device (zero memory allocation)
     logger.info("Creating model skeleton on meta device...")
@@ -441,11 +462,12 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         bias = loaded.get(mod_path + ".bias")
 
         meta_module = _resolve_module(model, mod_path)
+        tensor_bits = select_bits(weight_name, bits, sensitive_bits, sensitive_patterns)
         wrapper = TurboQuantWrapper.from_packed(
             packed, norms,
             in_features=meta_module.in_features,
             out_features=meta_module.out_features,
-            bits=bits, group_size=group_size,
+            bits=tensor_bits, group_size=group_size,
             bias=bias,
         )
 
@@ -476,9 +498,10 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         packed = loaded[base_name + ".tq_packed"]
         norms = loaded[base_name + ".tq_norms"]
 
+        tensor_bits = select_bits(base_name, bits, sensitive_bits, sensitive_patterns)
         compressed = Compressed3D.from_packed(
             packed, norms, shape=tuple(orig_shape),
-            dtype=torch.float16, bits=bits, group_size=group_size,
+            dtype=torch.float16, bits=tensor_bits, group_size=group_size,
         )
 
         setattr(owner, f"_tq_{param_name}", compressed)
@@ -648,9 +671,10 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             stacked_packed = torch.cat(all_packed, dim=0)
             stacked_norms = torch.cat(all_norms, dim=0)
 
+            target_bits = select_bits(target_key, bits, sensitive_bits, sensitive_patterns)
             compressed = Compressed3D.from_packed(
                 stacked_packed, stacked_norms, shape=tuple(orig_shape),
-                dtype=torch.float16, bits=bits, group_size=group_size,
+                dtype=torch.float16, bits=target_bits, group_size=group_size,
             )
 
             setattr(owner, f"_tq_{param_name}", compressed)

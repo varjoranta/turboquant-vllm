@@ -331,6 +331,20 @@ class TurboQuantWrapper(nn.Module):
 # Layers to never quantize
 _SKIP_PATTERNS = ("lm_head", "embed", "norm", "head")
 
+# Layers that benefit from higher precision (attention output + MLP output)
+_SENSITIVE_PATTERNS = ("o_proj", "down_proj")
+
+
+def select_bits(tensor_name: str, default_bits: int,
+                sensitive_bits: int | None = None,
+                sensitive_patterns: tuple[str, ...] = _SENSITIVE_PATTERNS) -> int:
+    """Return bits for this tensor. Sensitive layers get higher precision."""
+    if sensitive_bits is None:
+        return default_bits
+    if any(p in tensor_name for p in sensitive_patterns):
+        return sensitive_bits
+    return default_bits
+
 
 class Compressed3D:
     """Stores a compressed 3D expert weight tensor (num_experts, out_dim, in_dim).
