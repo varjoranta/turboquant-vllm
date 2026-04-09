@@ -156,7 +156,12 @@ def register():
                 # Fallback: 1 byte per index
                 packed_cols = n_groups * self.group_size
 
-            tq_packed = ModelWeightParameter(
+            # packed_factor: ratio of uncompressed input dim to packed dim
+            # vLLM uses this to correctly shard packed weights in TP
+            from fractions import Fraction
+            pack_ratio = Fraction(padded_in, packed_cols)
+
+            tq_packed = PackedvLLMParameter(
                 data=torch.empty(
                     output_size_per_partition,
                     packed_cols,
@@ -164,11 +169,14 @@ def register():
                 ),
                 input_dim=1,
                 output_dim=0,
+                packed_dim=1,
+                packed_factor=pack_ratio,
                 weight_loader=weight_loader,
             )
 
             # Norms: (out_features, n_groups) as float32
-            tq_norms = GroupQuantScaleParameter(
+            # n_groups = padded_in / group_size, so pack ratio is group_size
+            tq_norms = PackedvLLMParameter(
                 data=torch.empty(
                     output_size_per_partition,
                     n_groups,
@@ -176,6 +184,8 @@ def register():
                 ),
                 input_dim=1,
                 output_dim=0,
+                packed_dim=1,
+                packed_factor=self.group_size,
                 weight_loader=weight_loader,
             )
 

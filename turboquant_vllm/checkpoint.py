@@ -186,13 +186,8 @@ def save_tq3_checkpoint(
                     packed, norms = _compress_tensor(
                         tensor, tensor_quantizer, tensor_bits, group_size
                     )
-                    # Strip .weight suffix for vLLM compatibility:
-                    # vLLM layers have tq_packed/tq_norms as direct parameters,
-                    # not sub-attributes of .weight
-                    base_name = (tensor_name.removesuffix(".weight")
-                                 if tensor_name.endswith(".weight") else tensor_name)
-                    _add_tensor(base_name + ".tq_packed", packed)
-                    _add_tensor(base_name + ".tq_norms", norms)
+                    _add_tensor(tensor_name + ".tq_packed", packed)
+                    _add_tensor(tensor_name + ".tq_norms", norms)
 
                     comp_bytes = packed.numel() + norms.numel() * norms.element_size()
                     total_compressed += comp_bytes
@@ -510,6 +505,9 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
         except (AttributeError, TypeError):
             continue  # handle in 4b
 
+        if not isinstance(meta_param, (torch.Tensor, nn.Parameter)):
+            continue  # not a tensor (e.g., a sub-module like Router)
+
         orig_shape = meta_param.shape
         if len(orig_shape) != 3:
             continue  # 2D weights handled in 4b (regrouping or standalone)
@@ -589,6 +587,10 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
                     meta_param = getattr(owner, param_name)
                 except (AttributeError, TypeError):
                     continue
+
+                if not isinstance(meta_param, (torch.Tensor, nn.Parameter)):
+                    continue  # sub-module, not a parameter
+
                 if len(meta_param.shape) != 2:
                     continue
                 # Decompress and set directly (e.g., gate.weight on Router)
