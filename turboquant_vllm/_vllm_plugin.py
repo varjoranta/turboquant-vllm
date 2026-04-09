@@ -44,6 +44,10 @@ def register():
     weight_bits = os.environ.get("TQ_WEIGHT_BITS")
     kv_k_bits = os.environ.get("TQ_KV_K_BITS")
 
+    if weight_bits is not None or kv_k_bits is not None:
+        logger.info("TurboQuant plugin activated (pid=%d, TQ_WEIGHT_BITS=%s, TQ_KV_K_BITS=%s)",
+                     os.getpid(), weight_bits, kv_k_bits)
+
     if weight_bits is None and kv_k_bits is None:
         return
 

@@ -653,9 +653,22 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
             )
 
     # Phase 1: Replace nn.Linear layers with TurboQuantWrapper
+    # Also match vLLM's parallel linear layers (ColumnParallelLinear, etc.)
+    # which have .weight but inherit from LinearBase, not nn.Linear
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
-            continue
+            # Check for vLLM parallel linears: have weight + input_size/output_size
+            if not (hasattr(module, 'weight')
+                    and isinstance(getattr(module, 'weight', None), (torch.Tensor, nn.Parameter))
+                    and (hasattr(module, 'input_size') or hasattr(module, 'in_features'))):
+                continue
+            # Normalize attribute names for vLLM compatibility
+            if not hasattr(module, 'in_features') and hasattr(module, 'input_size'):
+                module.in_features = module.input_size
+            if not hasattr(module, 'out_features') and hasattr(module, 'output_size_per_partition'):
+                module.out_features = module.output_size_per_partition
+            elif not hasattr(module, 'out_features') and hasattr(module, 'output_size'):
+                module.out_features = module.output_size
         if module.in_features < min_size and module.out_features < min_size:
             continue
         if any(p in name.lower() for p in _SKIP_PATTERNS):
