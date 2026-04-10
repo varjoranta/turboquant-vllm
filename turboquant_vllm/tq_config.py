@@ -147,14 +147,16 @@ class TurboQuantConfig:
 
         Packing scheme (must match native_backend._store_kv/_decode_attention_python):
           4-bit: nibble pack → head_dim // 2 bytes  (2 indices per byte, 4 bits each)
-          3-bit: nibble pack → head_dim // 2 bytes  (waste 1 bit per nibble, avoids cross-byte)
+          3-bit: true 3-bit pack → 3 * head_dim // 8 bytes  (8 indices into 3 bytes, requires head_dim % 8 == 0)
           2-bit: 4-per-byte → head_dim // 4 bytes
           other: tight bit pack → ceil(head_dim * mse_bits / 8)
         """
         d = self.head_dim
         b = self.mse_bits
-        if b in (3, 4) and d % 2 == 0:
+        if b == 4 and d % 2 == 0:
             mse_bytes = d // 2   # nibble packing
+        elif b == 3 and d % 8 == 0:
+            mse_bytes = 3 * d // 8  # true 3-bit: 8 indices → 3 bytes
         elif b == 2 and d % 4 == 0:
             mse_bytes = d // 4   # 2-per-byte
         else:

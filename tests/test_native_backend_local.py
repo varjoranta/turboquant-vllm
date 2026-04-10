@@ -47,12 +47,11 @@ class TestTurboQuantConfig(unittest.TestCase):
         self.assertEqual(c.mse_bits, 3)
         self.assertEqual(c.n_centroids, 8)
         self.assertTrue(c.no_qjl)
-        # 3-bit nibble pack: 128//2 + 2 = 66 bytes (wastes 1 bit/index but
-        # avoids cross-byte reads on decode)
-        self.assertEqual(c.key_packed_size, 66)
+        # True 3-bit pack: 8 indices → 3 bytes, so 128 * 3/8 = 48 + 2 = 50
+        self.assertEqual(c.key_packed_size, 50)
         # value FP8 = 128 bytes
         self.assertEqual(c.value_packed_size, 128)
-        self.assertEqual(c.slot_size, 194)
+        self.assertEqual(c.slot_size, 178)
 
     def test_tq4_no_qjl(self):
         from turboquant_vllm.tq_config import TurboQuantConfig
@@ -254,14 +253,24 @@ class TestStoreDecodeCPU(unittest.TestCase):
         # Manually decode one token to check quality
         # Decode slot 0: read packed key, unpack MSE indices, reconstruct
         slot = kv_cache[0, 0, 0]  # (slot_size,) for head 0
-        # 3-bit nibble pack: D//2 bytes, 2 indices per byte
-        mse_bytes_n = D // 2
+        # True 3-bit pack: 8 indices → 3 bytes (3*D/8 total bytes)
+        mse_bytes_n = 3 * D // 8
         mse_raw = slot[:mse_bytes_n]
 
-        # Nibble unpack: [low_nibble, high_nibble] per byte
-        mse_sh = torch.tensor([0, 4], dtype=torch.int32)
-        expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
-        idx = (expanded & 0x7).reshape(-1)[:D]  # mask 0x7 for 3-bit
+        # Unpack 8 indices from every 3 bytes (inverse of the store layout)
+        b0 = mse_raw[0::3].int()  # (D/8,)
+        b1 = mse_raw[1::3].int()
+        b2 = mse_raw[2::3].int()
+        idx = torch.stack([
+            b0 & 0x7,
+            (b0 >> 3) & 0x7,
+            ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2),
+            (b1 >> 1) & 0x7,
+            (b1 >> 4) & 0x7,
+            ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1),
+            (b2 >> 2) & 0x7,
+            (b2 >> 5) & 0x7,
+        ], dim=-1).reshape(-1)[:D]
 
         centroids = get_centroids(D, cfg.mse_bits)
         c_vals = centroids[idx.long()]

@@ -33,6 +33,8 @@ import torch
 import torch.nn.functional as F
 from turboquant_vllm.tq_config import TurboQuantConfig
 
+from turboquant_vllm.tq_config import TurboQuantConfig
+
 _USE_STREAM_OVERLAP = os.environ.get("TQ_STREAM_OVERLAP", "0") == "1"
 _TQ_NO_QJL = os.environ.get("TQ_NO_QJL", "1") == "1"
 
@@ -436,9 +438,12 @@ class TurboQuantAttentionImpl:
         mse_bits = self.tq_config.mse_bits
         kps = self.tq_config.key_packed_size
         # mse_bytes_n must match the packing branch taken below.
-        # 3/4-bit nibble: D//2, 2-bit: D//4, else: ceil.
-        if mse_bits in (3, 4) and D % 2 == 0:
+        # 4-bit nibble: D//2, 3-bit tight (8→3 bytes): 3*D//8 when D%8==0,
+        # 2-bit: D//4, else tight bit-packing: ceil(D*mse_bits/8).
+        if mse_bits == 4 and D % 2 == 0:
             mse_bytes_n = D // 2
+        elif mse_bits == 3 and D % 8 == 0:
+            mse_bytes_n = 3 * D // 8
         elif mse_bits == 2 and D % 4 == 0:
             mse_bytes_n = D // 4
         else:
@@ -468,13 +473,32 @@ class TurboQuantAttentionImpl:
 
         # Pack MSE indices.
         # 4-bit: nibble pack (D//2 bytes)
-        # 3-bit: also nibble pack — indices are 0..7, still fit in 4 bits;
-        #        wastes 1 bit per index but avoids cross-byte reads on decode
+        # 3-bit: tight 8-into-3-bytes pack when D % 8 == 0 (3D/8 bytes)
         # 2-bit: 4-per-byte (D//4 bytes)
         # other: tight byte-spanning pack (ceil(D*mse_bits/8) bytes)
-        if mse_bits in (3, 4) and D % 2 == 0:
+        if mse_bits == 4 and D % 2 == 0:
             idx_r = idx.reshape(-1, D // 2, 2)
             packed_mse = (idx_r[:, :, 0].int() | (idx_r[:, :, 1].int() << 4)).to(torch.uint8)
+        elif mse_bits == 3 and D % 8 == 0:
+            # True 3-bit packing: 8 indices → 3 bytes (Gaby PR #4)
+            idx_r = idx.reshape(-1, D // 8, 8).int()
+            packed_mse = torch.empty(N * H, D // 8 * 3, dtype=torch.uint8, device=device)
+            packed_mse[:, 0::3] = (
+                (idx_r[:, :, 0] & 0x7)
+                | ((idx_r[:, :, 1] & 0x7) << 3)
+                | ((idx_r[:, :, 2] & 0x3) << 6)
+            ).to(torch.uint8)
+            packed_mse[:, 1::3] = (
+                ((idx_r[:, :, 2] >> 2) & 0x1)
+                | ((idx_r[:, :, 3] & 0x7) << 1)
+                | ((idx_r[:, :, 4] & 0x7) << 4)
+                | ((idx_r[:, :, 5] & 0x1) << 7)
+            ).to(torch.uint8)
+            packed_mse[:, 2::3] = (
+                ((idx_r[:, :, 5] >> 1) & 0x3)
+                | ((idx_r[:, :, 6] & 0x7) << 2)
+                | ((idx_r[:, :, 7] & 0x7) << 5)
+            ).to(torch.uint8)
         elif mse_bits == 2 and D % 4 == 0:
             idx_r = idx.reshape(-1, D // 4, 4)
             packed_mse = (idx_r.int() << self._shift_2bit).sum(-1).to(torch.uint8)
@@ -643,9 +667,12 @@ class TurboQuantAttentionImpl:
         Hk = self.num_kv_heads
         kps = self.tq_config.key_packed_size
         mse_bits = self.tq_config.mse_bits
-        # Must match store path: 3/4-bit nibble, 2-bit 4-per-byte, else tight.
-        if mse_bits in (3, 4) and D % 2 == 0:
+        # Must match store path: 4-bit nibble (D/2), 3-bit tight (3D/8),
+        # 2-bit 4-per-byte (D/4), else generic ceil(D*b/8).
+        if mse_bits == 4 and D % 2 == 0:
             mse_bytes_n = D // 2
+        elif mse_bits == 3 and D % 8 == 0:
+            mse_bytes_n = 3 * D // 8
         elif mse_bits == 2 and D % 4 == 0:
             mse_bytes_n = D // 4
         else:
@@ -667,12 +694,11 @@ class TurboQuantAttentionImpl:
         if mse_bits == 2:
             mse_sh: Optional[torch.Tensor] = torch.tensor([0, 2, 4, 6], device=device, dtype=torch.int32)
             mse_mask = 0x3
-        elif mse_bits in (3, 4):
-            # Nibble packing: 2 indices per byte. For 3-bit, the high bit of
-            # each nibble is unused (values 0..7 fit in lower 3 bits).
+        elif mse_bits == 4:
             mse_sh = torch.tensor([0, 4], device=device, dtype=torch.int32)
             mse_mask = 0xF
         else:
+            # 3-bit uses its own 8-into-3-bytes unpack below — no shift tensor
             mse_sh = None
             mse_mask = (1 << mse_bits) - 1
 
@@ -692,17 +718,37 @@ class TurboQuantAttentionImpl:
             if mse_bits == 2 and D % 4 == 0:
                 expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
                 idx = (expanded & mse_mask).reshape(seq_len, Hk, -1)[:, :, :D]
-            elif mse_bits in (3, 4) and D % 2 == 0:
-                # Nibble unpack matches nibble store path for both 3- and 4-bit
+            elif mse_bits == 4 and D % 2 == 0:
+                # Nibble unpack (4-bit only; 3-bit has its own tight path below)
                 expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
                 idx = (expanded & mse_mask).reshape(seq_len, Hk, -1)[:, :, :D]
+            elif mse_bits == 3 and D % 8 == 0:
+                b0 = mse_raw[:, :, 0::3].int()
+                b1 = mse_raw[:, :, 1::3].int()
+                b2 = mse_raw[:, :, 2::3].int()
+                idx = torch.stack([
+                    b0 & 7,
+                    (b0 >> 3) & 7,
+                    ((b0 >> 6) | (b1 << 2)) & 7,
+                    (b1 >> 1) & 7,
+                    (b1 >> 4) & 7,
+                    ((b1 >> 7) | (b2 << 1)) & 7,
+                    (b2 >> 2) & 7,
+                    (b2 >> 5) & 7,
+                ], dim=-1).reshape(seq_len, Hk, D)
             else:
                 j = torch.arange(D, device=device)
                 bo = j * mse_bits
                 bi = (bo // 8).long()
                 si = (bo % 8).int()
-                b0 = mse_raw[:, :, bi]
-                idx = (b0.int() >> si) & ((1 << mse_bits) - 1)
+                mse_raw_padded = F.pad(mse_raw, (0, 1))
+                b0 = mse_raw_padded[:, :, bi].int()
+                val = (b0 >> si) & ((1 << mse_bits) - 1)
+                need_next = si + mse_bits > 8
+                bi_next = bi + 1
+                b1 = mse_raw_padded[:, :, bi_next].int()
+                high = (b1 << (8 - si)) & ((1 << mse_bits) - 1)
+                idx = torch.where(need_next, val | high, val)
 
             c_vals = centroids[idx.long()]
 
