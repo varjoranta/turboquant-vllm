@@ -26,6 +26,7 @@ import torch
 try:
     import triton
     import triton.language as tl
+
     HAS_TRITON = True
 except ImportError:
     HAS_TRITON = False
@@ -37,22 +38,29 @@ if HAS_TRITON:
     def _tq_fused_gemm_kernel(
         # Activation: (M, K) row-major
         a_ptr,
-        stride_am, stride_ak,
+        stride_am,
+        stride_ak,
         # Compressed weight: packed (N, K_packed) uint8, norms (N, n_groups) float32
-        packed_ptr, norms_ptr,
-        stride_packed_n, stride_packed_k,
-        stride_norms_n, stride_norms_g,
+        packed_ptr,
+        norms_ptr,
+        stride_packed_n,
+        stride_packed_k,
+        stride_norms_n,
+        stride_norms_g,
         # Pre-computed rotation matrix: (GROUP_SIZE, GROUP_SIZE) float32
         w_rot_ptr,
         # Centroids: (n_centroids,) float32
         centroids_ptr,
         # Output: (M, N)
         c_ptr,
-        stride_cm, stride_cn,
+        stride_cm,
+        stride_cn,
         # Bias: (N,) or None
         bias_ptr,
         # Dimensions
-        M, N, K,
+        M,
+        N,
+        K,
         n_groups,
         # Constexprs
         GROUP_SIZE: tl.constexpr,
@@ -95,13 +103,9 @@ if HAS_TRITON:
             if BITS == 4:
                 byte_idx = offs_k // 2
                 is_hi = (offs_k % 2).to(tl.int32)
-                packed_elem_offs = (packed_row[:, None] * stride_packed_n
-                                   + byte_idx[None, :] * stride_packed_k)
-                packed_bytes = tl.load(packed_ptr + packed_elem_offs,
-                                       mask=offs_n[:, None] < N, other=0).to(tl.int32)
-                indices = tl.where(is_hi[None, :] > 0,
-                                   (packed_bytes >> 4) & 0xF,
-                                   packed_bytes & 0xF)
+                packed_elem_offs = packed_row[:, None] * stride_packed_n + byte_idx[None, :] * stride_packed_k
+                packed_bytes = tl.load(packed_ptr + packed_elem_offs, mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                indices = tl.where(is_hi[None, :] > 0, (packed_bytes >> 4) & 0xF, packed_bytes & 0xF)
             elif BITS == 3:
                 # 3-bit sub-byte: 8 indices per 3 bytes
                 group_of_8 = offs_k // 8
@@ -125,16 +129,12 @@ if HAS_TRITON:
             elif BITS == 2:
                 byte_idx = offs_k // 4
                 shift = (offs_k % 4).to(tl.int32) * 2
-                packed_elem_offs = (packed_row[:, None] * stride_packed_n
-                                   + byte_idx[None, :] * stride_packed_k)
-                packed_bytes = tl.load(packed_ptr + packed_elem_offs,
-                                       mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                packed_elem_offs = packed_row[:, None] * stride_packed_n + byte_idx[None, :] * stride_packed_k
+                packed_bytes = tl.load(packed_ptr + packed_elem_offs, mask=offs_n[:, None] < N, other=0).to(tl.int32)
                 indices = (packed_bytes >> shift[None, :]) & 0x3
             else:
-                packed_elem_offs = (packed_row[:, None] * stride_packed_n
-                                   + offs_k[None, :] * stride_packed_k)
-                indices = tl.load(packed_ptr + packed_elem_offs,
-                                  mask=offs_n[:, None] < N, other=0).to(tl.int32)
+                packed_elem_offs = packed_row[:, None] * stride_packed_n + offs_k[None, :] * stride_packed_k
+                indices = tl.load(packed_ptr + packed_elem_offs, mask=offs_n[:, None] < N, other=0).to(tl.int32)
 
             # Codebook lookup: (BLOCK_N, GROUP_SIZE) float
             centroid_vec = tl.load(centroids_ptr + indices)
@@ -162,8 +162,7 @@ if HAS_TRITON:
         tl.store(c_ptr + c_offs, acc.to(c_ptr.type.element_ty), mask=c_mask)
 
 
-def _build_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor,
-                           group_size: int) -> torch.Tensor:
+def _build_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor, group_size: int) -> torch.Tensor:
     """Pre-compute inverse rotation matrix W_rot = H @ D2 @ D1 / sqrt(n).
 
     Row i is the rotated basis vector i. Used by:
@@ -180,8 +179,8 @@ def _build_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor,
     eye = torch.eye(n, device=signs1.device, dtype=torch.float32)
 
     # Apply inverse rotation to identity rows: D2 -> H -> scale by D1
-    rotated = eye * signs2.unsqueeze(0)      # right-multiply by D2
-    rotated = _fast_wht_batch(rotated)       # H @ D2
+    rotated = eye * signs2.unsqueeze(0)  # right-multiply by D2
+    rotated = _fast_wht_batch(rotated)  # H @ D2
     rotated = rotated * signs1.unsqueeze(0)  # column-wise D1: H @ D2 @ D1
 
     return rotated
@@ -249,15 +248,25 @@ def tq_fused_gemm(
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _tq_fused_gemm_kernel[grid](
-        x, x.stride(0), x.stride(1),
-        packed_weight, norms,
-        packed_weight.stride(0), packed_weight.stride(1),
-        norms.stride(0), norms.stride(1),
+        x,
+        x.stride(0),
+        x.stride(1),
+        packed_weight,
+        norms,
+        packed_weight.stride(0),
+        packed_weight.stride(1),
+        norms.stride(0),
+        norms.stride(1),
         w_rot,
         centroids,
-        output, output.stride(0), output.stride(1),
+        output,
+        output.stride(0),
+        output.stride(1),
         bias,
-        M, N, K, n_groups,
+        M,
+        N,
+        K,
+        n_groups,
         GROUP_SIZE=group_size,
         BITS=bits,
         BLOCK_M=BLOCK_M,
@@ -286,8 +295,7 @@ def tq_fused_gemm(
 _rotation_matrix_cache: dict[tuple, torch.Tensor] = {}
 
 
-def _get_cached_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor,
-                                group_size: int) -> torch.Tensor:
+def _get_cached_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor, group_size: int) -> torch.Tensor:
     """Get cached rotation matrix for (signs1, signs2, group_size).
 
     Keyed by tensor identity (id) since sign vectors are long-lived module
@@ -295,8 +303,7 @@ def _get_cached_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor,
     """
     key = (id(signs1), id(signs2), group_size)
     if key not in _rotation_matrix_cache:
-        _rotation_matrix_cache[key] = _build_rotation_matrix(
-            signs1, signs2, group_size).contiguous()
+        _rotation_matrix_cache[key] = _build_rotation_matrix(signs1, signs2, group_size).contiguous()
     return _rotation_matrix_cache[key]
 
 
@@ -323,9 +330,7 @@ class FWHTInputCache:
         self._result: torch.Tensor | None = None
 
     def get(self, x: torch.Tensor) -> torch.Tensor | None:
-        if (x.data_ptr() == self._ptr
-                and x.untyped_storage().data_ptr() == self._storage_ptr
-                and x.shape == self._shape):
+        if x.data_ptr() == self._ptr and x.untyped_storage().data_ptr() == self._storage_ptr and x.shape == self._shape:
             # Verify content hasn't changed (catches memory reuse across forward passes).
             # Cheap: compare first + last few elements instead of full tensor.
             if self._fingerprint is not None:
@@ -391,37 +396,48 @@ if HAS_TRITON:
 
     @triton.autotune(
         configs=[
-            triton.Config({'BLOCK_M': 1, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_M': 1, 'BLOCK_N': 256}, num_warps=8, num_stages=2),
-            triton.Config({'BLOCK_M': 4, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_M': 8, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_M': 8, 'BLOCK_N': 128}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
-            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
-            triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=2),
-            triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 1, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 1, "BLOCK_N": 256}, num_warps=8, num_stages=2),
+            triton.Config({"BLOCK_M": 4, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 8, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 8, "BLOCK_N": 128}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 16, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 16, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+            triton.Config({"BLOCK_M": 32, "BLOCK_N": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+            triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
         ],
-        key=['batch_size', 'out_f', 'in_f_padded'],
+        key=["batch_size", "out_f", "in_f_padded"],
     )
     @triton.jit
     def _polar_fused_gemm_kernel(
         # Rotated input: (batch, in_f_padded), float32
-        x_rot_ptr, stride_xm, stride_xk,
+        x_rot_ptr,
+        stride_xm,
+        stride_xk,
         # Packed codes: (out_f, packed_cols), uint8
-        codes_ptr, stride_cn, stride_ck,
+        codes_ptr,
+        stride_cn,
+        stride_ck,
         # Per-group norms: (out_f, n_groups), float32
-        norms_ptr, stride_nn, stride_ng,
+        norms_ptr,
+        stride_nn,
+        stride_ng,
         # Pre-scaled centroids: (n_centroids,), float32
         ct_ptr,
         # Output: (batch, out_f)
-        out_ptr, stride_om, stride_on,
+        out_ptr,
+        stride_om,
+        stride_on,
         # Bias: (out_f,) or None
         bias_ptr,
         # Dims
-        batch_size, out_f, in_f_padded, n_groups,
+        batch_size,
+        out_f,
+        in_f_padded,
+        n_groups,
         # Constexprs
-        BLOCK_K: tl.constexpr,    # = group_size = 128
+        BLOCK_K: tl.constexpr,  # = group_size = 128
         BITS: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -562,20 +578,34 @@ def tq_fwht_input_gemm(
     output = torch.empty(M, N, dtype=x.dtype, device=x.device)
 
     BLOCK_K = group_size
-    grid = lambda META: (
-        triton.cdiv(M, META['BLOCK_M']),
-        triton.cdiv(N, META['BLOCK_N']),
-    )
+
+    def grid(META):
+        return (
+            triton.cdiv(M, META["BLOCK_M"]),
+            triton.cdiv(N, META["BLOCK_N"]),
+        )
 
     _polar_fused_gemm_kernel[grid](
-        x_rot, x_rot.stride(0), x_rot.stride(1),
-        packed_weight, packed_weight.stride(0), packed_weight.stride(1),
-        norms, norms.stride(0), norms.stride(1),
+        x_rot,
+        x_rot.stride(0),
+        x_rot.stride(1),
+        packed_weight,
+        packed_weight.stride(0),
+        packed_weight.stride(1),
+        norms,
+        norms.stride(0),
+        norms.stride(1),
         centroids,
-        output, output.stride(0), output.stride(1),
+        output,
+        output.stride(0),
+        output.stride(1),
         bias,
-        M, N, padded_K, n_groups,
-        BLOCK_K=BLOCK_K, BITS=bits,
+        M,
+        N,
+        padded_K,
+        n_groups,
+        BLOCK_K=BLOCK_K,
+        BITS=bits,
     )
 
     if len(orig_shape) > 2:
@@ -605,13 +635,19 @@ if HAS_TRITON:
 
     @triton.jit
     def _planar_quantize_kernel(
-        input_ptr, indices_ptr, norms_out_ptr,
-        cos_sin_ptr, centroids_ptr,
-        batch_size, emb_dim,
+        input_ptr,
+        indices_ptr,
+        norms_out_ptr,
+        cos_sin_ptr,
+        centroids_ptr,
+        batch_size,
+        emb_dim,
         n_pairs: tl.constexpr,
         n_levels: tl.constexpr,
-        stride_in_b, stride_in_d,
-        stride_idx_b, stride_idx_d,
+        stride_in_b,
+        stride_in_d,
+        stride_idx_b,
+        stride_idx_d,
         BLOCK_P: tl.constexpr,
     ):
         """Quantize only — returns uint8 indices. Norms stored separately."""
@@ -626,10 +662,8 @@ if HAS_TRITON:
 
         d0 = p_offs * 2
         d1 = d0 + 1
-        v0 = tl.load(input_ptr + pid_b * stride_in_b + d0 * stride_in_d,
-                      mask=p_mask & (d0 < emb_dim), other=0.0)
-        v1 = tl.load(input_ptr + pid_b * stride_in_b + d1 * stride_in_d,
-                      mask=p_mask & (d1 < emb_dim), other=0.0)
+        v0 = tl.load(input_ptr + pid_b * stride_in_b + d0 * stride_in_d, mask=p_mask & (d0 < emb_dim), other=0.0)
+        v1 = tl.load(input_ptr + pid_b * stride_in_b + d1 * stride_in_d, mask=p_mask & (d1 < emb_dim), other=0.0)
 
         r0 = cos_t * v0 - sin_t * v1
         r1 = sin_t * v0 + cos_t * v1
@@ -637,20 +671,23 @@ if HAS_TRITON:
         idx0 = _quantize_nearest(r0, centroids_ptr, n_levels)
         idx1 = _quantize_nearest(r1, centroids_ptr, n_levels)
 
-        tl.store(indices_ptr + pid_b * stride_idx_b + d0 * stride_idx_d,
-                 idx0.to(tl.int8), mask=p_mask & (d0 < emb_dim))
-        tl.store(indices_ptr + pid_b * stride_idx_b + d1 * stride_idx_d,
-                 idx1.to(tl.int8), mask=p_mask & (d1 < emb_dim))
+        tl.store(indices_ptr + pid_b * stride_idx_b + d0 * stride_idx_d, idx0.to(tl.int8), mask=p_mask & (d0 < emb_dim))
+        tl.store(indices_ptr + pid_b * stride_idx_b + d1 * stride_idx_d, idx1.to(tl.int8), mask=p_mask & (d1 < emb_dim))
 
     @triton.jit
     def _planar_dequantize_kernel(
-        indices_ptr, output_ptr,
-        cos_sin_ptr, centroids_ptr,
-        batch_size, emb_dim,
+        indices_ptr,
+        output_ptr,
+        cos_sin_ptr,
+        centroids_ptr,
+        batch_size,
+        emb_dim,
         n_pairs: tl.constexpr,
         n_levels: tl.constexpr,
-        stride_idx_b, stride_idx_d,
-        stride_out_b, stride_out_d,
+        stride_idx_b,
+        stride_idx_d,
+        stride_out_b,
+        stride_out_d,
         BLOCK_P: tl.constexpr,
     ):
         """Dequantize: indices → inverse rotation → vectors."""
@@ -666,10 +703,12 @@ if HAS_TRITON:
         d0 = p_offs * 2
         d1 = d0 + 1
 
-        idx0 = tl.load(indices_ptr + pid_b * stride_idx_b + d0 * stride_idx_d,
-                        mask=p_mask & (d0 < emb_dim), other=0).to(tl.int32)
-        idx1 = tl.load(indices_ptr + pid_b * stride_idx_b + d1 * stride_idx_d,
-                        mask=p_mask & (d1 < emb_dim), other=0).to(tl.int32)
+        idx0 = tl.load(
+            indices_ptr + pid_b * stride_idx_b + d0 * stride_idx_d, mask=p_mask & (d0 < emb_dim), other=0
+        ).to(tl.int32)
+        idx1 = tl.load(
+            indices_ptr + pid_b * stride_idx_b + d1 * stride_idx_d, mask=p_mask & (d1 < emb_dim), other=0
+        ).to(tl.int32)
 
         q0 = tl.load(centroids_ptr + idx0, mask=p_mask, other=0.0)
         q1 = tl.load(centroids_ptr + idx1, mask=p_mask, other=0.0)
@@ -677,15 +716,13 @@ if HAS_TRITON:
         f0 = cos_t * q0 + sin_t * q1
         f1 = -sin_t * q0 + cos_t * q1
 
-        tl.store(output_ptr + pid_b * stride_out_b + d0 * stride_out_d,
-                 f0, mask=p_mask & (d0 < emb_dim))
-        tl.store(output_ptr + pid_b * stride_out_b + d1 * stride_out_d,
-                 f1, mask=p_mask & (d1 < emb_dim))
+        tl.store(output_ptr + pid_b * stride_out_b + d0 * stride_out_d, f0, mask=p_mask & (d0 < emb_dim))
+        tl.store(output_ptr + pid_b * stride_out_b + d1 * stride_out_d, f1, mask=p_mask & (d1 < emb_dim))
 
 
 def planar_quantize(
-    x: torch.Tensor,        # [batch, dim]
-    cos_sin: torch.Tensor,   # [n_pairs, 2]
+    x: torch.Tensor,  # [batch, dim]
+    cos_sin: torch.Tensor,  # [n_pairs, 2]
     centroids: torch.Tensor,  # [n_levels]
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton PlanarQuant quantize: normalize → rotate → quantize. Returns (indices, norms)."""
@@ -707,20 +744,28 @@ def planar_quantize(
     grid = (batch_size, triton.cdiv(n_pairs, BLOCK_P))
 
     _planar_quantize_kernel[grid](
-        x_unit, indices, norms,
-        cos_sin.float().contiguous(), centroids.float().contiguous(),
-        batch_size, emb_dim, n_pairs, n_levels,
-        x_unit.stride(0), x_unit.stride(1),
-        indices.stride(0), indices.stride(1),
+        x_unit,
+        indices,
+        norms,
+        cos_sin.float().contiguous(),
+        centroids.float().contiguous(),
+        batch_size,
+        emb_dim,
+        n_pairs,
+        n_levels,
+        x_unit.stride(0),
+        x_unit.stride(1),
+        indices.stride(0),
+        indices.stride(1),
         BLOCK_P=BLOCK_P,
     )
     return indices, norms
 
 
 def planar_dequantize(
-    indices: torch.Tensor,    # [batch, dim] int8
-    norms: torch.Tensor,      # [batch]
-    cos_sin: torch.Tensor,    # [n_pairs, 2]
+    indices: torch.Tensor,  # [batch, dim] int8
+    norms: torch.Tensor,  # [batch]
+    cos_sin: torch.Tensor,  # [n_pairs, 2]
     centroids: torch.Tensor,  # [n_levels]
 ) -> torch.Tensor:
     """Triton PlanarQuant dequantize: indices → inverse rotation → rescale."""
@@ -737,11 +782,18 @@ def planar_dequantize(
     grid = (batch_size, triton.cdiv(n_pairs, BLOCK_P))
 
     _planar_dequantize_kernel[grid](
-        indices, output,
-        cos_sin.float().contiguous(), centroids.float().contiguous(),
-        batch_size, emb_dim, n_pairs, n_levels,
-        indices.stride(0), indices.stride(1),
-        output.stride(0), output.stride(1),
+        indices,
+        output,
+        cos_sin.float().contiguous(),
+        centroids.float().contiguous(),
+        batch_size,
+        emb_dim,
+        n_pairs,
+        n_levels,
+        indices.stride(0),
+        indices.stride(1),
+        output.stride(0),
+        output.stride(1),
         BLOCK_P=BLOCK_P,
     )
 

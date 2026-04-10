@@ -9,6 +9,7 @@ Usage:
 
 Expects a vLLM server running at the given URL.
 """
+
 import argparse
 import asyncio
 import json
@@ -134,7 +135,9 @@ async def run_benchmark(base_url: str, model: str, max_tokens: int = 128):
         if "error" in r and isinstance(r["error"], str):
             print(f"{c:>4} | {'FAIL':>6}")
         else:
-            print(f"{c:>4} | {r['qps']:>6} | {r['throughput_tok_s']:>7} | {r['latency_p50_s']:>5}s | {r['latency_p95_s']:>5}s | {r['latency_p99_s']:>5}s | {r['errors']:>6}")
+            print(
+                f"{c:>4} | {r['qps']:>6} | {r['throughput_tok_s']:>7} | {r['latency_p50_s']:>5}s | {r['latency_p95_s']:>5}s | {r['latency_p99_s']:>5}s | {r['errors']:>6}"
+            )
 
     print()
     return results

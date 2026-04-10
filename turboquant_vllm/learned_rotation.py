@@ -18,7 +18,6 @@ Usage:
 """
 
 import logging
-import math
 import torch
 import torch.nn as nn
 
@@ -32,8 +31,8 @@ def _cayley_transform(A: torch.Tensor) -> torch.Tensor:
     This parameterizes the Stiefel manifold (orthogonal matrices) smoothly.
     """
     n = A.shape[0]
-    I = torch.eye(n, device=A.device, dtype=A.dtype)
-    return torch.linalg.solve(I + A, I - A)
+    eye = torch.eye(n, device=A.device, dtype=A.dtype)
+    return torch.linalg.solve(eye + A, eye - A)
 
 
 def _skew_symmetric(M: torch.Tensor) -> torch.Tensor:
@@ -86,8 +85,8 @@ def optimize_rotation(
     # Parameterize as Cayley(A) where A is skew-symmetric
     # Initialize A so that Cayley(A) ≈ R_init
     # For small perturbations: A ≈ (R_init - I)(R_init + I)^{-1} (inverse Cayley)
-    I = torch.eye(n, device=device, dtype=torch.float32)
-    A_init = torch.linalg.solve(R_init + I, R_init - I)
+    eye = torch.eye(n, device=device, dtype=torch.float32)
+    A_init = torch.linalg.solve(R_init + eye, R_init - eye)
     A_param = nn.Parameter(_skew_symmetric(A_init))
 
     optimizer = torch.optim.Adam([A_param], lr=lr)
@@ -106,7 +105,7 @@ def optimize_rotation(
     safe_norms = torch.where(norms > 0, norms, torch.ones_like(norms))
     w_unit = w_sample / safe_norms
 
-    best_loss = float('inf')
+    best_loss = float("inf")
     best_R = R_init.clone()
 
     for step in range(steps):
@@ -170,9 +169,6 @@ def optimize_all_rotations(
     rotations: dict[str, torch.Tensor] = {}
     total_layers = 0
 
-    # Group layers by similar statistics to share rotations
-    layer_groups: dict[str, list[str]] = {}  # cluster_key → [layer_names]
-
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):
             continue
@@ -199,8 +195,7 @@ def optimize_all_rotations(
         if total_layers % 100 == 0:
             logger.info("Optimized rotations for %d layers...", total_layers)
 
-    logger.info("Rotation optimization complete: %d layers, %d unique rotations",
-                total_layers, len(rotations))
+    logger.info("Rotation optimization complete: %d layers, %d unique rotations", total_layers, len(rotations))
     return rotations
 
 
@@ -246,8 +241,7 @@ def quantize_with_learned_rotation(
     y = units @ rotation.T
 
     # Quantize
-    centroids = torch.tensor(optimal_centroids(bits, group_size),
-                             device=weight.device, dtype=torch.float32)
+    centroids = torch.tensor(optimal_centroids(bits, group_size), device=weight.device, dtype=torch.float32)
     boundaries = (centroids[:-1] + centroids[1:]) / 2
     indices = torch.searchsorted(boundaries, y.contiguous())
 

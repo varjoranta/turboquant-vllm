@@ -28,27 +28,30 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
         """Pass a local dir and verify HF Hub is not touched and local source shards are not deleted."""
         from turboquant_vllm.checkpoint import save_tq3_checkpoint
 
-        with tempfile.TemporaryDirectory() as srcdir, \
-             tempfile.TemporaryDirectory() as outdir:
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
             source_shard = os.path.join(srcdir, "model-00001-of-00001.safetensors")
             # Create a minimal safetensors shard with one small 2D tensor
             from safetensors.torch import save_file
+
             weight = torch.randn(8, 8)  # too small to actually compress (< 128)
-            save_file({"model.layers.0.mlp.fake.weight": weight},
-                      source_shard)
+            save_file({"model.layers.0.mlp.fake.weight": weight}, source_shard)
 
             # Fake config.json so AutoConfig.from_pretrained works
             import json
+
             with open(os.path.join(srcdir, "config.json"), "w") as f:
-                json.dump({
-                    "model_type": "bert",  # simplest arch with no tokenizer requirement
-                    "hidden_size": 8,
-                    "num_hidden_layers": 1,
-                    "num_attention_heads": 1,
-                    "vocab_size": 10,
-                    "intermediate_size": 8,
-                    "max_position_embeddings": 16,
-                }, f)
+                json.dump(
+                    {
+                        "model_type": "bert",  # simplest arch with no tokenizer requirement
+                        "hidden_size": 8,
+                        "num_hidden_layers": 1,
+                        "num_attention_heads": 1,
+                        "vocab_size": 10,
+                        "intermediate_size": 8,
+                        "max_position_embeddings": 16,
+                    },
+                    f,
+                )
             # Fake tokenizer file so AutoTokenizer doesn't go online
             with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
                 json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
@@ -60,14 +63,15 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
             # raises for any reason other than the mock sentinels, this test
             # should fail so we know the shard-preservation code path was not
             # reached.
-            with mock.patch(
-                "huggingface_hub.HfApi.list_repo_files",
-                side_effect=AssertionError(
-                    "save_tq3_checkpoint must not call HfApi for a local path"),
-            ), mock.patch(
-                "huggingface_hub.hf_hub_download",
-                side_effect=AssertionError(
-                    "save_tq3_checkpoint must not call hf_hub_download for a local path"),
+            with (
+                mock.patch(
+                    "huggingface_hub.HfApi.list_repo_files",
+                    side_effect=AssertionError("save_tq3_checkpoint must not call HfApi for a local path"),
+                ),
+                mock.patch(
+                    "huggingface_hub.hf_hub_download",
+                    side_effect=AssertionError("save_tq3_checkpoint must not call hf_hub_download for a local path"),
+                ),
             ):
                 save_tq3_checkpoint(
                     model_id=srcdir,
@@ -85,10 +89,10 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
         """Empty local directory should raise a clear FileNotFoundError."""
         from turboquant_vllm.checkpoint import save_tq3_checkpoint
 
-        with tempfile.TemporaryDirectory() as srcdir, \
-             tempfile.TemporaryDirectory() as outdir:
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
             # config.json but no safetensors
             import json
+
             with open(os.path.join(srcdir, "config.json"), "w") as f:
                 json.dump({"model_type": "bert"}, f)
             with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
@@ -98,7 +102,10 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
 
             with self.assertRaises(FileNotFoundError) as ctx:
                 save_tq3_checkpoint(
-                    model_id=srcdir, output_dir=outdir, bits=3, group_size=8,
+                    model_id=srcdir,
+                    output_dir=outdir,
+                    bits=3,
+                    group_size=8,
                 )
             self.assertIn("No .safetensors shards", str(ctx.exception))
 
@@ -106,18 +113,19 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
         """Non-float tensors should contribute their real dtype byte size."""
         from turboquant_vllm.checkpoint import save_tq3_checkpoint
 
-        with tempfile.TemporaryDirectory() as srcdir, \
-             tempfile.TemporaryDirectory() as outdir:
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
             from safetensors.torch import save_file
+
             save_file(
                 {
                     "float_tensor": torch.ones(4, dtype=torch.float32),  # 16 -> 8 bytes (fp16)
-                    "int_tensor": torch.arange(3, dtype=torch.int64),    # 24 -> 24 bytes
+                    "int_tensor": torch.arange(3, dtype=torch.int64),  # 24 -> 24 bytes
                 },
                 os.path.join(srcdir, "model-00001-of-00001.safetensors"),
             )
 
             import json
+
             with open(os.path.join(srcdir, "config.json"), "w") as f:
                 json.dump({"model_type": "bert", "vocab_size": 10}, f)
             with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:

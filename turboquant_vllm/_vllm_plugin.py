@@ -17,12 +17,14 @@ Environment variables:
     TQ_KV_V_BITS: monkey-patch mode — value bits
     TQ_KV_ROTATION: rotation mode for monkey-patch ('wht' or 'planar')
 """
+
 import logging
 import os
 import sys
 
 try:
     from vllm.logger import init_logger
+
     logger = init_logger("turboquant_vllm.plugin")
 except ImportError:
     logger = logging.getLogger("turboquant_vllm.plugin")
@@ -55,7 +57,6 @@ def _register_native_backend() -> bool:
             AttentionBackendEnum,
             register_backend,
         )
-        from turboquant_vllm.native_backend import TurboQuantAttentionBackend
 
         register_backend(
             AttentionBackendEnum.CUSTOM,
@@ -78,6 +79,7 @@ def _register_native_backend() -> bool:
             kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
             if kv_cache_dtype is not None and str(kv_cache_dtype).startswith("tq"):
                 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
                 return [(AttentionBackendEnum.CUSTOM, 0)], {}
             return _orig_get_valid(self, device_capability, attn_selector_config, num_heads)
 
@@ -111,6 +113,7 @@ def _patch_cache_dtype_validation() -> None:
     """Allow tq3/tq4/tq_k4v3 as valid kv_cache_dtype values in CacheConfig."""
     try:
         import vllm.config.cache as cache_mod
+
         # Some vLLM versions have explicit validation in validate_cache_dtype
         if hasattr(cache_mod, "validate_cache_dtype"):
             _orig_validate = cache_mod.validate_cache_dtype
@@ -128,6 +131,7 @@ def _patch_cache_dtype_validation() -> None:
     # Fallback: look for the CacheConfig class validator
     try:
         from vllm.config.cache import CacheConfig
+
         if hasattr(CacheConfig, "__validators__"):
             # Remove dtype validator if it rejects unknown types
             pass
@@ -184,7 +188,8 @@ def _init_tq_buffers(layer, cache_dtype: str, head_size: int, prefix: str) -> No
     layer_idx = 0
     try:
         import re
-        m = re.search(r'\.(\d+)\.', prefix)
+
+        m = re.search(r"\.(\d+)\.", prefix)
         if m:
             layer_idx = int(m.group(1))
     except Exception:
@@ -205,6 +210,7 @@ def register():
     # Always register weight quantization config (needed for TQ3 checkpoint loading)
     try:
         from turboquant_vllm.vllm_quant import register as register_quant_config
+
         register_quant_config()
     except Exception as e:
         logger.debug("Could not register TurboQuant quant config: %s", e)
@@ -219,7 +225,9 @@ def register():
     if weight_bits is not None or kv_k_bits is not None:
         logger.info(
             "TurboQuant plugin activated (pid=%d, TQ_WEIGHT_BITS=%s, TQ_KV_K_BITS=%s)",
-            os.getpid(), weight_bits, kv_k_bits,
+            os.getpid(),
+            weight_bits,
+            kv_k_bits,
         )
 
     if weight_bits is None and kv_k_bits is None:
@@ -235,9 +243,9 @@ def register():
         group_size = int(os.environ.get("TQ_WEIGHT_GROUP_SIZE", "128"))
         try:
             from turboquant_vllm.weight_quant import patch_vllm_loader
+
             patch_vllm_loader(bits=bits, group_size=group_size, min_size=128)
-            logger.info("TurboQuant TQ%d-g%d weight compression registered (pid=%d)",
-                        bits, group_size, os.getpid())
+            logger.info("TurboQuant TQ%d-g%d weight compression registered (pid=%d)", bits, group_size, os.getpid())
         except ImportError as e:
             logger.warning("Failed to register weight compression: %s", e)
 
@@ -249,13 +257,15 @@ def register():
         rotation = os.environ.get("TQ_KV_ROTATION", "wht")
         try:
             from turboquant_vllm.vllm_patch import patch_vllm_attention
-            patch_vllm_attention(k_bits=k_bits, v_bits=v_bits,
-                                 norm_correction=norm_correction, rotation=rotation)
+
+            patch_vllm_attention(k_bits=k_bits, v_bits=v_bits, norm_correction=norm_correction, rotation=rotation)
             logger.info(
                 "TurboQuant K%d/V%d KV cache compression registered via monkey-patch "
                 "(pid=%d) — note: breaks with vLLM V1 CUDA graphs. "
                 "Use --kv-cache-dtype tq3 for native backend.",
-                k_bits, v_bits, os.getpid(),
+                k_bits,
+                v_bits,
+                os.getpid(),
             )
         except ImportError as e:
             logger.warning("Failed to register KV cache compression: %s", e)

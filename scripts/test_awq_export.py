@@ -8,6 +8,7 @@
 
 Usage: python3 -u scripts/test_awq_export.py
 """
+
 import gc
 import json
 import os
@@ -32,7 +33,8 @@ PROMPTS = [
 
 def main():
     import logging
-    logging.basicConfig(level=logging.INFO, format='%(name)s: %(message)s')
+
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
 
     print("=" * 60, flush=True)
     print("AWQ Export + Marlin Serving Test", flush=True)
@@ -42,6 +44,7 @@ def main():
     print("\n── Step 1: TQ compress + AWQ export ──", flush=True)
     t0 = time.time()
     from turboquant_vllm.export import compress_and_export
+
     compress_and_export(
         model_id=MODEL,
         output_dir=EXPORT_DIR,
@@ -60,26 +63,36 @@ def main():
     # Free GPU memory before vLLM
     gc.collect()
     torch.cuda.empty_cache()
-    subprocess.run("nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9",
-                    shell=True, capture_output=True)
+    subprocess.run(
+        "nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9", shell=True, capture_output=True
+    )
     time.sleep(5)
 
     # Step 2: Start vLLM with the exported checkpoint
     print("\n── Step 2: Start vLLM with AWQ checkpoint ──", flush=True)
     cmd = [
-        sys.executable, "-m", "vllm.entrypoints.openai.api_server",
-        "--model", EXPORT_DIR,
-        "--quantization", "awq",
-        "--max-model-len", "4096",
-        "--gpu-memory-utilization", "0.9",
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        EXPORT_DIR,
+        "--quantization",
+        "awq",
+        "--max-model-len",
+        "4096",
+        "--gpu-memory-utilization",
+        "0.9",
         "--enforce-eager",
-        "--port", str(PORT),
-        "--host", "0.0.0.0",
+        "--port",
+        str(PORT),
+        "--host",
+        "0.0.0.0",
     ]
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
     # Wait for health check
     import urllib.request
+
     print("Waiting for server...", flush=True)
     for i in range(300):
         try:
@@ -91,7 +104,7 @@ def main():
         time.sleep(1)
     else:
         print("Server failed to start!", flush=True)
-        out = proc.stdout.read(5000).decode(errors='replace')
+        out = proc.stdout.read(5000).decode(errors="replace")
         print(f"Output: {out[-2000:]}", flush=True)
         proc.terminate()
         return
@@ -109,12 +122,14 @@ def main():
         model_name = EXPORT_DIR
 
     for label, prompt in PROMPTS:
-        payload = json.dumps({
-            "model": model_name,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 100,
-            "temperature": 0.0,
-        }).encode()
+        payload = json.dumps(
+            {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 100,
+                "temperature": 0.0,
+            }
+        ).encode()
         req = urllib.request.Request(
             f"http://localhost:{PORT}/v1/chat/completions",
             data=payload,

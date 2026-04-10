@@ -133,7 +133,10 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float16, device_map="cuda", trust_remote_code=True,
+        args.model,
+        dtype=torch.float16,
+        device_map="cuda",
+        trust_remote_code=True,
     )
     model.eval()
 
@@ -142,8 +145,12 @@ def main():
     logger.info("Model memory: %.0f MB (%.2f GB)", model_memory_mb, model_memory_mb / 1024)
 
     total_params, comp_2d, comp_3d = count_parameters(model)
-    logger.info("Parameters: %.0fM total, %.0fM compressible 2D, %.0fM compressible 3D",
-                total_params / 1e6, comp_2d / 1e6, comp_3d / 1e6)
+    logger.info(
+        "Parameters: %.0fM total, %.0fM compressible 2D, %.0fM compressible 3D",
+        total_params / 1e6,
+        comp_2d / 1e6,
+        comp_3d / 1e6,
+    )
 
     # Perplexity
     baseline_ppl = measure_perplexity(model, tokenizer, PERPLEXITY_TEXT)
@@ -178,7 +185,6 @@ def main():
 
     gc.collect()
     torch.cuda.empty_cache()
-    mem_before_compress = gpu_memory_mb()
 
     from turboquant_vllm.weight_quant import _replace_linear_layers
 
@@ -194,9 +200,13 @@ def main():
 
     logger.info("Compression time: %.1fs", compress_time)
     logger.info("Layers compressed: %d", num_replaced)
-    logger.info("Memory: %.0f MB -> %.0f MB (saved %.0f MB, %.1f%%)",
-                model_memory_mb, compressed_memory_mb,
-                memory_saved_mb, memory_saved_mb / model_memory_mb * 100 if model_memory_mb > 0 else 0)
+    logger.info(
+        "Memory: %.0f MB -> %.0f MB (saved %.0f MB, %.1f%%)",
+        model_memory_mb,
+        compressed_memory_mb,
+        memory_saved_mb,
+        memory_saved_mb / model_memory_mb * 100 if model_memory_mb > 0 else 0,
+    )
 
     # Perplexity
     compressed_ppl = measure_perplexity(model, tokenizer, PERPLEXITY_TEXT)
@@ -234,9 +244,12 @@ def main():
     logger.info("=" * 60)
     logger.info("SUMMARY: %s TQ%d-g%d", args.model, args.bits, args.group_size)
     logger.info("=" * 60)
-    logger.info("Memory:     %.0f MB -> %.0f MB (%.1f%% saved)",
-                model_memory_mb, compressed_memory_mb,
-                memory_saved_mb / model_memory_mb * 100 if model_memory_mb > 0 else 0)
+    logger.info(
+        "Memory:     %.0f MB -> %.0f MB (%.1f%% saved)",
+        model_memory_mb,
+        compressed_memory_mb,
+        memory_saved_mb / model_memory_mb * 100 if model_memory_mb > 0 else 0,
+    )
     logger.info("Perplexity: %.4f -> %.4f (%+.2f%%)", baseline_ppl, compressed_ppl, ppl_delta)
     logger.info("Speed:      %.1f -> %.1f tok/s", avg_baseline_speed, avg_compressed_speed)
     logger.info("Compression time: %.1fs (%d layers)", compress_time, num_replaced)
@@ -246,8 +259,8 @@ def main():
     logger.info("Output comparison:")
     for i, prompt in enumerate(EVAL_PROMPTS):
         logger.info("  Prompt: %s", prompt[:50])
-        logger.info("  Base:   %s", baseline_outputs[i][len(prompt):len(prompt)+80].strip())
-        logger.info("  TQ:     %s", compressed_outputs[i][len(prompt):len(prompt)+80].strip())
+        logger.info("  Base:   %s", baseline_outputs[i][len(prompt) : len(prompt) + 80].strip())
+        logger.info("  TQ:     %s", compressed_outputs[i][len(prompt) : len(prompt) + 80].strip())
         logger.info("")
 
     if args.output:

@@ -50,14 +50,18 @@ def main():
     # Phase 1: Load model
     logger.info("Loading model...")
     torch.cuda.reset_peak_memory_stats()
-    gc.collect(); torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
     mem_start = gpu_memory_mb()
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, dtype=torch.float16, device_map="cuda", trust_remote_code=True,
+        args.model,
+        dtype=torch.float16,
+        device_map="cuda",
+        trust_remote_code=True,
     )
     model.eval()
 
@@ -83,12 +87,16 @@ def main():
     num = _replace_linear_layers(model, bits=args.w_bits, group_size=args.group_size, min_size=1024)
     compress_time = time.perf_counter() - t0
 
-    gc.collect(); torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
     mem_compressed = gpu_memory_mb()
     logger.info("Compressed %d layers in %.1fs", num, compress_time)
-    logger.info("Memory: %.0f MB -> %.0f MB (%.1f%% saved)",
-                mem_loaded - mem_start, mem_compressed - mem_start,
-                (1 - (mem_compressed - mem_start) / (mem_loaded - mem_start)) * 100)
+    logger.info(
+        "Memory: %.0f MB -> %.0f MB (%.1f%% saved)",
+        mem_loaded - mem_start,
+        mem_compressed - mem_start,
+        (1 - (mem_compressed - mem_start) / (mem_loaded - mem_start)) * 100,
+    )
 
     # Phase 4: Generate with weight compression only
     logger.info("")
@@ -119,12 +127,19 @@ def main():
     logger.info("=" * 60)
     logger.info("Model: %s", args.model)
     logger.info("Original model size: %.1f GB", (mem_loaded - mem_start) / 1024)
-    logger.info("After weight compression: %.1f GB (%.1fx savings)",
-                (mem_compressed - mem_start) / 1024,
-                (mem_loaded - mem_start) / (mem_compressed - mem_start) if (mem_compressed - mem_start) > 0 else 0)
+    logger.info(
+        "After weight compression: %.1f GB (%.1fx savings)",
+        (mem_compressed - mem_start) / 1024,
+        (mem_loaded - mem_start) / (mem_compressed - mem_start) if (mem_compressed - mem_start) > 0 else 0,
+    )
     logger.info("Peak during generation: %.1f GB", peak_mem / 1024)
-    logger.info("Compression: TQ%d-g%d weights | Ready for TQ+ K%d/V%d KV cache",
-                args.w_bits, args.group_size, args.k_bits, args.v_bits)
+    logger.info(
+        "Compression: TQ%d-g%d weights | Ready for TQ+ K%d/V%d KV cache",
+        args.w_bits,
+        args.group_size,
+        args.k_bits,
+        args.v_bits,
+    )
     logger.info("")
     logger.info("To serve with both compressions via vLLM:")
     logger.info("  from turboquant_vllm import enable_weight_quantization, patch_vllm_attention")

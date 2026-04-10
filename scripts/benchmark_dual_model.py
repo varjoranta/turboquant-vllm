@@ -4,6 +4,7 @@ Tests compression at multiple levels on both models, measuring memory and qualit
 
 Usage: python3 -u scripts/benchmark_dual_model.py
 """
+
 import gc
 import json
 import os
@@ -16,7 +17,10 @@ os.environ["PYTHONUNBUFFERED"] = "1"
 PROMPTS = [
     ("Capital", "What is the capital of Finland? One word."),
     ("Math", "What is 17 * 23? Just the number."),
-    ("Reasoning", "A bat and ball cost $1.10 together. The bat costs $1 more than the ball. How much does the ball cost?"),
+    (
+        "Reasoning",
+        "A bat and ball cost $1.10 together. The bat costs $1 more than the ball. How much does the ball cost?",
+    ),
     ("Code", "Write a Python function is_prime(n) that returns True if n is prime."),
 ]
 
@@ -34,7 +38,7 @@ def mem():
 
 def gen(model, tok, prompt, max_tok=80):
     # Use chat template for instruction-tuned models (Gemma 4 -it, etc.)
-    if hasattr(tok, 'chat_template') and tok.chat_template:
+    if hasattr(tok, "chat_template") and tok.chat_template:
         messages = [{"role": "user", "content": prompt}]
         text_input = tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         inp = tok(text_input, return_tensors="pt").to("cuda")
@@ -42,7 +46,7 @@ def gen(model, tok, prompt, max_tok=80):
         inp = tok(prompt, return_tensors="pt").to("cuda")
     with torch.no_grad():
         out = model.generate(**inp, max_new_tokens=max_tok, temperature=0.0, do_sample=False)
-    text = tok.decode(out[0][inp.input_ids.shape[1]:], skip_special_tokens=True)
+    text = tok.decode(out[0][inp.input_ids.shape[1] :], skip_special_tokens=True)
     return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 
@@ -60,11 +64,12 @@ def test_model(model_id, configs):
     """Test a model with multiple compression configs."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
     import logging
-    logging.basicConfig(level=logging.INFO, format='%(name)s: %(message)s')
 
-    print(f"\n{'='*70}", flush=True)
+    logging.basicConfig(level=logging.INFO, format="%(name)s: %(message)s")
+
+    print(f"\n{'=' * 70}", flush=True)
     print(f"MODEL: {model_id}", flush=True)
-    print(f"{'='*70}", flush=True)
+    print(f"{'=' * 70}", flush=True)
 
     results = {"model": model_id, "configs": {}}
     tok = AutoTokenizer.from_pretrained(model_id)
@@ -78,31 +83,31 @@ def test_model(model_id, configs):
         print(f"\n── {name} ──", flush=True)
 
         # Load fresh model
-        model = AutoModelForCausalLM.from_pretrained(
-            model_id, dtype=torch.bfloat16, device_map="cuda"
-        )
+        model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map="cuda")
         m0 = mem()
-        print(f"BF16: {m0:.0f} MB ({m0/1000:.1f} GB)", flush=True)
+        print(f"BF16: {m0:.0f} MB ({m0 / 1000:.1f} GB)", flush=True)
 
         if bits == 16:
             # Baseline — just quality check
             answers = quality(model, tok, "BF16 baseline")
-            results["configs"][name] = {
-                "memory_mb": round(m0), "ratio": 1.0, "answers": answers
-            }
-            del model; gc.collect(); torch.cuda.empty_cache()
+            results["configs"][name] = {"memory_mb": round(m0), "ratio": 1.0, "answers": answers}
+            del model
+            gc.collect()
+            torch.cuda.empty_cache()
             continue
 
         # REAP prune if requested
         if prune > 0:
             t0 = time.time()
             from turboquant_vllm.expert_pruning import reap_prune
+
             reap_prune(model, tok, prune_fraction=prune, num_samples=cal_samples)
-            print(f"REAP {prune*100:.0f}%: {time.time()-t0:.0f}s", flush=True)
+            print(f"REAP {prune * 100:.0f}%: {time.time() - t0:.0f}s", flush=True)
 
         # TQ compress
         t0 = time.time()
         from turboquant_vllm.weight_quant import _replace_linear_layers
+
         _replace_linear_layers(model, bits=bits, group_size=128)
         compress_time = time.time() - t0
         m1 = mem()
@@ -117,11 +122,15 @@ def test_model(model_id, configs):
             answers = {"error": str(e)}
 
         results["configs"][name] = {
-            "memory_mb": round(m1), "ratio": round(ratio, 1),
-            "time_s": round(compress_time), "answers": answers
+            "memory_mb": round(m1),
+            "ratio": round(ratio, 1),
+            "time_s": round(compress_time),
+            "answers": answers,
         }
 
-        del model; gc.collect(); torch.cuda.empty_cache()
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
 
     return results
 
@@ -152,13 +161,13 @@ def main():
     all_results["gemma"] = test_model("google/gemma-4-26B-A4B-it", gemma_configs)
 
     # Summary
-    print(f"\n{'='*70}", flush=True)
+    print(f"\n{'=' * 70}", flush=True)
     print("FINAL SUMMARY", flush=True)
-    print(f"{'='*70}", flush=True)
+    print(f"{'=' * 70}", flush=True)
     for model_key, result in all_results.items():
         print(f"\n{result['model']}:", flush=True)
         print(f"  {'Config':<25} {'Memory':>10} {'Ratio':>8}", flush=True)
-        print(f"  {'-'*45}", flush=True)
+        print(f"  {'-' * 45}", flush=True)
         for name, cfg in result["configs"].items():
             print(f"  {name:<25} {cfg['memory_mb']:>8} MB {cfg['ratio']:>7.1f}x", flush=True)
 
