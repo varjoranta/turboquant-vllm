@@ -27,7 +27,7 @@ try:
 except ImportError:
     logger = logging.getLogger(__name__)
 
-_quantizers: dict[tuple[int, int], PolarQuantTorch] = {}
+_quantizers: dict[tuple[int, int, str], PolarQuantTorch] = {}
 _cuda_mod = None
 _cuda_available = None
 _triton_available = None
@@ -74,10 +74,19 @@ def _get_cuda_module():
 
 def _get_quantizer(group_size: int, bits: int, device: str) -> PolarQuantTorch:
     """Get or create a PolarQuant quantizer for a given group size and bit width."""
-    key = (group_size, bits)
-    if key not in _quantizers:
-        _quantizers[key] = PolarQuantTorch(group_size, bits, seed=42, device=device)
-    return _quantizers[key]
+    normalized_device = str(torch.device(device))
+    key = (group_size, bits, normalized_device)
+    quantizer = _quantizers.get(key)
+    if quantizer is None:
+        quantizer = PolarQuantTorch(group_size, bits, seed=42, device=normalized_device)
+        _quantizers[key] = quantizer
+
+    # Defensive fallback in case a stale/mutated cache entry has mismatched device.
+    if str(quantizer.device) != normalized_device:
+        quantizer = PolarQuantTorch(group_size, bits, seed=42, device=normalized_device)
+        _quantizers[key] = quantizer
+
+    return quantizer
 
 
 def pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:

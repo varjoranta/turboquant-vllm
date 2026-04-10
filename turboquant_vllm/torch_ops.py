@@ -164,7 +164,7 @@ class PolarQuantTorch:
                  device: str = "cuda", rotation: str = "wht"):
         self.dim = dim
         self.bit_width = bit_width
-        self.device = device
+        self.device = torch.device(device)
         self.rotation_mode = rotation
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -173,21 +173,21 @@ class PolarQuantTorch:
             # Random Givens angles: one (cos, sin) pair per 2 elements
             n_pairs = (dim + 1) // 2
             angles = torch.rand(n_pairs, generator=gen) * 2 * math.pi
-            self.cos_sin = torch.stack([angles.cos(), angles.sin()], dim=1).float().to(device)
+            self.cos_sin = torch.stack([angles.cos(), angles.sin()], dim=1).float().to(self.device)
             # Dummy signs for compatibility (not used in planar mode)
-            self.signs1 = torch.ones(dim, device=device)
-            self.signs2 = torch.ones(dim, device=device)
+            self.signs1 = torch.ones(dim, device=self.device)
+            self.signs2 = torch.ones(dim, device=self.device)
             self.padded_dim = dim
         else:
             # WHT rotation: D2 @ H @ D1
             self.padded_dim = _next_power_of_2(dim)
-            self.signs1 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(device)
-            self.signs2 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(device)
+            self.signs1 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(self.device)
+            self.signs2 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(self.device)
             self.cos_sin = None
 
         # Codebook: optimal centroids for N(0, 1/dim)
         centroids_list = optimal_centroids(bit_width, dim)
-        self.centroids = torch.tensor(centroids_list, dtype=torch.float32, device=device)
+        self.centroids = torch.tensor(centroids_list, dtype=torch.float32, device=self.device)
         self.boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2
 
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:
@@ -234,7 +234,7 @@ class PolarQuantTorch:
         squeeze = x.dim() == 1
         if squeeze:
             x = x.unsqueeze(0)
-        x = x.float()
+        x = x.to(device=self.device, dtype=torch.float32)
 
         norms = torch.linalg.norm(x, dim=1)
         safe_norms = torch.where(norms > 0, norms, torch.ones_like(norms))
@@ -264,6 +264,8 @@ class PolarQuantTorch:
         if squeeze:
             indices = indices.unsqueeze(0)
             norms = norms.unsqueeze(0)
+        indices = indices.to(device=self.device)
+        norms = norms.to(device=self.device, dtype=torch.float32)
 
         y_hat = self.centroids[indices]
         x_hat_unit = self._rotate_inverse(y_hat)
