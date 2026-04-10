@@ -32,6 +32,8 @@ from typing import ClassVar, Optional
 import torch
 import torch.nn.functional as F
 
+from turboquant_vllm.tq_config import TurboQuantConfig
+
 _USE_STREAM_OVERLAP = os.environ.get("TQ_STREAM_OVERLAP", "0") == "1"
 _TQ_NO_QJL = os.environ.get("TQ_NO_QJL", "1") == "1"
 
@@ -89,8 +91,6 @@ try:
 except ImportError:
     import logging
     logger = logging.getLogger(__name__)
-
-from turboquant_vllm.tq_config import TurboQuantConfig
 
 
 # ---------------------------------------------------------------------------
@@ -464,9 +464,25 @@ class TurboQuantAttentionImpl:
         if mse_bits == 4 and D % 2 == 0:
             idx_r = idx.reshape(-1, D // 2, 2)
             packed_mse = (idx_r[:, :, 0].int() | (idx_r[:, :, 1].int() << 4)).to(torch.uint8)
-        elif mse_bits == 3 and D % 2 == 0:
-            idx_r = idx.reshape(-1, D // 2, 2)
-            packed_mse = (idx_r[:, :, 0].int() | (idx_r[:, :, 1].int() << 4)).to(torch.uint8)
+        elif mse_bits == 3 and D % 8 == 0:
+            idx_r = idx.reshape(-1, D // 8, 8).int()
+            packed_mse = torch.empty(N * H, D // 8 * 3, dtype=torch.uint8, device=device)
+            packed_mse[:, 0::3] = (
+                idx_r[:, :, 0]
+                | (idx_r[:, :, 1] << 3)
+                | (idx_r[:, :, 2] << 6)
+            ).to(torch.uint8)
+            packed_mse[:, 1::3] = (
+                (idx_r[:, :, 2] >> 2)
+                | (idx_r[:, :, 3] << 1)
+                | (idx_r[:, :, 4] << 4)
+                | (idx_r[:, :, 5] << 7)
+            ).to(torch.uint8)
+            packed_mse[:, 2::3] = (
+                (idx_r[:, :, 5] >> 1)
+                | (idx_r[:, :, 6] << 2)
+                | (idx_r[:, :, 7] << 5)
+            ).to(torch.uint8)
         elif mse_bits == 2 and D % 4 == 0:
             idx_r = idx.reshape(-1, D // 4, 4)
             packed_mse = (idx_r.int() << self._shift_2bit).sum(-1).to(torch.uint8)
@@ -647,7 +663,7 @@ class TurboQuantAttentionImpl:
         if mse_bits == 2:
             mse_sh: Optional[torch.Tensor] = torch.tensor([0, 2, 4, 6], device=device, dtype=torch.int32)
             mse_mask = 0x3
-        elif mse_bits in (3, 4):
+        elif mse_bits == 4:
             mse_sh = torch.tensor([0, 4], device=device, dtype=torch.int32)
             mse_mask = 0xF
         else:
@@ -670,7 +686,7 @@ class TurboQuantAttentionImpl:
             if mse_bits == 2 and D % 4 == 0:
                 expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
                 idx = (expanded & mse_mask).reshape(seq_len, Hk, -1)[:, :, :D]
-            elif mse_bits in (3, 4) and D % 2 == 0:
+            elif mse_bits == 4 and D % 2 == 0:
                 expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
                 idx = (expanded & mse_mask).reshape(seq_len, Hk, -1)[:, :, :D]
             else:
@@ -728,7 +744,6 @@ class TurboQuantAttentionImpl:
 
             attn_w = torch.softmax(scores.T, dim=-1)  # (Hq, S)
 
-            vps = self.tq_config.value_packed_size
             if self.tq_config.value_fp8:
                 val_raw = slots[:, :, kps:kps + D]
                 values = val_raw.view(torch.float8_e4m3fn).float()
