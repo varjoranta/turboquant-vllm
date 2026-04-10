@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 class TestSaveTqCheckpointLocalPath(unittest.TestCase):
     def test_local_path_does_not_touch_hf_hub(self):
-        """Pass a local dir and verify local source shards are not deleted."""
+        """Pass a local dir and verify HF Hub is not touched and local source shards are not deleted."""
         from turboquant_vllm.checkpoint import save_tq3_checkpoint
 
         with tempfile.TemporaryDirectory() as srcdir, \
