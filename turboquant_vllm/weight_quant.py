@@ -74,7 +74,10 @@ def _get_cuda_module():
 
 def _get_quantizer(group_size: int, bits: int, device: str) -> PolarQuantTorch:
     """Get or create a PolarQuant quantizer for a given group size and bit width."""
-    normalized_device = str(torch.device(device))
+    dev = torch.device(device)
+    if dev.type == "cuda" and dev.index is None:
+        dev = torch.device("cuda", torch.cuda.current_device())
+    normalized_device = str(dev)
     key = (group_size, bits, normalized_device)
     quantizer = _quantizers.get(key)
     if quantizer is None:

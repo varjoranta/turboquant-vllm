@@ -164,7 +164,10 @@ class PolarQuantTorch:
                  device: str = "cuda", rotation: str = "wht"):
         self.dim = dim
         self.bit_width = bit_width
-        self.device = torch.device(device)
+        dev = torch.device(device)
+        if dev.type == "cuda" and dev.index is None:
+            dev = torch.device("cuda", torch.cuda.current_device())
+        self.device = dev
         self.rotation_mode = rotation
 
         gen = torch.Generator(device="cpu").manual_seed(seed)
@@ -280,7 +283,7 @@ class PolarQuantTorch:
         squeeze = x.dim() == 1
         if squeeze:
             x = x.unsqueeze(0)
-        x = x.float()
+        x = x.to(device=self.device, dtype=torch.float32)
 
         indices, norms = self.quantize(x)
         x_hat = self.dequantize(indices, norms)
