@@ -407,11 +407,25 @@ class KVCacheCompressorTorch:
         self.k_bits = k_bits
         self.v_bits = v_bits
         self.device = device
-        self.use_cuda = use_cuda
         self.norm_correction = norm_correction
         self.use_qjl = use_qjl
         self.rotation = rotation
         self._cuda_mod = None
+
+        # The CUDA store kernel does not currently apply norm_correction —
+        # it returns raw norms. Silently falling through would degrade
+        # reconstruction quality, so force the PyTorch path when norm
+        # correction is requested. Log once so users know.
+        if use_cuda and norm_correction:
+            import logging as _logging
+            _logging.getLogger(__name__).warning(
+                "TurboQuant+: norm_correction=True is incompatible with the "
+                "CUDA KV compression kernel; falling back to the PyTorch path. "
+                "Set norm_correction=False to use CUDA."
+            )
+            use_cuda = False
+
+        self.use_cuda = use_cuda
 
         if use_cuda and rotation == "wht":
             # CUDA kernels only support WHT rotation currently
@@ -453,13 +467,18 @@ class KVCacheCompressorTorch:
         )
 
     def compress_k(self, k: torch.Tensor) -> CompressedKV:
-        """Compress key vectors. k: (num_tokens, head_dim)."""
+        """Compress key vectors. k: (num_tokens, head_dim).
+
+        CUDA fast path is only used when norm_correction=False and
+        use_qjl=False. The __init__ guard forces use_cuda off when
+        norm_correction is requested, so this path only fires for
+        plain raw-norm quantization.
+        """
         if self.use_cuda and self._cuda_mod is not None and not self.use_qjl:
             n = k.shape[0]
             indices = torch.zeros(n, self.head_dim, dtype=torch.uint8, device=self.device)
             norms = torch.zeros(n, dtype=torch.float32, device=self.device)
             self._cuda_mod.quantize(k.half(), indices, norms)
-            # Note: CUDA path doesn't support norm_correction yet
             return CompressedKV(indices=indices.to(torch.int64), norms=norms)
 
         if self.k_qjl is not None:
