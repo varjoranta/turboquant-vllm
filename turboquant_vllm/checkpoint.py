@@ -219,18 +219,23 @@ def save_tq3_checkpoint(
                                     (total_original - total_compressed) / 1e9)
                 else:
                     if tensor.is_floating_point():
-                        _add_tensor(tensor_name, tensor.half())
+                        stored_tensor = tensor.half()
                     else:
-                        _add_tensor(tensor_name, tensor)
-                    total_compressed += tensor.numel() * 2
+                        stored_tensor = tensor
+                    _add_tensor(tensor_name, stored_tensor)
+                    total_compressed += (
+                        stored_tensor.numel() * stored_tensor.element_size()
+                    )
 
                 del tensor  # free input tensor immediately
 
         # Delete downloaded shard to save disk (critical for TB-scale models)
-        try:
-            os.remove(shard_path)
-        except OSError:
-            pass
+        # but never remove source files when model_id is a local directory.
+        if not is_local:
+            try:
+                os.remove(shard_path)
+            except OSError:
+                pass
 
     _flush_shard()  # write remaining tensors
 
