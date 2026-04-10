@@ -55,7 +55,11 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
             with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
                 f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
 
-            # Patch huggingface_hub so any accidental call raises loudly
+            # Patch huggingface_hub so any accidental call raises loudly.
+            # We do NOT swallow other exceptions here: if save_tq3_checkpoint
+            # raises for any reason other than the mock sentinels, this test
+            # should fail so we know the shard-preservation code path was not
+            # reached.
             with mock.patch(
                 "huggingface_hub.HfApi.list_repo_files",
                 side_effect=AssertionError(
@@ -65,21 +69,12 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
                 side_effect=AssertionError(
                     "save_tq3_checkpoint must not call hf_hub_download for a local path"),
             ):
-                try:
-                    save_tq3_checkpoint(
-                        model_id=srcdir,
-                        output_dir=outdir,
-                        bits=3,
-                        group_size=8,  # match tiny tensor dim
-                    )
-                except AssertionError:
-                    raise  # bubble up our mock trips
-                except Exception as e:
-                    # Any other failure (e.g. compression edge cases on small
-                    # tensors) is fine for *this* test — we only care that
-                    # hf_hub was not called. Verify the error isn't one of
-                    # our AssertionError sentinels.
-                    self.assertNotIn("must not call", str(e))
+                save_tq3_checkpoint(
+                    model_id=srcdir,
+                    output_dir=outdir,
+                    bits=3,
+                    group_size=8,  # match tiny tensor dim
+                )
 
             self.assertTrue(
                 os.path.exists(source_shard),
