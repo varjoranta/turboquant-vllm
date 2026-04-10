@@ -25,16 +25,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 class TestSaveTqCheckpointLocalPath(unittest.TestCase):
     def test_local_path_does_not_touch_hf_hub(self):
-        """Pass a local dir and verify hf_hub_download / HfApi are never called."""
+        """Pass a local dir and verify local source shards are not deleted."""
         from turboquant_vllm.checkpoint import save_tq3_checkpoint
 
         with tempfile.TemporaryDirectory() as srcdir, \
              tempfile.TemporaryDirectory() as outdir:
+            source_shard = os.path.join(srcdir, "model-00001-of-00001.safetensors")
             # Create a minimal safetensors shard with one small 2D tensor
             from safetensors.torch import save_file
             weight = torch.randn(8, 8)  # too small to actually compress (< 128)
             save_file({"model.layers.0.mlp.fake.weight": weight},
-                      os.path.join(srcdir, "model-00001-of-00001.safetensors"))
+                      source_shard)
 
             # Fake config.json so AutoConfig.from_pretrained works
             import json
@@ -80,6 +81,11 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
                     # our AssertionError sentinels.
                     self.assertNotIn("must not call", str(e))
 
+            self.assertTrue(
+                os.path.exists(source_shard),
+                "save_tq3_checkpoint should not delete local source shards",
+            )
+
     def test_local_path_missing_shards_raises(self):
         """Empty local directory should raise a clear FileNotFoundError."""
         from turboquant_vllm.checkpoint import save_tq3_checkpoint
@@ -100,6 +106,47 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
                     model_id=srcdir, output_dir=outdir, bits=3, group_size=8,
                 )
             self.assertIn("No .safetensors shards", str(ctx.exception))
+
+    def test_non_float_tensor_uses_true_dtype_size_in_ratio(self):
+        """Non-float tensors should contribute their real dtype byte size."""
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        with tempfile.TemporaryDirectory() as srcdir, \
+             tempfile.TemporaryDirectory() as outdir:
+            from safetensors.torch import save_file
+            save_file(
+                {
+                    "float_tensor": torch.ones(4, dtype=torch.float32),  # 16 -> 8 bytes (fp16)
+                    "int_tensor": torch.arange(3, dtype=torch.int64),    # 24 -> 24 bytes
+                },
+                os.path.join(srcdir, "model-00001-of-00001.safetensors"),
+            )
+
+            import json
+            with open(os.path.join(srcdir, "config.json"), "w") as f:
+                json.dump({"model_type": "bert", "vocab_size": 10}, f)
+            with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
+                json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
+            with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
+                f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
+
+            with mock.patch("turboquant_vllm.checkpoint.logger.info") as mock_info:
+                save_tq3_checkpoint(
+                    model_id=srcdir,
+                    output_dir=outdir,
+                    bits=3,
+                    group_size=8,
+                )
+
+            final_call = None
+            for call in mock_info.call_args_list:
+                if call.args and call.args[0].startswith("TQ3 checkpoint saved:"):
+                    final_call = call
+            self.assertIsNotNone(final_call, "Expected final checkpoint summary log")
+
+            # Args: original_gb, compressed_gb, ratio, compressed_count
+            ratio = final_call.args[3]
+            self.assertAlmostEqual(ratio, 40 / 32, places=6)
 
 
 if __name__ == "__main__":
