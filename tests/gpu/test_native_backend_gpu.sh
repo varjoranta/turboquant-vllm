@@ -175,24 +175,34 @@ stop_vllm() {
 extract_kv_capacity_tokens() {
     # Try several known vLLM log patterns. Dump matches to stderr for debug.
     local n_blocks=""
+    local n_tokens=""
 
-    # Pattern 1: "# GPU blocks: 12345" (vLLM 0.18-0.19 standard)
+    # Pattern 1: "GPU KV cache size: 5,742,768 tokens" (vLLM 0.19+, preferred;
+    # already expressed in tokens so no block-size multiplication needed).
+    n_tokens=$(grep -oE "GPU KV cache size: [0-9,]+ tokens" "$SERVER_LOG" 2>/dev/null | head -1 | grep -oE "[0-9,]+" | tr -d , || true)
+    if [[ -n "$n_tokens" ]]; then
+        echo "$n_tokens"
+        return 0
+    fi
+
+    # Pattern 2: "# GPU blocks: 12345" (vLLM 0.18 standard)
     n_blocks=$(grep -oE "# GPU blocks: [0-9]+" "$SERVER_LOG" 2>/dev/null | head -1 | awk '{print $NF}' || true)
     if [[ -n "$n_blocks" ]]; then
         echo "$((n_blocks * BLOCK_SIZE))"
         return 0
     fi
 
-    # Pattern 2: "Usable KV cache memory: X GiB ... N blocks"
+    # Pattern 3: "num_gpu_blocks=N" / similar
     n_blocks=$(grep -oE "num_gpu_blocks[^0-9]*[0-9]+" "$SERVER_LOG" 2>/dev/null | head -1 | grep -oE "[0-9]+$" || true)
     if [[ -n "$n_blocks" ]]; then
         echo "$((n_blocks * BLOCK_SIZE))"
         return 0
     fi
 
-    # Pattern 3: "maximum concurrency for N tokens per request"
+    # Pattern 4: "Maximum concurrency for N tokens per request" — this reports
+    # *per-request* tokens, not total KV capacity, but ratio math still works.
     local max_conc
-    max_conc=$(grep -oE "Maximum concurrency for [0-9]+ tokens" "$SERVER_LOG" 2>/dev/null | head -1 | grep -oE "[0-9]+" | head -1 || true)
+    max_conc=$(grep -oE "Maximum concurrency for [0-9,]+ tokens" "$SERVER_LOG" 2>/dev/null | head -1 | grep -oE "[0-9,]+" | head -1 | tr -d , || true)
     if [[ -n "$max_conc" ]]; then
         echo "$max_conc"
         return 0

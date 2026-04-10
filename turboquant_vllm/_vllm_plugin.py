@@ -113,14 +113,107 @@ def _eager_patch_str_dtype_mapping() -> None:
 
     _tq_aware_resolver._tq_wrapped = True  # type: ignore[attr-defined]
     _tu.kv_cache_dtype_str_to_dtype = _tq_aware_resolver
+    msg = (
+        f"TurboQuant patched STR_DTYPE_TO_TORCH_DTYPE with tq3/tq4/tq_k4v3 "
+        f"(pid={os.getpid()})"
+    )
+    logger.info(msg)
+    # Also print to stderr: vLLM's subprocess launcher sometimes runs before
+    # the logging handlers are attached, and the CI timing check greps raw
+    # server output for this exact string.
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _eager_patch_cache_dtype_literal() -> None:
+    """Extend vLLM's CacheDType Literal to accept tq3/tq4/tq_k4v3.
+
+    vLLM's EngineArgs.add_cli_args() introspects CacheConfig's type hints via
+    get_kwargs() and builds an argparse ``choices=[...]`` list from the
+    CacheDType Literal. Without this patch, argparse rejects
+    ``--kv-cache-dtype tq3`` with ``invalid choice`` before any engine code
+    runs.
+
+    Ordering: AsyncEngineArgs.add_cli_args() calls load_general_plugins() BEFORE
+    calling EngineArgs.add_cli_args() (vllm/engine/arg_utils.py ~line 2262), so
+    this eager patch — fired at plugin import time — lands in time to influence
+    the choices list.
+
+    We replace both the module-level CacheDType and CacheConfig.__annotations__
+    entry because different call sites may consult either one.
+    """
+    try:
+        from typing import Literal
+
+        import vllm.config.cache as cache_mod
+        from vllm.config.cache import CacheConfig
+    except ImportError:
+        return
+
+    current = getattr(cache_mod, "CacheDType", None)
+    if current is None:
+        return
+
+    import typing as _typing
+    existing = _typing.get_args(current)
+    if all(name in existing for name in _TQ_DTYPE_NAMES):
+        return  # already extended
+
+    new_args = tuple(existing) + tuple(n for n in _TQ_DTYPE_NAMES if n not in existing)
+    extended = Literal[new_args]  # type: ignore[valid-type]
+
+    cache_mod.CacheDType = extended
+    try:
+        CacheConfig.__annotations__["cache_dtype"] = extended
+    except Exception as e:
+        logger.debug("Could not patch CacheConfig.__annotations__: %s", e)
+
+    # dataclasses.fields(CacheConfig) captures each field's .type at class
+    # creation time. get_kwargs() reads these — mutating __annotations__ alone
+    # is not enough, we have to update the captured Field.type too.
+    try:
+        from dataclasses import fields
+
+        for f in fields(CacheConfig):
+            if f.name == "cache_dtype":
+                f.type = extended
+                break
+    except Exception as e:
+        logger.debug("Could not patch CacheConfig fields: %s", e)
+
+    # vllm's _compute_kwargs is lru_cache'd. If it was populated before this
+    # patch (e.g. by a --help probe), the cached entry still has the old
+    # choices. Invalidate it.
+    try:
+        from vllm.engine.arg_utils import _compute_kwargs
+
+        _compute_kwargs.cache_clear()
+    except Exception as e:
+        logger.debug("Could not clear _compute_kwargs cache: %s", e)
+
+    # CacheConfig is a pydantic dataclass; its __pydantic_validator__ was
+    # built at class-creation time from the original Literal. Rebuilding
+    # forces pydantic to re-read the (now-patched) annotations. Without
+    # this, CacheConfig(cache_dtype='tq3') still raises a pydantic
+    # ValidationError even though argparse accepts the flag.
+    try:
+        from pydantic.dataclasses import rebuild_dataclass
+
+        rebuild_dataclass(CacheConfig, force=True, raise_errors=True)
+    except Exception as e:
+        logger.debug("Could not rebuild CacheConfig pydantic validator: %s", e)
+
     logger.info(
-        "TurboQuant patched STR_DTYPE_TO_TORCH_DTYPE with tq3/tq4/tq_k4v3 "
-        "(pid=%d)", os.getpid(),
+        "TurboQuant extended CacheDType Literal with %s (pid=%d)",
+        list(_TQ_DTYPE_NAMES), os.getpid(),
     )
 
 
-# Fire the eager patch on module load, before register() is called.
+# Fire the eager patches on module load, before register() is called.
+# load_general_plugins() runs in AsyncEngineArgs.add_cli_args() BEFORE the
+# actual argparse choices are derived — so these patches take effect in
+# time to keep --kv-cache-dtype tq3/tq4/tq_k4v3 from being rejected.
 _eager_patch_str_dtype_mapping()
+_eager_patch_cache_dtype_literal()
 
 
 def _tq_reset_patches_for_test() -> None:
@@ -216,16 +309,22 @@ def _register_native_backend() -> bool:
     try:
         from vllm.platforms.cuda import CudaPlatform
 
+        # CudaPlatform.get_valid_backends is a @classmethod. Accessing it on
+        # the class gives us a bound method with cls already bound, so we can
+        # call _orig_get_valid(...) directly without passing cls. Our
+        # replacement must be wrapped as classmethod() to preserve the
+        # descriptor — otherwise vLLM's call path passes no implicit self/cls
+        # and we'd crash with "missing 1 required positional argument".
         _orig_get_valid = CudaPlatform.get_valid_backends
 
-        def _tq_get_valid_backends(self, device_capability, attn_selector_config, num_heads=None):
+        def _tq_get_valid_backends(cls, device_capability, attn_selector_config, num_heads=None):
             kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
             if _is_tq_dtype(kv_cache_dtype):
                 from vllm.v1.attention.backends.registry import AttentionBackendEnum
                 return [(AttentionBackendEnum.CUSTOM, 0)], {}
-            return _orig_get_valid(self, device_capability, attn_selector_config, num_heads)
+            return _orig_get_valid(device_capability, attn_selector_config, num_heads)
 
-        CudaPlatform.get_valid_backends = _tq_get_valid_backends
+        CudaPlatform.get_valid_backends = classmethod(_tq_get_valid_backends)
         logger.debug("TurboQuant patched CudaPlatform.get_valid_backends")
     except Exception as e:
         logger.warning("Could not patch CudaPlatform.get_valid_backends: %s", e)
@@ -415,23 +514,29 @@ def _patch_mla_fail_loud() -> None:
 
 
 def _patch_attention_layer_init() -> None:
-    """Inject _init_turboquant_buffers into vLLM's AttentionLayer.
+    """Inject _init_turboquant_buffers into vLLM's Attention layer.
 
-    In the vllm fork, AttentionLayer.__init__ calls self._init_turboquant_buffers()
+    In the vllm fork, the layer __init__ calls self._init_turboquant_buffers()
     when kv_cache_dtype.startswith('tq'). In stock vLLM this code doesn't exist.
     We add it via monkey-patch so the rotation matrices (Pi, S, centroids)
     are attached to the layer before the model runs.
+
+    vLLM 0.19 renamed the class from AttentionLayer to Attention
+    (vllm/model_executor/layers/attention/attention.py:175). Try both names.
     """
+    layer_cls = None
     try:
-        from vllm.model_executor.layers.attention.attention import AttentionLayer
+        from vllm.model_executor.layers.attention.attention import Attention as layer_cls  # type: ignore[no-redef]
     except ImportError:
+        try:
+            from vllm.model_executor.layers.attention.attention import AttentionLayer as layer_cls  # type: ignore[no-redef]
+        except ImportError:
+            return
+
+    if hasattr(layer_cls, "_tq_buffers_patched"):
         return
 
-    if hasattr(AttentionLayer, "_tq_buffers_patched"):
-        return
-
-    # Save original __init__
-    _orig_init = AttentionLayer.__init__
+    _orig_init = layer_cls.__init__
 
     def _patched_init(self, *args, **kwargs):
         _orig_init(self, *args, **kwargs)
@@ -442,9 +547,11 @@ def _patch_attention_layer_init() -> None:
             if head_size is not None:
                 _init_tq_buffers(self, kv_cache_dtype, head_size, prefix)
 
-    AttentionLayer.__init__ = _patched_init
-    AttentionLayer._tq_buffers_patched = True
-    logger.debug("TurboQuant patched AttentionLayer.__init__ for TQ buffer init")
+    layer_cls.__init__ = _patched_init
+    layer_cls._tq_buffers_patched = True
+    logger.debug(
+        "TurboQuant patched %s.__init__ for TQ buffer init", layer_cls.__name__,
+    )
 
 
 def _init_tq_buffers(layer, cache_dtype: str, head_size: int, prefix: str) -> None:
