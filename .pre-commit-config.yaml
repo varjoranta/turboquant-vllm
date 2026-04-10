@@ -10,11 +10,12 @@ repos:
     hooks:
       - id: ruff-check
         args: [--output-format, github, --fix]
-    # Note: ruff-format is intentionally NOT enabled yet. Enabling it would
-    # reformat ~40 files in a single sweep, poisoning git blame and causing
-    # merge conflicts with in-flight feature branches. The format pass will
-    # be its own follow-up PR with a .git-blame-ignore-revs entry so
-    # historical authorship survives.
+      - id: ruff-format
+    # The format-sweep commit that preceded this hook enable is recorded
+    # in .git-blame-ignore-revs (added in a follow-up commit post-merge
+    # because rebase-merge rewrites SHAs and the file needs the final one).
+    # Both local `git blame --ignore-revs-file=...` and GitHub's blame
+    # view honor the file so historical authorship survives the sweep.
 
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.7
