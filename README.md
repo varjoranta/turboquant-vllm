@@ -182,7 +182,7 @@ Design choices:
 - **Separate K/V codebooks** in constant memory for asymmetric bit widths.
 - **Constant memory caching**: codebook and sign vectors only re-uploaded when config changes.
 - **4-bit packing**: two indices per byte, halves cache bandwidth.
-- Targets T4/RTX 2080 (sm_75), A100 (sm_80), A10/A40/RTX 3090 (sm_86), L40S/RTX 4090 (sm_89), H100/H200 (sm_90). The PyTorch fallback runs on any CUDA GPU, CPU, or Apple MPS.
+- Targets T4/RTX 2080 (sm_75), A100 (sm_80), A10/A40/RTX 3090 (sm_86), L40S/RTX 4090 (sm_89), H100/H200 (sm_90), RTX 50xx (sm_120), and GB10/DGX Spark (sm_121). The PyTorch fallback runs on any CUDA GPU, CPU, or Apple MPS.
 
 ## Bandwidth argument
 

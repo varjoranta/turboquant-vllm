@@ -35,11 +35,13 @@ def build():
     extra_cuda_cflags = [
         "-O3",
         "--use_fast_math",
-        "-gencode=arch=compute_75,code=sm_75",  # T4, RTX 2080
-        "-gencode=arch=compute_80,code=sm_80",  # A100
-        "-gencode=arch=compute_86,code=sm_86",  # A10, A40, RTX 3090, RTX A6000
-        "-gencode=arch=compute_89,code=sm_89",  # L40S, RTX 4090
-        "-gencode=arch=compute_90,code=sm_90",  # H100, H200
+        "-gencode=arch=compute_75,code=sm_75",    # T4, RTX 2080
+        "-gencode=arch=compute_80,code=sm_80",    # A100
+        "-gencode=arch=compute_86,code=sm_86",    # A10, A40, RTX 3090, RTX A6000
+        "-gencode=arch=compute_89,code=sm_89",    # L40S, RTX 4090
+        "-gencode=arch=compute_90,code=sm_90",    # H100, H200
+        "-gencode=arch=compute_120,code=sm_120",  # Blackwell consumer (RTX 50xx)
+        "-gencode=arch=compute_121,code=sm_121",  # GB10 (DGX Spark)
     ]
 
     module = load(
