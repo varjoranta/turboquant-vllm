@@ -19,6 +19,8 @@ from turboquant_vllm.weight_quant import (
     unpack_indices,
     TurboQuantLinearMethod,
     TurboQuantWrapper,
+    _get_quantizer,
+    _quantizers,
 )
 
 
@@ -87,6 +89,27 @@ class TestPacking:
         # int64 = 8 bytes, packed uint8 = 1 byte, 2 per byte
         # Ratio: (1024 * 4096 * 8) / (1024 * 2048 * 1) = 16x
         assert packed.numel() * packed.element_size() < indices.numel() * indices.element_size()
+
+    def test_quantizer_cache_is_device_scoped(self):
+        _quantizers.clear()
+        group_size = 128
+        bits = 4
+
+        cpu_quantizer = _get_quantizer(group_size, bits, "cpu")
+        cpu_x = torch.randn(8, group_size, device="cpu")
+        cpu_indices, cpu_norms = cpu_quantizer.quantize(cpu_x)
+        cpu_hat = cpu_quantizer.dequantize(cpu_indices, cpu_norms)
+        assert cpu_hat.device.type == "cpu"
+
+        cuda_quantizer = _get_quantizer(group_size, bits, "cuda")
+        cuda_x = torch.randn(8, group_size, device="cuda")
+        cuda_indices, cuda_norms = cuda_quantizer.quantize(cuda_x)
+        cuda_hat = cuda_quantizer.dequantize(cuda_indices, cuda_norms)
+        assert cuda_hat.device.type == "cuda"
+
+        assert cpu_quantizer is not cuda_quantizer
+        assert str(cpu_quantizer.device) == "cpu"
+        assert str(cuda_quantizer.device).startswith("cuda")
 
 
 class TestLinearMethod:
