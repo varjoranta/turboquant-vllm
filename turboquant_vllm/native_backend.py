@@ -532,9 +532,14 @@ class TurboQuantAttentionImpl:
         # Scatter to cache
         packed_key = packed_key.reshape(N, H, kps)
         packed_value = packed_value.reshape(N, H, vps)
-        safe_slot = slot_mapping.clamp(min=0)
-        blk_idx = (safe_slot // block_size).long()
-        blk_off = (safe_slot % block_size).long()
+        valid = slot_mapping >= 0
+        if not valid.any():
+            return
+        packed_key = packed_key[valid]
+        packed_value = packed_value[valid]
+        valid_slots = slot_mapping[valid]
+        blk_idx = (valid_slots // block_size).long()
+        blk_off = (valid_slots % block_size).long()
         kv_cache[blk_idx, blk_off, :, :kps] = packed_key
         kv_cache[blk_idx, blk_off, :, kps:kps + vps] = packed_value
 
