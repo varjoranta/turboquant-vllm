@@ -50,9 +50,7 @@ def _lloyds_gaussian(n_centroids: int, sigma: float, n_iter: int = 100) -> list[
     """Lloyd's algorithm for optimal scalar quantization of N(0, sigma²)."""
     from scipy import stats as sp_stats
 
-    boundaries = list(sp_stats.norm.ppf(
-        [i / n_centroids for i in range(1, n_centroids)], scale=sigma
-    ))
+    boundaries = list(sp_stats.norm.ppf([i / n_centroids for i in range(1, n_centroids)], scale=sigma))
     centroids = [0.0] * n_centroids
 
     for _ in range(n_iter):
@@ -160,8 +158,7 @@ class PolarQuantTorch:
       comparable or better PPL for KV cache.
     """
 
-    def __init__(self, dim: int, bit_width: int, seed: int = 42,
-                 device: str = "cuda", rotation: str = "wht"):
+    def __init__(self, dim: int, bit_width: int, seed: int = 42, device: str = "cuda", rotation: str = "wht"):
         self.dim = dim
         self.bit_width = bit_width
         dev = torch.device(device)
@@ -201,13 +198,13 @@ class PolarQuantTorch:
         batch = x.shape[0]
         if self.padded_dim > self.dim:
             padded = torch.zeros(batch, self.padded_dim, device=x.device, dtype=x.dtype)
-            padded[:, :self.dim] = x
+            padded[:, : self.dim] = x
         else:
             padded = x.clone()
         padded *= self.signs1.unsqueeze(0)
         padded = _fast_wht_batch(padded)
         padded *= self.signs2.unsqueeze(0)
-        return padded[:, :self.dim]
+        return padded[:, : self.dim]
 
     def _rotate_inverse(self, y: torch.Tensor) -> torch.Tensor:
         """Apply inverse rotation."""
@@ -217,13 +214,13 @@ class PolarQuantTorch:
         batch = y.shape[0]
         if self.padded_dim > self.dim:
             padded = torch.zeros(batch, self.padded_dim, device=y.device, dtype=y.dtype)
-            padded[:, :self.dim] = y
+            padded[:, : self.dim] = y
         else:
             padded = y.clone()
         padded *= self.signs2.unsqueeze(0)
         padded = _fast_wht_batch(padded)
         padded *= self.signs1.unsqueeze(0)
-        return padded[:, :self.dim]
+        return padded[:, : self.dim]
 
     def quantize(self, x: torch.Tensor, norm_correction: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
         """Quantize vectors. x: (batch, dim) or (dim,). Returns (indices, norms).
@@ -360,12 +357,13 @@ class QJLTorch:
 @dataclass
 class CompressedKV:
     """Compressed K or V cache for one layer+head."""
+
     # PolarQuant part
-    indices: torch.Tensor   # (seq_len, head_dim) int64
-    norms: torch.Tensor     # (seq_len,) float32
+    indices: torch.Tensor  # (seq_len, head_dim) int64
+    norms: torch.Tensor  # (seq_len,) float32
     # QJL part (only for K cache, None for V)
-    qjl_signs: torch.Tensor | None = None   # (seq_len, head_dim) int8
-    qjl_norms: torch.Tensor | None = None   # (seq_len,) float32
+    qjl_signs: torch.Tensor | None = None  # (seq_len, head_dim) int8
+    qjl_norms: torch.Tensor | None = None  # (seq_len,) float32
 
 
 class KVCacheCompressorTorch:
@@ -418,6 +416,7 @@ class KVCacheCompressorTorch:
         # correction is requested. Log once so users know.
         if use_cuda and norm_correction:
             import logging as _logging
+
             _logging.getLogger(__name__).warning(
                 "TurboQuant+: norm_correction=True is incompatible with the "
                 "CUDA KV compression kernel; falling back to the PyTorch path. "
@@ -432,20 +431,18 @@ class KVCacheCompressorTorch:
             self._init_cuda(head_dim, k_bits, v_bits, seed, device)
 
         if use_qjl and k_bits >= 2:
-            self.k_polar = PolarQuantTorch(head_dim, k_bits - 1, seed=seed,
-                                           device=device, rotation=rotation)
+            self.k_polar = PolarQuantTorch(head_dim, k_bits - 1, seed=seed, device=device, rotation=rotation)
             self.k_qjl = QJLTorch(head_dim, seed=seed + 1000, device=device)
         else:
-            self.k_polar = PolarQuantTorch(head_dim, k_bits, seed=seed,
-                                           device=device, rotation=rotation)
+            self.k_polar = PolarQuantTorch(head_dim, k_bits, seed=seed, device=device, rotation=rotation)
             self.k_qjl = None
 
-        self.v_polar = PolarQuantTorch(head_dim, v_bits, seed=seed + 500,
-                                       device=device, rotation=rotation)
+        self.v_polar = PolarQuantTorch(head_dim, v_bits, seed=seed + 500, device=device, rotation=rotation)
 
     def _init_cuda(self, head_dim, k_bits, v_bits, seed, device):
         """Initialize CUDA kernels with matching codebooks and rotations."""
         from turboquant_vllm.build import build
+
         self._cuda_mod = build()
 
         k_pq_bits = (k_bits - 1 if k_bits >= 2 else 1) if self.use_qjl else k_bits
@@ -456,14 +453,20 @@ class KVCacheCompressorTorch:
         v_pq = PolarQuantTorch(head_dim, v_pq_bits, seed=seed + 500, device=device)
 
         self._cuda_mod.init_k(
-            k_pq.centroids.cpu(), k_pq.boundaries.cpu(),
-            k_pq.signs1.cpu().float(), k_pq.signs2.cpu().float(),
-            head_dim, k_pq_bits,
+            k_pq.centroids.cpu(),
+            k_pq.boundaries.cpu(),
+            k_pq.signs1.cpu().float(),
+            k_pq.signs2.cpu().float(),
+            head_dim,
+            k_pq_bits,
         )
         self._cuda_mod.init_v(
-            v_pq.centroids.cpu(), v_pq.boundaries.cpu(),
-            v_pq.signs1.cpu().float(), v_pq.signs2.cpu().float(),
-            head_dim, v_pq_bits,
+            v_pq.centroids.cpu(),
+            v_pq.boundaries.cpu(),
+            v_pq.signs1.cpu().float(),
+            v_pq.signs2.cpu().float(),
+            head_dim,
+            v_pq_bits,
         )
 
     def compress_k(self, k: torch.Tensor) -> CompressedKV:

@@ -23,6 +23,7 @@ from turboquant_vllm.torch_ops import PolarQuantTorch
 
 try:
     from vllm.logger import init_logger
+
     logger = init_logger(__name__)
 except ImportError:
     logger = logging.getLogger(__name__)
@@ -57,8 +58,9 @@ def _get_cuda_module():
         return _cuda_mod if _cuda_available else None
     try:
         from turboquant_vllm.build import build
+
         _cuda_mod = build()
-        if hasattr(_cuda_mod, 'weight_dequant'):
+        if hasattr(_cuda_mod, "weight_dequant"):
             _cuda_available = True
             logger.info("CUDA weight dequant kernel loaded")
             return _cuda_mod
@@ -120,13 +122,13 @@ def pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
         n_packed_cols = flat.shape[1] // 8 * 3
         packed = torch.zeros(n_rows, n_packed_cols, dtype=torch.uint8, device=indices.device)
         for i in range(flat.shape[1] // 8):
-            v = flat[:, i*8:(i+1)*8]  # (n_rows, 8) uint8, values 0-7
+            v = flat[:, i * 8 : (i + 1) * 8]  # (n_rows, 8) uint8, values 0-7
             b0 = v[:, 0] | (v[:, 1] << 3) | ((v[:, 2] & 0x3) << 6)
             b1 = (v[:, 2] >> 2) | (v[:, 3] << 1) | (v[:, 4] << 4) | ((v[:, 5] & 0x1) << 7)
             b2 = (v[:, 5] >> 1) | (v[:, 6] << 2) | (v[:, 7] << 5)
-            packed[:, i*3] = b0
-            packed[:, i*3+1] = b1
-            packed[:, i*3+2] = b2
+            packed[:, i * 3] = b0
+            packed[:, i * 3 + 1] = b1
+            packed[:, i * 3 + 2] = b2
         return packed
     elif bits == 2:
         assert indices.shape[-1] % 4 == 0
@@ -155,17 +157,17 @@ def unpack_indices(packed: torch.Tensor, bits: int, dim: int) -> torch.Tensor:
         n_groups_of_3 = flat.shape[1] // 3
         unpacked = torch.zeros(n_rows, n_groups_of_3 * 8, dtype=torch.int64, device=packed.device)
         for i in range(n_groups_of_3):
-            b0 = flat[:, i*3].to(torch.int64)
-            b1 = flat[:, i*3+1].to(torch.int64)
-            b2 = flat[:, i*3+2].to(torch.int64)
-            unpacked[:, i*8+0] = b0 & 0x7
-            unpacked[:, i*8+1] = (b0 >> 3) & 0x7
-            unpacked[:, i*8+2] = ((b0 >> 6) | (b1 << 2)) & 0x7
-            unpacked[:, i*8+3] = (b1 >> 1) & 0x7
-            unpacked[:, i*8+4] = (b1 >> 4) & 0x7
-            unpacked[:, i*8+5] = ((b1 >> 7) | (b2 << 1)) & 0x7
-            unpacked[:, i*8+6] = (b2 >> 2) & 0x7
-            unpacked[:, i*8+7] = (b2 >> 5) & 0x7
+            b0 = flat[:, i * 3].to(torch.int64)
+            b1 = flat[:, i * 3 + 1].to(torch.int64)
+            b2 = flat[:, i * 3 + 2].to(torch.int64)
+            unpacked[:, i * 8 + 0] = b0 & 0x7
+            unpacked[:, i * 8 + 1] = (b0 >> 3) & 0x7
+            unpacked[:, i * 8 + 2] = ((b0 >> 6) | (b1 << 2)) & 0x7
+            unpacked[:, i * 8 + 3] = (b1 >> 1) & 0x7
+            unpacked[:, i * 8 + 4] = (b1 >> 4) & 0x7
+            unpacked[:, i * 8 + 5] = ((b1 >> 7) | (b2 << 1)) & 0x7
+            unpacked[:, i * 8 + 6] = (b2 >> 2) & 0x7
+            unpacked[:, i * 8 + 7] = (b2 >> 5) & 0x7
         return unpacked[:, :dim]
     elif bits == 2:
         flat = packed.reshape(-1, packed.shape[-1])
@@ -185,8 +187,7 @@ class TurboQuantWrapper(nn.Module):
     Lloyd-Max codebook. This matches how GPTQ/AWQ use per-group scales.
     """
 
-    def __init__(self, original: nn.Linear, bits: int = 3, group_size: int = 128,
-                 rotation: torch.Tensor | None = None):
+    def __init__(self, original: nn.Linear, bits: int = 3, group_size: int = 128, rotation: torch.Tensor | None = None):
         super().__init__()
         self.bits = bits
         self.group_size = group_size
@@ -212,9 +213,8 @@ class TurboQuantWrapper(nn.Module):
         if rotation is not None:
             # Use learned rotation (SpinQuant-style)
             from turboquant_vllm.learned_rotation import quantize_with_learned_rotation
-            packed, norms, _ = quantize_with_learned_rotation(
-                weight, rotation, bits=bits, group_size=group_size
-            )
+
+            packed, norms, _ = quantize_with_learned_rotation(weight, rotation, bits=bits, group_size=group_size)
             self.register_buffer("rotation", rotation)
         else:
             # Use fixed WHT rotation (default) with norm correction
@@ -238,14 +238,24 @@ class TurboQuantWrapper(nn.Module):
 
         logger.debug(
             "TQ%d-g%d compressed %dx%d (%.1fx)",
-            bits, group_size, out_dim, in_dim, self._ratio,
+            bits,
+            group_size,
+            out_dim,
+            in_dim,
+            self._ratio,
         )
 
     @classmethod
-    def from_packed(cls, packed_weight: torch.Tensor, norms: torch.Tensor,
-                    in_features: int, out_features: int,
-                    bits: int = 3, group_size: int = 128,
-                    bias: torch.Tensor | None = None):
+    def from_packed(
+        cls,
+        packed_weight: torch.Tensor,
+        norms: torch.Tensor,
+        in_features: int,
+        out_features: int,
+        bits: int = 3,
+        group_size: int = 128,
+        bias: torch.Tensor | None = None,
+    ):
         """Create a TurboQuantWrapper from pre-packed data (native TQ3 checkpoint).
 
         Skips compression — the packed indices and norms are used directly.
@@ -278,6 +288,7 @@ class TurboQuantWrapper(nn.Module):
         if _triton_available is None:
             try:
                 from turboquant_vllm.triton_ops import tq_fused_gemm, tq_fwht_input_gemm
+
                 _tq_fused_gemm_fn = tq_fused_gemm
                 _tq_fwht_input_fn = tq_fwht_input_gemm
                 _triton_available = True
@@ -288,8 +299,7 @@ class TurboQuantWrapper(nn.Module):
 
         if _triton_available and x.is_cuda:
             quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
-            args = (x, self.packed_weight, self.norms,
-                    quantizer.signs1, quantizer.signs2, quantizer.centroids)
+            args = (x, self.packed_weight, self.norms, quantizer.signs1, quantizer.signs2, quantizer.centroids)
             kwargs = dict(group_size=self.group_size, bits=self.bits, bias=self.bias)
 
             # FWHT-on-input wins for large output dims (saves N inverse rotations).
@@ -309,17 +319,20 @@ class TurboQuantWrapper(nn.Module):
 
         if cuda_mod is not None:
             output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
-            w_deq = torch.empty(self.out_features, self.in_features,
-                                dtype=output_dtype, device=x.device)
+            w_deq = torch.empty(self.out_features, self.in_features, dtype=output_dtype, device=x.device)
 
             quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
             cuda_mod.weight_dequant(
-                self.packed_weight, self.norms,
-                quantizer.signs1, quantizer.signs2,
+                self.packed_weight,
+                self.norms,
+                quantizer.signs1,
+                quantizer.signs2,
                 quantizer.centroids,
                 w_deq,
-                self.group_size, self.bits,
-                self.out_features, self.in_features,
+                self.group_size,
+                self.bits,
+                self.out_features,
+                self.in_features,
             )
         else:
             indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
@@ -328,7 +341,7 @@ class TurboQuantWrapper(nn.Module):
             quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
             w_groups = quantizer.dequantize(indices, norms_flat)
 
-            w_deq = w_groups.reshape(self.out_features, self.padded_in)[:, :self.in_features]
+            w_deq = w_groups.reshape(self.out_features, self.padded_in)[:, : self.in_features]
             w_deq = w_deq.to(x.dtype)
 
         if w_deq.dtype != x.dtype:
@@ -340,8 +353,10 @@ class TurboQuantWrapper(nn.Module):
         return output
 
     def extra_repr(self) -> str:
-        return (f"in_features={self.in_features}, out_features={self.out_features}, "
-                f"bits={self.bits}, group_size={self.group_size}, bias={self.bias is not None}")
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bits={self.bits}, group_size={self.group_size}, bias={self.bias is not None}"
+        )
 
 
 # Layers to never quantize
@@ -351,9 +366,12 @@ _SKIP_PATTERNS = ("lm_head", "embed", "norm", "head")
 _SENSITIVE_PATTERNS = ("o_proj", "down_proj")
 
 
-def select_bits(tensor_name: str, default_bits: int,
-                sensitive_bits: int | None = None,
-                sensitive_patterns: tuple[str, ...] = _SENSITIVE_PATTERNS) -> int:
+def select_bits(
+    tensor_name: str,
+    default_bits: int,
+    sensitive_bits: int | None = None,
+    sensitive_patterns: tuple[str, ...] = _SENSITIVE_PATTERNS,
+) -> int:
     """Return bits for this tensor. Sensitive layers get higher precision."""
     if sensitive_bits is None:
         return default_bits
@@ -399,9 +417,15 @@ class Compressed3D:
         self.compressed_bytes = self.packed.numel() + self.norms.numel() * 4
 
     @classmethod
-    def from_packed(cls, packed: torch.Tensor, norms: torch.Tensor,
-                    shape: tuple[int, int, int], dtype: torch.dtype,
-                    bits: int = 3, group_size: int = 128):
+    def from_packed(
+        cls,
+        packed: torch.Tensor,
+        norms: torch.Tensor,
+        shape: tuple[int, int, int],
+        dtype: torch.dtype,
+        bits: int = 3,
+        group_size: int = 128,
+    ):
         """Create a Compressed3D from pre-packed data (native TQ3 checkpoint).
 
         Skips compression — the packed indices and norms are used directly.
@@ -436,16 +460,20 @@ class Compressed3D:
             if buf is not None and buf.shape == (n_experts, out_dim, in_dim) and buf.dtype == output_dtype:
                 output = buf
             else:
-                output = torch.empty(n_experts, out_dim, in_dim,
-                                     dtype=output_dtype, device=self.packed.device)
+                output = torch.empty(n_experts, out_dim, in_dim, dtype=output_dtype, device=self.packed.device)
             quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
             cuda_mod.weight_dequant_3d(
-                self.packed, self.norms,
-                quantizer.signs1, quantizer.signs2,
+                self.packed,
+                self.norms,
+                quantizer.signs1,
+                quantizer.signs2,
                 quantizer.centroids,
                 output,
-                self.group_size, self.bits,
-                n_experts, out_dim, in_dim,
+                self.group_size,
+                self.bits,
+                n_experts,
+                out_dim,
+                in_dim,
             )
             return output.to(self.dtype)
 
@@ -454,8 +482,7 @@ class Compressed3D:
         if buf is not None and buf.shape == (n_experts, out_dim, in_dim):
             output = buf
         else:
-            output = torch.empty(n_experts, out_dim, in_dim,
-                                 dtype=output_dtype, device=self.packed.device)
+            output = torch.empty(n_experts, out_dim, in_dim, dtype=output_dtype, device=self.packed.device)
 
         quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
         chunk_experts = max(1, min(8, n_experts))
@@ -476,10 +503,8 @@ class Compressed3D:
             chunk_groups = quantizer.dequantize(chunk_idx, chunk_norms.reshape(-1))
             del chunk_idx
 
-            chunk_result = chunk_groups.reshape(-1, self.padded_in)[:, :self.in_dim]
-            output[start:end] = chunk_result.reshape(
-                end - start, out_dim, in_dim
-            ).to(output_dtype)
+            chunk_result = chunk_groups.reshape(-1, self.padded_in)[:, : self.in_dim]
+            output[start:end] = chunk_result.reshape(end - start, out_dim, in_dim).to(output_dtype)
             del chunk_groups, chunk_result
 
         return output
@@ -506,8 +531,7 @@ def _compress_3d_param(module: nn.Module, param_name: str, bits: int, group_size
     return compressed.original_bytes, compressed.compressed_bytes
 
 
-def _register_moe_hooks(module: nn.Module, param_names: list[str],
-                        pool_buffers: bool = True):
+def _register_moe_hooks(module: nn.Module, param_names: list[str], pool_buffers: bool = True):
     """Register pre/post forward hooks that decompress expert weights on demand.
 
     Args:
@@ -563,7 +587,7 @@ def _select_bits(param: torch.Tensor, default_bits: int, kurtosis_aware: bool = 
     if std < 1e-8:
         return default_bits
     normalized = (flat - mean) / std
-    kurt = (normalized ** 4).mean().item()  # excess kurtosis + 3
+    kurt = (normalized**4).mean().item()  # excess kurtosis + 3
 
     if kurt > 8:
         # Heavy-tailed (shared experts, attention projections): more bits
@@ -584,8 +608,8 @@ def _find_router_weights(model: nn.Module) -> dict[str, torch.Tensor]:
     gates = {}
     for name, module in model.named_modules():
         # vLLM MoE blocks have a 'gate' attribute (ReplicatedLinear)
-        gate = getattr(module, 'gate', None)
-        if gate is not None and hasattr(gate, 'weight'):
+        gate = getattr(module, "gate", None)
+        if gate is not None and hasattr(gate, "weight"):
             w = gate.weight.data
             if w.dim() == 2:  # (num_experts, hidden_size)
                 gates[name] = w
@@ -615,11 +639,17 @@ def _prune_expert_weights(
     param[~keep_mask] = 0.0
 
 
-def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
-                            min_size: int = 1024, kurtosis_aware: bool = False,
-                            prune_experts: float = 0.0, routed_expert_bits: int | None = None,
-                            per_module_bits: dict[str, int] | None = None,
-                            learned_rotations: dict[str, torch.Tensor] | None = None):
+def _replace_linear_layers(
+    model: nn.Module,
+    bits: int,
+    group_size: int = 128,
+    min_size: int = 1024,
+    kurtosis_aware: bool = False,
+    prune_experts: float = 0.0,
+    routed_expert_bits: int | None = None,
+    per_module_bits: dict[str, int] | None = None,
+    learned_rotations: dict[str, torch.Tensor] | None = None,
+):
     """Compress model weights: nn.Linear layers AND MoE expert weights.
 
     Args:
@@ -642,6 +672,7 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
     pruned_expert_modules: set[str] = set()
     if prune_experts > 0:
         import re
+
         gates = _find_router_weights(model)
         for gate_path, gate_weight in gates.items():
             num_experts = gate_weight.shape[0]
@@ -661,7 +692,11 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
             n_marked = len([m for m in pruned_expert_modules if m.startswith(gate_path)])
             logger.info(
                 "Expert pruning %s: keeping %d/%d experts (%.0f%% pruned, %d modules marked)",
-                gate_path, n_keep, num_experts, prune_experts * 100, n_marked,
+                gate_path,
+                n_keep,
+                num_experts,
+                prune_experts * 100,
+                n_marked,
             )
 
     # Phase 1: Replace nn.Linear layers with TurboQuantWrapper
@@ -670,16 +705,18 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear):
             # Check for vLLM parallel linears: have weight + input_size/output_size
-            if not (hasattr(module, 'weight')
-                    and isinstance(getattr(module, 'weight', None), (torch.Tensor, nn.Parameter))
-                    and (hasattr(module, 'input_size') or hasattr(module, 'in_features'))):
+            if not (
+                hasattr(module, "weight")
+                and isinstance(getattr(module, "weight", None), (torch.Tensor, nn.Parameter))
+                and (hasattr(module, "input_size") or hasattr(module, "in_features"))
+            ):
                 continue
             # Normalize attribute names for vLLM compatibility
-            if not hasattr(module, 'in_features') and hasattr(module, 'input_size'):
+            if not hasattr(module, "in_features") and hasattr(module, "input_size"):
                 module.in_features = module.input_size
-            if not hasattr(module, 'out_features') and hasattr(module, 'output_size_per_partition'):
+            if not hasattr(module, "out_features") and hasattr(module, "output_size_per_partition"):
                 module.out_features = module.output_size_per_partition
-            elif not hasattr(module, 'out_features') and hasattr(module, 'output_size'):
+            elif not hasattr(module, "out_features") and hasattr(module, "output_size"):
                 module.out_features = module.output_size
         if module.in_features < min_size and module.out_features < min_size:
             continue
@@ -710,8 +747,7 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
             tensor_bits = _select_bits(module.weight.data, bits, kurtosis_aware)
 
         rotation = learned_rotations.get(name) if learned_rotations else None
-        wrapper = TurboQuantWrapper(module, bits=tensor_bits, group_size=group_size,
-                                    rotation=rotation)
+        wrapper = TurboQuantWrapper(module, bits=tensor_bits, group_size=group_size, rotation=rotation)
         setattr(parent, attr_name, wrapper)
 
         compressed_bytes = wrapper.packed_weight.numel() + wrapper.norms.numel() * wrapper.norms.element_size()
@@ -754,7 +790,10 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
 
             logger.info(
                 "Expert pruning %s: keeping %d/%d experts (%.0f%% pruned)",
-                gate_path, n_keep, num_experts, prune_experts * 100,
+                gate_path,
+                n_keep,
+                num_experts,
+                prune_experts * 100,
             )
 
     for name, param in list(model.named_parameters()):
@@ -799,10 +838,16 @@ def _replace_linear_layers(model: nn.Module, bits: int, group_size: int = 128,
         prune_msg = f", {pruned_count:,} expert params pruned" if pruned_count > 0 else ""
         expert_bits_msg = f" (routed@TQ{routed_expert_bits})" if routed_expert_bits else ""
         logger.info(
-            "TQ%d-g%d%s weight compression: %d linear + %d expert layers, "
-            "%.1f GB -> %.1f GB (%.1fx)%s",
-            bits, group_size, expert_bits_msg, replacements, expert_layers,
-            total_original / 1e9, total_compressed / 1e9, ratio, prune_msg,
+            "TQ%d-g%d%s weight compression: %d linear + %d expert layers, %.1f GB -> %.1f GB (%.1fx)%s",
+            bits,
+            group_size,
+            expert_bits_msg,
+            replacements,
+            expert_layers,
+            total_original / 1e9,
+            total_compressed / 1e9,
+            ratio,
+            prune_msg,
         )
         # Guard: on CPU-only PyTorch builds (Mac, CI, etc.) calling
         # torch.cuda.empty_cache() raises AssertionError.
@@ -840,14 +885,20 @@ def patch_vllm_loader(**replace_kwargs) -> None:
     base_loader.process_weights_after_loading = patched_process_weights
     try:
         import vllm.model_executor.model_loader.gguf_loader as gguf_loader
+
         gguf_loader.process_weights_after_loading = patched_process_weights
     except (ImportError, AttributeError):
         pass
 
 
-def enable_weight_quantization(bits: int = 3, group_size: int = 128,
-                                min_layer_size: int = 1024, kurtosis_aware: bool = False,
-                                prune_experts: float = 0.0, routed_expert_bits: int | None = None):
+def enable_weight_quantization(
+    bits: int = 3,
+    group_size: int = 128,
+    min_layer_size: int = 1024,
+    kurtosis_aware: bool = False,
+    prune_experts: float = 0.0,
+    routed_expert_bits: int | None = None,
+):
     """Monkey-patch vLLM to apply TurboQuant weight compression at model load time.
 
     Args:
@@ -872,18 +923,20 @@ def enable_weight_quantization(bits: int = 3, group_size: int = 128,
 
     try:
         patch_vllm_loader(
-            bits=bits, group_size=group_size, min_size=min_layer_size,
-            kurtosis_aware=kurtosis_aware, prune_experts=prune_experts,
+            bits=bits,
+            group_size=group_size,
+            min_size=min_layer_size,
+            kurtosis_aware=kurtosis_aware,
+            prune_experts=prune_experts,
             routed_expert_bits=routed_expert_bits,
         )
     except ImportError:
         logger.error("Cannot import vLLM model loader. Is vLLM installed?")
         raise
 
-    prune_msg = f", {prune_experts*100:.0f}% expert pruning" if prune_experts > 0 else ""
+    prune_msg = f", {prune_experts * 100:.0f}% expert pruning" if prune_experts > 0 else ""
     expert_msg = f", routed@TQ{routed_expert_bits}" if routed_expert_bits else ""
-    logger.info("TurboQuant TQ%d-g%d weight compression enabled%s%s",
-                bits, group_size, prune_msg, expert_msg)
+    logger.info("TurboQuant TQ%d-g%d weight compression enabled%s%s", bits, group_size, prune_msg, expert_msg)
 
 
 def save_compressed_checkpoint(
@@ -914,9 +967,7 @@ def save_compressed_checkpoint(
 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16, device_map="cpu"
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16, device_map="cpu")
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
     quantizer = _get_quantizer(group_size, bits, "cpu")
@@ -964,8 +1015,5 @@ def save_compressed_checkpoint(
     model.save_pretrained(output_dir, safe_serialization=True)
     tokenizer.save_pretrained(output_dir)
 
-    total_size = sum(
-        os.path.getsize(os.path.join(output_dir, f))
-        for f in os.listdir(output_dir)
-    )
+    total_size = sum(os.path.getsize(os.path.join(output_dir, f)) for f in os.listdir(output_dir))
     logger.info("Saved to %s (%.1f GB)", output_dir, total_size / 1e9)

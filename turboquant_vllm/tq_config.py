@@ -15,6 +15,7 @@ import torch
 # Lloyd-Max optimal quantizer
 # ---------------------------------------------------------------------------
 
+
 def _gaussian_pdf(x: float, sigma2: float) -> float:
     return (1.0 / math.sqrt(2 * math.pi * sigma2)) * math.exp(-x * x / (2 * sigma2))
 
@@ -28,7 +29,7 @@ def solve_lloyd_max(
     """Solve Lloyd-Max optimal quantizer for N(0, 1/d) distribution."""
     from scipy import integrate
 
-    n_levels = 2 ** bits
+    n_levels = 2**bits
     sigma2 = 1.0 / d
     sigma = math.sqrt(sigma2)
 
@@ -76,9 +77,8 @@ def get_boundaries(d: int, bits: int) -> torch.Tensor:
 # Random matrix generation
 # ---------------------------------------------------------------------------
 
-def generate_rotation_matrix(
-    d: int, seed: int, device: torch.device = torch.device("cpu")
-) -> torch.Tensor:
+
+def generate_rotation_matrix(d: int, seed: int, device: torch.device = torch.device("cpu")) -> torch.Tensor:
     """Generate Haar-distributed random orthogonal matrix via QR decomposition."""
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
@@ -90,9 +90,7 @@ def generate_rotation_matrix(
     return Q.to(device)
 
 
-def generate_qjl_matrix(
-    d: int, seed: int, device: torch.device = torch.device("cpu")
-) -> torch.Tensor:
+def generate_qjl_matrix(d: int, seed: int, device: torch.device = torch.device("cpu")) -> torch.Tensor:
     """Generate i.i.d. N(0,1) projection matrix for QJL."""
     gen = torch.Generator(device="cpu")
     gen.manual_seed(seed)
@@ -123,6 +121,7 @@ class TurboQuantConfig:
         v_total_bits: Total bits for V when asymmetric=True.
         seed: Base seed for deterministic random matrix generation.
     """
+
     head_dim: int = 128
     total_bits: int = 3
     value_quant_bits: int = 8
@@ -139,7 +138,7 @@ class TurboQuantConfig:
 
     @property
     def n_centroids(self) -> int:
-        return 2 ** self.mse_bits
+        return 2**self.mse_bits
 
     @property
     def key_packed_size(self) -> int:
@@ -199,8 +198,7 @@ class TurboQuantConfig:
         return s
 
     @staticmethod
-    def from_cache_dtype(cache_dtype: str, head_dim: int,
-                         value_quant_bits: int = 8) -> "TurboQuantConfig":
+    def from_cache_dtype(cache_dtype: str, head_dim: int, value_quant_bits: int = 8) -> "TurboQuantConfig":
         """Create config from cache dtype string: tq3, tq4, tq_k4v3."""
         vqb_env = os.environ.get("TQ_VALUE_BITS")
         if vqb_env is not None:
@@ -208,14 +206,17 @@ class TurboQuantConfig:
         no_qjl = os.environ.get("TQ_NO_QJL", "1") == "1"
 
         if cache_dtype == "tq3":
-            return TurboQuantConfig(head_dim=head_dim, total_bits=3,
-                                    value_quant_bits=value_quant_bits, no_qjl=no_qjl)
+            return TurboQuantConfig(head_dim=head_dim, total_bits=3, value_quant_bits=value_quant_bits, no_qjl=no_qjl)
         elif cache_dtype == "tq4":
-            return TurboQuantConfig(head_dim=head_dim, total_bits=4,
-                                    value_quant_bits=value_quant_bits, no_qjl=no_qjl)
+            return TurboQuantConfig(head_dim=head_dim, total_bits=4, value_quant_bits=value_quant_bits, no_qjl=no_qjl)
         elif cache_dtype == "tq_k4v3":
-            return TurboQuantConfig(head_dim=head_dim, total_bits=4,
-                                    asymmetric=True, v_total_bits=3,
-                                    value_quant_bits=value_quant_bits, no_qjl=no_qjl)
+            return TurboQuantConfig(
+                head_dim=head_dim,
+                total_bits=4,
+                asymmetric=True,
+                v_total_bits=3,
+                value_quant_bits=value_quant_bits,
+                no_qjl=no_qjl,
+            )
         else:
             raise ValueError(f"Unknown TurboQuant cache dtype: {cache_dtype}")

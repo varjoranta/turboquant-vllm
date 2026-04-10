@@ -37,9 +37,15 @@ def _lazy_import_vllm():
         ModelWeightParameter,
         PackedvLLMParameter,
     )
+
     return (
-        LinearBase, LinearMethodBase, QuantizationConfig, QuantizeMethodBase,
-        GroupQuantScaleParameter, ModelWeightParameter, PackedvLLMParameter,
+        LinearBase,
+        LinearMethodBase,
+        QuantizationConfig,
+        QuantizeMethodBase,
+        GroupQuantScaleParameter,
+        ModelWeightParameter,
+        PackedvLLMParameter,
     )
 
 
@@ -61,28 +67,37 @@ def register():
         return
 
     (
-        LinearBase, LinearMethodBase, QuantizationConfig, QuantizeMethodBase,
-        GroupQuantScaleParameter, ModelWeightParameter, PackedvLLMParameter,
+        LinearBase,
+        LinearMethodBase,
+        QuantizationConfig,
+        QuantizeMethodBase,
+        GroupQuantScaleParameter,
+        ModelWeightParameter,
+        PackedvLLMParameter,
     ) = _lazy_import_vllm()
 
     from turboquant_vllm.weight_quant import (
-        _SKIP_PATTERNS, select_bits, _get_quantizer, unpack_indices,
+        _SKIP_PATTERNS,
+        select_bits,
+        _get_quantizer,
+        unpack_indices,
     )
 
     @register_quantization_config("turboquant")
     class TurboQuantConfig(QuantizationConfig):
         """Config for TurboQuant weight quantization (TQ3/TQ4)."""
 
-        def __init__(self, bits: int = 3, group_size: int = 128,
-                     sensitive_bits: int | None = None):
+        def __init__(self, bits: int = 3, group_size: int = 128, sensitive_bits: int | None = None):
             super().__init__()
             self.bits = bits
             self.group_size = group_size
             self.sensitive_bits = sensitive_bits
 
         def __repr__(self) -> str:
-            return (f"TurboQuantConfig(bits={self.bits}, group_size={self.group_size}, "
-                    f"sensitive_bits={self.sensitive_bits})")
+            return (
+                f"TurboQuantConfig(bits={self.bits}, group_size={self.group_size}, "
+                f"sensitive_bits={self.sensitive_bits})"
+            )
 
         def get_name(self) -> str:
             return "turboquant"
@@ -112,6 +127,7 @@ def register():
                 # Skip layers that shouldn't be quantized
                 if any(p in prefix.lower() for p in _SKIP_PATTERNS):
                     from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+
                     return UnquantizedLinearMethod()
                 # Determine bits for this layer
                 layer_bits = select_bits(prefix, self.bits, self.sensitive_bits)
@@ -142,8 +158,7 @@ def register():
             # Packed indices: shape depends on bits and group_size
             # For group_size=128, bits=3: each group of 128 indices packs into 48 bytes (128*3/8)
             # Layout: (out_features, n_groups * packed_group_bytes) as uint8
-            padded_in = ((input_size_per_partition + self.group_size - 1)
-                         // self.group_size) * self.group_size
+            padded_in = ((input_size_per_partition + self.group_size - 1) // self.group_size) * self.group_size
             n_groups = padded_in // self.group_size
 
             if self.bits == 4:
@@ -159,6 +174,7 @@ def register():
             # packed_factor: ratio of uncompressed input dim to packed dim
             # vLLM uses this to correctly shard packed weights in TP
             from fractions import Fraction
+
             pack_ratio = Fraction(padded_in, packed_cols)
 
             tq_packed = PackedvLLMParameter(
@@ -198,10 +214,8 @@ def register():
 
         def process_weights_after_loading(self, layer: nn.Module) -> None:
             # Ensure weights are contiguous and on the right device
-            layer.tq_packed = nn.Parameter(
-                layer.tq_packed.data.contiguous(), requires_grad=False)
-            layer.tq_norms = nn.Parameter(
-                layer.tq_norms.data.contiguous(), requires_grad=False)
+            layer.tq_packed = nn.Parameter(layer.tq_packed.data.contiguous(), requires_grad=False)
+            layer.tq_norms = nn.Parameter(layer.tq_norms.data.contiguous(), requires_grad=False)
 
         def apply(
             self,
@@ -217,10 +231,17 @@ def register():
             # Try Triton fused kernels first (fastest)
             try:
                 from turboquant_vllm.triton_ops import tq_fused_gemm, tq_fwht_input_gemm
+
                 quantizer = _get_quantizer(group_size, bits, str(x.device))
 
-                args = (x, layer.tq_packed.data, layer.tq_norms.data,
-                        quantizer.signs1, quantizer.signs2, quantizer.centroids)
+                args = (
+                    x,
+                    layer.tq_packed.data,
+                    layer.tq_norms.data,
+                    quantizer.signs1,
+                    quantizer.signs2,
+                    quantizer.centroids,
+                )
                 kwargs = dict(group_size=group_size, bits=bits, bias=bias)
 
                 primary = tq_fwht_input_gemm if out_features >= 4096 else tq_fused_gemm

@@ -52,6 +52,7 @@ if os.environ.get("TQ_PYTHON_STORE", "0") != "1":
     ]:
         try:
             import importlib
+
             _mod = importlib.import_module(_store_src)
             _triton_tq_store = _mod.triton_tq_store
             _USE_TRITON_STORE = True
@@ -68,6 +69,7 @@ if os.environ.get("TQ_PYTHON_DECODE", "0") != "1":
     ]:
         try:
             import importlib
+
             _mod = importlib.import_module(_decode_src)
             _triton_tq_decode = _mod.triton_tq_decode_attention
             _USE_TRITON_DECODE = True
@@ -81,15 +83,18 @@ try:
         is_flash_attn_varlen_func_available,
         flash_attn_varlen_func,
     )
+
     _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 except ImportError:
     _HAS_FLASH_ATTN = False
 
 try:
     from vllm.logger import init_logger
+
     logger = init_logger(__name__)
 except ImportError:
     import logging
+
     logger = logging.getLogger(__name__)
 
 
@@ -134,6 +139,7 @@ class TurboQuantAttentionBackend(_VLLMBackendBase):
     def supports_attn_type(cls, attn_type: str) -> bool:
         try:
             from vllm.v1.attention.backend import AttentionType
+
             return attn_type == AttentionType.DECODER
         except ImportError:
             return attn_type == "decoder"
@@ -199,6 +205,7 @@ class TurboQuantAttentionBackend(_VLLMBackendBase):
 # Metadata
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class TurboQuantMetadata:
     seq_lens: torch.Tensor
@@ -247,6 +254,7 @@ class TurboQuantMetadataBuilder(_VLLMBuilderBase):  # type: ignore[misc,valid-ty
         silently skip our Python-level store/decode work.
         """
         from vllm.v1.attention.backend import AttentionCGSupport
+
         return AttentionCGSupport.NEVER
 
     def reorder_batch(self, input_batch, scheduler_output):
@@ -274,6 +282,7 @@ class TurboQuantMetadataBuilder(_VLLMBuilderBase):  # type: ignore[misc,valid-ty
 # ---------------------------------------------------------------------------
 # Impl
 # ---------------------------------------------------------------------------
+
 
 class TurboQuantAttentionImpl:
     """TurboQuant attention implementation.
@@ -330,8 +339,7 @@ class TurboQuantAttentionImpl:
 
         if self.tq_config is None:
             actual_head_dim = Pi.shape[0]
-            self.tq_config = TurboQuantConfig.from_cache_dtype(
-                self._tq_cache_dtype, actual_head_dim)
+            self.tq_config = TurboQuantConfig.from_cache_dtype(self._tq_cache_dtype, actual_head_dim)
 
         if Pi.device != device:
             layer._tq_Pi = Pi.to(device)
@@ -344,7 +352,7 @@ class TurboQuantAttentionImpl:
             self._shift_8bit = self._shift_8bit.to(device)
             self._shifts_on_device = True
 
-        if not hasattr(layer, '_tq_cached'):
+        if not hasattr(layer, "_tq_cached"):
             Pi_f = layer._tq_Pi.float().contiguous()
             S_f = layer._tq_S.float().contiguous()
             c = layer._tq_centroids.float()
@@ -379,21 +387,15 @@ class TurboQuantAttentionImpl:
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
         self._current_layer = layer
 
-        use_overlap = (
-            _USE_STREAM_OVERLAP
-            and _USE_TRITON_STORE
-            and not torch.cuda.is_current_stream_capturing()
-        )
+        use_overlap = _USE_STREAM_OVERLAP and _USE_TRITON_STORE and not torch.cuda.is_current_stream_capturing()
         if use_overlap:
             if _store_stream is None:
                 _store_stream = torch.cuda.Stream(device=device)
             torch.cuda.current_stream(device).wait_stream(_store_stream)
             with torch.cuda.stream(_store_stream):
-                self._store_kv(k, v, kv_cache, slot_mapping,
-                               layer._tq_Pi, layer._tq_S, layer._tq_centroids)
+                self._store_kv(k, v, kv_cache, slot_mapping, layer._tq_Pi, layer._tq_S, layer._tq_centroids)
         else:
-            self._store_kv(k, v, kv_cache, slot_mapping,
-                           layer._tq_Pi, layer._tq_S, layer._tq_centroids)
+            self._store_kv(k, v, kv_cache, slot_mapping, layer._tq_Pi, layer._tq_S, layer._tq_centroids)
 
     def forward(
         self,
@@ -409,9 +411,7 @@ class TurboQuantAttentionImpl:
     ) -> torch.Tensor:
         num_tokens = query.shape[0]
         if output is None:
-            output = torch.zeros(
-                num_tokens, self.num_heads * self.head_size,
-                dtype=query.dtype, device=query.device)
+            output = torch.zeros(num_tokens, self.num_heads * self.head_size, dtype=query.dtype, device=query.device)
         assert output is not None
 
         if attn_metadata is None:
@@ -429,9 +429,7 @@ class TurboQuantAttentionImpl:
         S = layer._tq_S
         centroids = layer._tq_centroids
 
-        if (_store_stream is not None
-                and not attn_metadata.is_prefill
-                and not torch.cuda.is_current_stream_capturing()):
+        if _store_stream is not None and not attn_metadata.is_prefill and not torch.cuda.is_current_stream_capturing():
             torch.cuda.current_stream(device).wait_stream(_store_stream)
 
         if not attn_metadata.is_prefill:
@@ -453,10 +451,17 @@ class TurboQuantAttentionImpl:
             else:
                 assert q_lens is not None
                 attn_out = self._mixed_batch_attention(
-                    q, key[:N].view(N, self.num_kv_heads, self.head_size),
+                    q,
+                    key[:N].view(N, self.num_kv_heads, self.head_size),
                     value[:N].view(N, self.num_kv_heads, self.head_size),
-                    kv_cache, attn_metadata, Pi, S, centroids,
-                    query_start_loc, q_lens, num_reqs,
+                    kv_cache,
+                    attn_metadata,
+                    Pi,
+                    S,
+                    centroids,
+                    query_start_loc,
+                    q_lens,
+                    num_reqs,
                 )
 
         if output.ndim == 3:
@@ -471,9 +476,9 @@ class TurboQuantAttentionImpl:
 
     def _store_kv(
         self,
-        key: torch.Tensor,      # (N, Hk, D)
-        value: torch.Tensor,    # (N, Hk, D)
-        kv_cache: torch.Tensor, # (num_blocks, block_size, Hk, slot_size)
+        key: torch.Tensor,  # (N, Hk, D)
+        value: torch.Tensor,  # (N, Hk, D)
+        kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
         slot_mapping: torch.Tensor,
         Pi: torch.Tensor,
         S: torch.Tensor,
@@ -485,8 +490,14 @@ class TurboQuantAttentionImpl:
 
         if _USE_TRITON_STORE and _triton_tq_store is not None:
             _triton_tq_store(
-                key, value, kv_cache, slot_mapping,
-                layer._tq_PiT, layer._tq_Pi_S_T, centroids, layer._tq_midpoints,
+                key,
+                value,
+                kv_cache,
+                slot_mapping,
+                layer._tq_PiT,
+                layer._tq_Pi_S_T,
+                centroids,
+                layer._tq_midpoints,
                 mse_bits=self.tq_config.mse_bits,
                 key_packed_size=self.tq_config.key_packed_size,
                 value_quant_bits=self.tq_config.effective_value_quant_bits,
@@ -534,9 +545,7 @@ class TurboQuantAttentionImpl:
             idx_r = idx.reshape(-1, D // 8, 8).int()
             packed_mse = torch.empty(N * H, D // 8 * 3, dtype=torch.uint8, device=device)
             packed_mse[:, 0::3] = (
-                (idx_r[:, :, 0] & 0x7)
-                | ((idx_r[:, :, 1] & 0x7) << 3)
-                | ((idx_r[:, :, 2] & 0x3) << 6)
+                (idx_r[:, :, 0] & 0x7) | ((idx_r[:, :, 1] & 0x7) << 3) | ((idx_r[:, :, 2] & 0x3) << 6)
             ).to(torch.uint8)
             packed_mse[:, 1::3] = (
                 ((idx_r[:, :, 2] >> 2) & 0x1)
@@ -545,9 +554,7 @@ class TurboQuantAttentionImpl:
                 | ((idx_r[:, :, 5] & 0x1) << 7)
             ).to(torch.uint8)
             packed_mse[:, 2::3] = (
-                ((idx_r[:, :, 5] >> 1) & 0x3)
-                | ((idx_r[:, :, 6] & 0x7) << 2)
-                | ((idx_r[:, :, 7] & 0x7) << 5)
+                ((idx_r[:, :, 5] >> 1) & 0x3) | ((idx_r[:, :, 6] & 0x7) << 2) | ((idx_r[:, :, 7] & 0x7) << 5)
             ).to(torch.uint8)
         elif mse_bits == 2 and D % 4 == 0:
             idx_r = idx.reshape(-1, D // 4, 4)
@@ -560,8 +567,7 @@ class TurboQuantAttentionImpl:
                 bi, si = bo // 8, bo % 8
                 packed_mse[:, bi] |= ((idx_u8[:, j].int() << si) & 0xFF).to(torch.uint8)
                 if si + mse_bits > 8 and bi + 1 < mse_bytes_n:
-                    packed_mse[:, bi + 1] |= (
-                        (idx_u8[:, j].int() >> (8 - si)) & 0xFF).to(torch.uint8)
+                    packed_mse[:, bi + 1] |= ((idx_u8[:, j].int() >> (8 - si)) & 0xFF).to(torch.uint8)
 
         norm_b = norms.squeeze(-1).half().contiguous().view(torch.uint8).reshape(-1, 2)
         no_qjl = self.tq_config.no_qjl
@@ -576,7 +582,7 @@ class TurboQuantAttentionImpl:
             else:
                 packed_signs = torch.zeros(N * H, qjl_bytes_n, dtype=torch.uint8, device=device)
                 for j in range(D):
-                    packed_signs[:, j // 8] |= (signs[:, j] << (j % 8))
+                    packed_signs[:, j // 8] |= signs[:, j] << (j % 8)
             gamma_b = gamma.squeeze(-1).half().contiguous().view(torch.uint8).reshape(-1, 2)
             packed_key = torch.cat([packed_mse, packed_signs, norm_b, gamma_b], dim=1)
 
@@ -608,8 +614,7 @@ class TurboQuantAttentionImpl:
                     bi, si = bo // 8, bo % 8
                     packed_val[:, bi] |= ((v_u8[:, j].int() << si) & 0xFF).to(torch.uint8)
                     if si + vqb > 8 and bi + 1 < val_data_bytes:
-                        packed_val[:, bi + 1] |= (
-                            (v_u8[:, j].int() >> (8 - si)) & 0xFF).to(torch.uint8)
+                        packed_val[:, bi + 1] |= ((v_u8[:, j].int() >> (8 - si)) & 0xFF).to(torch.uint8)
             v_scale_b = v_scale.squeeze(-1).half().contiguous().view(torch.uint8).reshape(-1, 2)
             v_zero_b = vmin.squeeze(-1).half().contiguous().view(torch.uint8).reshape(-1, 2)
             packed_value = torch.cat([packed_val, v_scale_b, v_zero_b], dim=1)
@@ -622,12 +627,12 @@ class TurboQuantAttentionImpl:
         blk_idx = (safe_slots // block_size).long()
         blk_off = (safe_slots % block_size).long()
         existing_key = kv_cache[blk_idx, blk_off, :, :kps]
-        existing_value = kv_cache[blk_idx, blk_off, :, kps:kps + vps]
+        existing_value = kv_cache[blk_idx, blk_off, :, kps : kps + vps]
         valid_mask = valid.view(N, 1, 1)
         packed_key = torch.where(valid_mask, packed_key, existing_key)
         packed_value = torch.where(valid_mask, packed_value, existing_value)
         kv_cache[blk_idx, blk_off, :, :kps] = packed_key
-        kv_cache[blk_idx, blk_off, :, kps:kps + vps] = packed_value
+        kv_cache[blk_idx, blk_off, :, kps : kps + vps] = packed_value
 
     # ------------------------------------------------------------------ #
     #  Prefill: SDPA on raw Q/K/V                                         #
@@ -644,13 +649,16 @@ class TurboQuantAttentionImpl:
         if _HAS_FLASH_ATTN and attn_metadata.max_query_len == attn_metadata.max_seq_len:
             output = torch.empty(N, Hq, D, device=query.device, dtype=query.dtype)
             flash_attn_varlen_func(
-                q=query, k=key, v=value,
+                q=query,
+                k=key,
+                v=value,
                 cu_seqlens_q=attn_metadata.query_start_loc,
                 cu_seqlens_k=attn_metadata.query_start_loc,
                 max_seqlen_q=attn_metadata.max_query_len,
                 max_seqlen_k=attn_metadata.max_query_len,
                 softmax_scale=self.scale,
-                causal=True, out=output,
+                causal=True,
+                out=output,
             )
             return output
 
@@ -671,8 +679,7 @@ class TurboQuantAttentionImpl:
             q_t = query[q_start:q_end].transpose(0, 1).contiguous()
             k_t = key[q_start:q_end].transpose(0, 1).contiguous()
             v_t = value[q_start:q_end].transpose(0, 1).contiguous()
-            out = F.scaled_dot_product_attention(
-                q_t, k_t, v_t, is_causal=True, scale=self.scale, enable_gqa=use_gqa)
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True, scale=self.scale, enable_gqa=use_gqa)
             output[q_start:q_end] = out.transpose(0, 1).to(query.dtype)
         return output
 
@@ -693,10 +700,13 @@ class TurboQuantAttentionImpl:
         if self._use_triton_decode and _triton_tq_decode is not None:
             try:
                 return _triton_tq_decode(
-                    query=query, kv_cache=kv_cache,
+                    query=query,
+                    kv_cache=kv_cache,
                     block_table=attn_metadata.block_table,
                     seq_lens=attn_metadata.seq_lens,
-                    Pi=Pi, S=S, centroids=centroids,
+                    Pi=Pi,
+                    S=S,
+                    centroids=centroids,
                     scale=self.scale,
                     mse_bits=self.tq_config.mse_bits,
                     key_packed_size=self.tq_config.key_packed_size,
@@ -778,16 +788,19 @@ class TurboQuantAttentionImpl:
                 b0 = mse_raw[:, :, 0::3].int()
                 b1 = mse_raw[:, :, 1::3].int()
                 b2 = mse_raw[:, :, 2::3].int()
-                idx = torch.stack([
-                    b0 & 7,
-                    (b0 >> 3) & 7,
-                    ((b0 >> 6) | (b1 << 2)) & 7,
-                    (b1 >> 1) & 7,
-                    (b1 >> 4) & 7,
-                    ((b1 >> 7) | (b2 << 1)) & 7,
-                    (b2 >> 2) & 7,
-                    (b2 >> 5) & 7,
-                ], dim=-1).reshape(seq_len, Hk, D)
+                idx = torch.stack(
+                    [
+                        b0 & 7,
+                        (b0 >> 3) & 7,
+                        ((b0 >> 6) | (b1 << 2)) & 7,
+                        (b1 >> 1) & 7,
+                        (b1 >> 4) & 7,
+                        ((b1 >> 7) | (b2 << 1)) & 7,
+                        (b2 >> 2) & 7,
+                        (b2 >> 5) & 7,
+                    ],
+                    dim=-1,
+                ).reshape(seq_len, Hk, D)
             else:
                 j = torch.arange(D, device=device)
                 bo = j * mse_bits
@@ -808,12 +821,12 @@ class TurboQuantAttentionImpl:
             gammas: Optional[torch.Tensor] = None
             if no_qjl:
                 noff = mse_bytes_n
-                nd = slots[:, :, noff:noff + 2].contiguous()
+                nd = slots[:, :, noff : noff + 2].contiguous()
                 vec_norms = nd.view(torch.float16).squeeze(-1).float()
             else:
                 assert sign_sh is not None
                 qjl_bytes_n_local = math.ceil(D / 8)
-                sign_raw = slots[:, :, mse_bytes_n:mse_bytes_n + qjl_bytes_n_local]
+                sign_raw = slots[:, :, mse_bytes_n : mse_bytes_n + qjl_bytes_n_local]
                 if D % 8 == 0:
                     s_exp = sign_raw.unsqueeze(-1).int() >> sign_sh
                     signs_01 = (s_exp & 1).reshape(seq_len, Hk, -1)[:, :, :D]
@@ -823,8 +836,8 @@ class TurboQuantAttentionImpl:
                     signs_01 = (s_byte.int() >> (j % 8).int()) & 1
                 signs_f = signs_01.float() * 2.0 - 1.0
                 noff = mse_bytes_n + qjl_bytes_n_local
-                nd = slots[:, :, noff:noff + 2].contiguous()
-                gd = slots[:, :, noff + 2:noff + 4].contiguous()
+                nd = slots[:, :, noff : noff + 2].contiguous()
+                gd = slots[:, :, noff + 2 : noff + 4].contiguous()
                 vec_norms = nd.view(torch.float16).squeeze(-1).float()
                 gammas = gd.view(torch.float16).squeeze(-1).float()
 
@@ -838,25 +851,25 @@ class TurboQuantAttentionImpl:
                     gammas = gammas.repeat_interleave(g, dim=1)
 
             q_rot_i = q_rot[i]
-            term1 = torch.einsum('hd,shd->sh', q_rot_i, c_vals)
+            term1 = torch.einsum("hd,shd->sh", q_rot_i, c_vals)
             if no_qjl:
                 scores = vec_norms * term1 * self.scale
             else:
                 assert q_proj is not None and signs_f is not None and gammas is not None
                 q_proj_i = q_proj[i]
-                term2 = torch.einsum('hd,shd->sh', q_proj_i, signs_f)
+                term2 = torch.einsum("hd,shd->sh", q_proj_i, signs_f)
                 scores = vec_norms * (term1 + correction * gammas * term2) * self.scale
 
             attn_w = torch.softmax(scores.T, dim=-1)  # (Hq, S)
 
             if self.tq_config.value_fp8:
-                val_raw = slots[:, :, kps:kps + D]
+                val_raw = slots[:, :, kps : kps + D]
                 values = val_raw.view(torch.float8_e4m3fn).float()
             else:
                 vqb = self.tq_config.effective_value_quant_bits
                 val_data_bytes = math.ceil(D * vqb / 8)
                 qmax = (1 << vqb) - 1
-                val_raw = slots[:, :, kps:kps + val_data_bytes]
+                val_raw = slots[:, :, kps : kps + val_data_bytes]
                 if vqb == 2 and D % 4 == 0:
                     v_sh = torch.tensor([0, 2, 4, 6], device=device, dtype=torch.int32)
                     v_exp = val_raw.unsqueeze(-1).int() >> v_sh
@@ -878,14 +891,14 @@ class TurboQuantAttentionImpl:
                     high = (b1 << (8 - si)) & qmax
                     v_idx = torch.where(need_next, low | high, low).float()
                 sc_off = kps + val_data_bytes
-                v_scale = slots[:, :, sc_off:sc_off + 2].contiguous().view(torch.float16).squeeze(-1).float()
-                v_zero = slots[:, :, sc_off + 2:sc_off + 4].contiguous().view(torch.float16).squeeze(-1).float()
+                v_scale = slots[:, :, sc_off : sc_off + 2].contiguous().view(torch.float16).squeeze(-1).float()
+                v_zero = slots[:, :, sc_off + 2 : sc_off + 4].contiguous().view(torch.float16).squeeze(-1).float()
                 values = v_idx * v_scale.unsqueeze(-1) + v_zero.unsqueeze(-1)
 
             if Hk < Hq:
                 values = values.repeat_interleave(self.num_kv_groups, dim=1)
 
-            out = torch.einsum('hs,shd->hd', attn_w, values)
+            out = torch.einsum("hs,shd->hd", attn_w, values)
             outputs.append(out.to(query.dtype))
 
         return torch.stack(outputs, dim=0)
@@ -912,7 +925,7 @@ class TurboQuantAttentionImpl:
         device = query.device
         output = torch.zeros(N, Hq, D, device=device, dtype=query.dtype)
 
-        decode_mask = (q_lens == 1)
+        decode_mask = q_lens == 1
         prefill_mask = ~decode_mask
 
         # Single CPU<->GPU sync for query_start_loc; consumed by both the
@@ -937,7 +950,8 @@ class TurboQuantAttentionImpl:
                 k_t = key[q_start:q_end].transpose(0, 1).contiguous()
                 v_t = value[q_start:q_end].transpose(0, 1).contiguous()
                 out = F.scaled_dot_product_attention(
-                    q_t, k_t, v_t, is_causal=True, scale=self.scale, enable_gqa=use_gqa)
+                    q_t, k_t, v_t, is_causal=True, scale=self.scale, enable_gqa=use_gqa
+                )
                 output[q_start:q_end] = out.transpose(0, 1)
 
         if decode_mask.any():

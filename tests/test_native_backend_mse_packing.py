@@ -10,7 +10,7 @@ from turboquant_vllm.weight_quant import pack_indices, unpack_indices
 
 def _make_synthetic_centroids_and_midpoints(d: int, bits: int):
     """Return (centroids, midpoints) for testing without expensive Lloyd-Max."""
-    n_levels = 2 ** bits
+    n_levels = 2**bits
     sigma = 1.0 / math.sqrt(d)
     lo, hi = -3.0 * sigma, 3.0 * sigma
     centroids = torch.linspace(lo, hi, n_levels, dtype=torch.float32)
@@ -76,9 +76,7 @@ def test_store_kv_uses_true_3bit_layout_for_representative_dims():
 
         # pack_indices pads to multiples of 8 indices; compare only the
         # first mse_bytes that the native backend actually writes.
-        assert torch.equal(stored_mse, expected_packed[:, :mse_bytes]), (
-            f"3-bit packed bytes mismatch for D={d}"
-        )
+        assert torch.equal(stored_mse, expected_packed[:, :mse_bytes]), f"3-bit packed bytes mismatch for D={d}"
 
         # To unpack with weight_quant, pad stored bytes to a multiple of 3
         pad_needed = (3 - mse_bytes % 3) % 3
@@ -93,6 +91,7 @@ def test_store_kv_uses_true_3bit_layout_for_representative_dims():
 @dataclass
 class _FakeDecodeMetadata:
     """Minimal metadata for exercising _decode_attention_python."""
+
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
@@ -117,7 +116,10 @@ def test_decode_roundtrip_3bit_mse():
             kv_cache_dtype="tq3",
         )
         impl.tq_config = TurboQuantConfig(
-            head_dim=d, total_bits=3, value_quant_bits=4, no_qjl=True,
+            head_dim=d,
+            total_bits=3,
+            value_quant_bits=4,
+            no_qjl=True,
         )
 
         centroids, midpoints = _make_synthetic_centroids_and_midpoints(d, 3)
@@ -138,9 +140,12 @@ def test_decode_roundtrip_3bit_mse():
         slot_mapping = torch.arange(n, dtype=torch.int64)
 
         impl._store_kv(
-            key=key, value=value, kv_cache=kv_cache,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
             slot_mapping=slot_mapping,
-            Pi=torch.eye(d), S=torch.eye(d),
+            Pi=torch.eye(d),
+            S=torch.eye(d),
             centroids=centroids,
         )
 
@@ -159,9 +164,7 @@ def test_decode_roundtrip_3bit_mse():
         else:
             stored_mse_padded = stored_mse
         decoded_idx = unpack_indices(stored_mse_padded, bits=3, dim=d)
-        assert torch.equal(decoded_idx, expected_idx), (
-            f"weight_quant unpack mismatch for D={d}"
-        )
+        assert torch.equal(decoded_idx, expected_idx), f"weight_quant unpack mismatch for D={d}"
 
         # Now exercise the actual Python decode path in native_backend
         query = torch.randn(1, 1, d)
@@ -179,9 +182,11 @@ def test_decode_roundtrip_3bit_mse():
         # This should not raise — it exercises the 3-bit unpack inside
         # _decode_attention_python and produces a valid attention output.
         output = impl._decode_attention_python(
-            query=query, kv_cache=kv_cache,
+            query=query,
+            kv_cache=kv_cache,
             attn_metadata=meta,
-            Pi=torch.eye(d), S=torch.eye(d),
+            Pi=torch.eye(d),
+            S=torch.eye(d),
             centroids=centroids,
         )
         assert output.shape == (1, 1, d), f"decode output shape mismatch for D={d}"
@@ -200,9 +205,7 @@ def test_store_kv_value_3bit_generic_pack_unpacks_for_straddled_offsets():
         num_kv_heads=1,
         kv_cache_dtype="tq_k4v3",
     )
-    impl.tq_config = TurboQuantConfig(
-        head_dim=d, total_bits=4, asymmetric=True, v_total_bits=3, no_qjl=True
-    )
+    impl.tq_config = TurboQuantConfig(head_dim=d, total_bits=4, asymmetric=True, v_total_bits=3, no_qjl=True)
 
     centroids, midpoints = _make_synthetic_centroids_and_midpoints(d, 4)
     layer = torch.nn.Module()
@@ -233,7 +236,7 @@ def test_store_kv_value_3bit_generic_pack_unpacks_for_straddled_offsets():
     qmax = (1 << vqb) - 1
     kps = impl.tq_config.key_packed_size
     val_data_bytes = math.ceil(d * vqb / 8)
-    packed_val = kv_cache[0, :n, 0, kps:kps + val_data_bytes]
+    packed_val = kv_cache[0, :n, 0, kps : kps + val_data_bytes]
 
     v_flat = value.float().reshape(-1, d)
     vmin = v_flat.min(dim=1, keepdim=True).values
@@ -270,9 +273,7 @@ def test_decode_roundtrip_tq_k4v3_value_3bit_straddled_offsets():
         num_kv_heads=1,
         kv_cache_dtype="tq_k4v3",
     )
-    impl.tq_config = TurboQuantConfig(
-        head_dim=d, total_bits=4, asymmetric=True, v_total_bits=3, no_qjl=True
-    )
+    impl.tq_config = TurboQuantConfig(head_dim=d, total_bits=4, asymmetric=True, v_total_bits=3, no_qjl=True)
 
     centroids, midpoints = _make_synthetic_centroids_and_midpoints(d, 4)
     layer = torch.nn.Module()
@@ -324,9 +325,5 @@ def test_decode_roundtrip_tq_k4v3_value_3bit_straddled_offsets():
     vmax = v_flat.max(dim=1, keepdim=True).values
     v_scale = ((vmax - vmin) / qmax).clamp(min=1e-8)
     v_idx = ((v_flat - vmin) / v_scale).round().clamp(0, qmax)
-    expected_decoded = (
-        v_idx
-        * v_scale.half().float()
-        + vmin.half().float()
-    )
+    expected_decoded = v_idx * v_scale.half().float() + vmin.half().float()
     assert torch.allclose(output[0, 0].float(), expected_decoded[0], atol=5e-3, rtol=5e-3)

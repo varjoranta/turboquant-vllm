@@ -27,14 +27,13 @@ class TestCudaNormCorrectionFallback(unittest.TestCase):
                 v_bits=4,
                 seed=42,
                 device="cpu",
-                use_cuda=True,       # caller asks for CUDA
+                use_cuda=True,  # caller asks for CUDA
                 norm_correction=True,  # but also wants norm correction
                 use_qjl=False,
             )
         self.assertFalse(
             comp.use_cuda,
-            "norm_correction=True must override use_cuda=True to avoid "
-            "silent quality degradation on the CUDA path",
+            "norm_correction=True must override use_cuda=True to avoid silent quality degradation on the CUDA path",
         )
         self.assertIsNone(comp._cuda_mod, "CUDA module must not be loaded")
         # The warning must explain *why* we fell back
@@ -58,20 +57,32 @@ class TestCudaNormCorrectionFallback(unittest.TestCase):
         with self.assertLogs(logger, level="WARNING") as logs:
             logger.warning("sentinel")  # keep assertLogs happy
             KVCacheCompressorTorch(
-                head_dim=64, k_bits=4, v_bits=4, seed=42, device="cpu",
-                use_cuda=False, norm_correction=True, use_qjl=False,
+                head_dim=64,
+                k_bits=4,
+                v_bits=4,
+                seed=42,
+                device="cpu",
+                use_cuda=False,
+                norm_correction=True,
+                use_qjl=False,
             )
         norm_msgs = [r for r in logs.records if "norm_correction" in r.message]
         self.assertEqual(
-            norm_msgs, [],
+            norm_msgs,
+            [],
             "no norm_correction warning should fire when use_cuda=False",
         )
 
     def test_default_pytorch_path(self):
         """The default construction must not touch CUDA at all."""
         from turboquant_vllm.torch_ops import KVCacheCompressorTorch
+
         comp = KVCacheCompressorTorch(
-            head_dim=64, k_bits=4, v_bits=4, seed=42, device="cpu",
+            head_dim=64,
+            k_bits=4,
+            v_bits=4,
+            seed=42,
+            device="cpu",
         )
         self.assertFalse(comp.use_cuda)
         self.assertIsNone(comp._cuda_mod)

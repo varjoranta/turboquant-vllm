@@ -16,6 +16,7 @@ from turboquant_vllm.weight_quant import pack_indices, unpack_indices, _get_quan
 def _skip_if_no_triton():
     try:
         import triton  # noqa: F401
+
         return False
     except ImportError:
         return True
@@ -30,9 +31,7 @@ def _prepare(out_dim, in_dim, bits, group_size, device="cuda"):
     indices, norms = quantizer.quantize(grouped)
     packed = pack_indices(indices, bits).contiguous()
     norms_2d = norms.reshape(out_dim, n_groups).contiguous()
-    centroids = torch.tensor(
-        optimal_centroids(bits, group_size), device=device, dtype=torch.float32
-    )
+    centroids = torch.tensor(optimal_centroids(bits, group_size), device=device, dtype=torch.float32)
     return packed, norms_2d, quantizer, centroids
 
 
@@ -47,7 +46,6 @@ def _reference_gemm(x, packed, norms_2d, quantizer, bits, group_size, out_dim, i
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.skipif(_skip_if_no_triton(), reason="Triton required")
 class TestTritonFusedGemm:
-
     @pytest.mark.parametrize("bits", [4])
     @pytest.mark.parametrize("M", [1, 16, 64])
     def test_correctness(self, bits, M):
@@ -63,9 +61,9 @@ class TestTritonFusedGemm:
         ref = _reference_gemm(x, packed, norms_2d, quantizer, bits, group_size, N, K)
 
         # Fused kernel
-        fused = tq_fused_gemm(x, packed, norms_2d,
-                              quantizer.signs1, quantizer.signs2, centroids,
-                              group_size=group_size, bits=bits)
+        fused = tq_fused_gemm(
+            x, packed, norms_2d, quantizer.signs1, quantizer.signs2, centroids, group_size=group_size, bits=bits
+        )
 
         max_diff = (ref - fused).abs().max().item()
         rel_err = max_diff / (ref.abs().max().item() + 1e-8)
@@ -83,9 +81,9 @@ class TestTritonFusedGemm:
         x_f16 = x_f32.half()
 
         ref = _reference_gemm(x_f32, packed, norms_2d, quantizer, bits, group_size, N, K)
-        fused = tq_fused_gemm(x_f16, packed, norms_2d,
-                              quantizer.signs1, quantizer.signs2, centroids,
-                              group_size=group_size, bits=bits)
+        fused = tq_fused_gemm(
+            x_f16, packed, norms_2d, quantizer.signs1, quantizer.signs2, centroids, group_size=group_size, bits=bits
+        )
 
         # FP16 introduces some error, but should be reasonable
         max_diff = (ref.half().float() - fused.float()).abs().max().item()
@@ -106,9 +104,17 @@ class TestTritonFusedGemm:
         ref = _reference_gemm(x, packed, norms_2d, quantizer, bits, group_size, N, K)
         ref += bias
 
-        fused = tq_fused_gemm(x, packed, norms_2d,
-                              quantizer.signs1, quantizer.signs2, centroids,
-                              group_size=group_size, bits=bits, bias=bias)
+        fused = tq_fused_gemm(
+            x,
+            packed,
+            norms_2d,
+            quantizer.signs1,
+            quantizer.signs2,
+            centroids,
+            group_size=group_size,
+            bits=bits,
+            bias=bias,
+        )
 
         max_diff = (ref - fused).abs().max().item()
         rel_err = max_diff / (ref.abs().max().item() + 1e-8)
@@ -125,22 +131,23 @@ class TestTritonFusedGemm:
 
         # Warmup
         for _ in range(3):
-            tq_fused_gemm(x, packed, norms_2d,
-                          quantizer.signs1, quantizer.signs2, centroids,
-                          group_size=group_size, bits=bits)
+            tq_fused_gemm(
+                x, packed, norms_2d, quantizer.signs1, quantizer.signs2, centroids, group_size=group_size, bits=bits
+            )
             _reference_gemm(x.float(), packed, norms_2d, quantizer, bits, group_size, N, K)
         torch.cuda.synchronize()
 
         import time
+
         n_iters = 50
 
         # Fused
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         for _ in range(n_iters):
-            tq_fused_gemm(x, packed, norms_2d,
-                          quantizer.signs1, quantizer.signs2, centroids,
-                          group_size=group_size, bits=bits)
+            tq_fused_gemm(
+                x, packed, norms_2d, quantizer.signs1, quantizer.signs2, centroids, group_size=group_size, bits=bits
+            )
         torch.cuda.synchronize()
         fused_ms = (time.perf_counter() - t0) / n_iters * 1000
 
@@ -156,7 +163,6 @@ class TestTritonFusedGemm:
         separate_ms = (time.perf_counter() - t0) / n_iters * 1000
 
         speedup = separate_ms / fused_ms
-        print(f"\n  Fused: {fused_ms:.3f} ms, Separate: {separate_ms:.3f} ms, "
-              f"Speedup: {speedup:.1f}x")
+        print(f"\n  Fused: {fused_ms:.3f} ms, Separate: {separate_ms:.3f} ms, Speedup: {speedup:.1f}x")
         # Fused should be at least competitive (>0.5x is OK for first version)
         assert fused_ms < separate_ms * 3, f"Fused is too slow: {fused_ms:.1f}ms vs {separate_ms:.1f}ms"
