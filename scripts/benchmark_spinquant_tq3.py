@@ -7,7 +7,6 @@ Usage: python3 -u scripts/benchmark_spinquant_tq3.py [--model MODEL]
 """
 import argparse
 import gc
-import json
 import os
 import re
 import time

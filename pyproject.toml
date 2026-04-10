@@ -10,6 +10,7 @@ dependencies = [
     "scipy>=1.11",
     "numpy>=1.24",
     "transformers>=4.57.6",
+    "safetensors>=0.4",
 ]
 authors = [{name = "Hannu Varjoranta", email = "hannu@varjosoft.com"}]
 keywords = ["quantization", "kv-cache", "vllm", "inference", "llm", "compression", "cuda"]
@@ -75,7 +76,9 @@ ignore = [
 # Benchmark/utility scripts are more permissive — they're not library code
 # and developer ergonomics > strict style. E702 is the `del x; gc.collect()`
 # pattern common in CUDA benchmarks. F841 is captured-but-unused results.
-"scripts/**" = ["E702", "F841", "F541", "F401"]
+# F401 is deliberately NOT ignored: unused imports hide stale dependencies
+# even in scripts, and the autofixer handles them cleanly.
+"scripts/**" = ["E702", "F841", "F541"]
 # Tests frequently define unused fixtures for symmetry.
 "tests/**" = ["F841"]
 
