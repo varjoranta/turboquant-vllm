@@ -23,24 +23,19 @@ if not (CSRC_DIR / "turbo_quant.cu").exists():
 
 
 def _cuda_version_tuple():
-    """Return (major, minor) tuple for the nvcc the toolchain will invoke."""
-    import subprocess
+    """Return (major, minor) for the CUDA toolkit torch was built against.
 
-    from torch.utils.cpp_extension import CUDA_HOME
+    Matches the toolchain `torch.utils.cpp_extension.load()` will invoke,
+    so it's the right version to gate gencode flags on.
+    """
+    import torch
 
-    nvcc = f"{CUDA_HOME}/bin/nvcc" if CUDA_HOME else "nvcc"
+    v = getattr(torch.version, "cuda", None) or "0.0"
     try:
-        out = subprocess.check_output([nvcc, "--version"], text=True)
-    except (OSError, subprocess.CalledProcessError):
+        major, minor = v.split(".")[:2]
+        return (int(major), int(minor))
+    except ValueError:
         return (0, 0)
-    for line in out.splitlines():
-        if "release" in line:
-            # "Cuda compilation tools, release 12.8, V12.8.93"
-            for token in line.split():
-                if token[:1].isdigit() and "." in token.rstrip(","):
-                    major, minor = token.rstrip(",").split(".")[:2]
-                    return (int(major), int(minor))
-    return (0, 0)
 
 
 def build():

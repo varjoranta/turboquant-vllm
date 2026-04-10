@@ -127,19 +127,12 @@ def _eager_patch_str_dtype_mapping() -> None:
 def _eager_patch_cache_dtype_literal() -> None:
     """Extend vLLM's CacheDType Literal to accept tq3/tq4/tq_k4v3.
 
-    vLLM's EngineArgs.add_cli_args() introspects CacheConfig's type hints via
-    get_kwargs() and builds an argparse ``choices=[...]`` list from the
-    CacheDType Literal. Without this patch, argparse rejects
-    ``--kv-cache-dtype tq3`` with ``invalid choice`` before any engine code
-    runs.
-
-    Ordering: AsyncEngineArgs.add_cli_args() calls load_general_plugins() BEFORE
-    calling EngineArgs.add_cli_args() (vllm/engine/arg_utils.py ~line 2262), so
-    this eager patch — fired at plugin import time — lands in time to influence
-    the choices list.
-
-    We replace both the module-level CacheDType and CacheConfig.__annotations__
-    entry because different call sites may consult either one.
+    Ordering invariant: AsyncEngineArgs.add_cli_args() calls
+    load_general_plugins() BEFORE EngineArgs.add_cli_args() builds the
+    argparse choices list from CacheConfig's type hints. This patch fires
+    at plugin import time so the extended Literal is in place when the
+    choices are computed. Without it, argparse rejects --kv-cache-dtype tq3
+    before any engine code runs.
     """
     try:
         from typing import Literal
@@ -169,8 +162,8 @@ def _eager_patch_cache_dtype_literal() -> None:
         logger.debug("Could not patch CacheConfig.__annotations__: %s", e)
 
     # dataclasses.fields(CacheConfig) captures each field's .type at class
-    # creation time. get_kwargs() reads these — mutating __annotations__ alone
-    # is not enough, we have to update the captured Field.type too.
+    # creation time; get_kwargs() reads these, so mutating __annotations__
+    # alone is insufficient.
     try:
         from dataclasses import fields
 
@@ -181,9 +174,8 @@ def _eager_patch_cache_dtype_literal() -> None:
     except Exception as e:
         logger.debug("Could not patch CacheConfig fields: %s", e)
 
-    # vllm's _compute_kwargs is lru_cache'd. If it was populated before this
-    # patch (e.g. by a --help probe), the cached entry still has the old
-    # choices. Invalidate it.
+    # _compute_kwargs is @lru_cache'd; a prior --help probe may have cached
+    # the old choices list.
     try:
         from vllm.engine.arg_utils import _compute_kwargs
 
@@ -191,11 +183,8 @@ def _eager_patch_cache_dtype_literal() -> None:
     except Exception as e:
         logger.debug("Could not clear _compute_kwargs cache: %s", e)
 
-    # CacheConfig is a pydantic dataclass; its __pydantic_validator__ was
-    # built at class-creation time from the original Literal. Rebuilding
-    # forces pydantic to re-read the (now-patched) annotations. Without
-    # this, CacheConfig(cache_dtype='tq3') still raises a pydantic
-    # ValidationError even though argparse accepts the flag.
+    # CacheConfig is a pydantic dataclass; rebuilding forces a fresh
+    # __pydantic_validator__ that honors the patched annotations.
     try:
         from pydantic.dataclasses import rebuild_dataclass
 
@@ -211,9 +200,6 @@ def _eager_patch_cache_dtype_literal() -> None:
 
 
 # Fire the eager patches on module load, before register() is called.
-# load_general_plugins() runs in AsyncEngineArgs.add_cli_args() BEFORE the
-# actual argparse choices are derived — so these patches take effect in
-# time to keep --kv-cache-dtype tq3/tq4/tq_k4v3 from being rejected.
 _eager_patch_str_dtype_mapping()
 _eager_patch_cache_dtype_literal()
 
@@ -304,17 +290,13 @@ def _register_native_backend() -> bool:
         return False
 
     # Patch CudaPlatform.get_valid_backends to route tq* → CUSTOM.
-    # In vLLM this is an instance method, not classmethod, so the attribute
-    # is a regular function — no .__func__ needed.
+    # It's a @classmethod on the class; our replacement must be wrapped in
+    # classmethod() too or vLLM's call path crashes with "missing cls".
+    # Accessing the original via the class gives a bound method, so
+    # _orig_get_valid(...) below can be called without passing cls.
     try:
         from vllm.platforms.cuda import CudaPlatform
 
-        # CudaPlatform.get_valid_backends is a @classmethod. Accessing it on
-        # the class gives us a bound method with cls already bound, so we can
-        # call _orig_get_valid(...) directly without passing cls. Our
-        # replacement must be wrapped as classmethod() to preserve the
-        # descriptor — otherwise vLLM's call path passes no implicit self/cls
-        # and we'd crash with "missing 1 required positional argument".
         _orig_get_valid = CudaPlatform.get_valid_backends
 
         def _tq_get_valid_backends(cls, device_capability, attn_selector_config, num_heads=None):
@@ -520,12 +502,10 @@ def _patch_attention_layer_init() -> None:
     """Inject _init_turboquant_buffers into vLLM's Attention layer.
 
     In the vllm fork, the layer __init__ calls self._init_turboquant_buffers()
-    when kv_cache_dtype.startswith('tq'). In stock vLLM this code doesn't exist.
-    We add it via monkey-patch so the rotation matrices (Pi, S, centroids)
-    are attached to the layer before the model runs.
-
-    vLLM 0.19 renamed the class from AttentionLayer to Attention
-    (vllm/model_executor/layers/attention/attention.py:175). Try both names.
+    when kv_cache_dtype.startswith('tq'); stock vLLM lacks this, so we
+    monkey-patch __init__ to attach the rotation matrices (Pi, S, centroids)
+    before the model runs. The class is called Attention in current vLLM
+    and AttentionLayer in older versions.
     """
     layer_cls = None
     try:
