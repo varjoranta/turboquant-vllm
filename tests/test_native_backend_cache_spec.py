@@ -5,24 +5,25 @@ The native backend was declaring supported_kv_cache_dtypes = ["tq3",
 allocation math. Result: --kv-cache-dtype tq3 either crashed at
 startup (stock vLLM rejects the dtype string) or silently allocated
 a bf16-sized cache (if the user ran the fork). The token-capacity
-gain was ~5% instead of the expected 2×.
+gain was ~5% instead of the expected 2x.
 
 This test suite locks in the fix:
 
-1. STR_DTYPE_TO_TORCH_DTYPE is patched with tq3/tq4/tq_k4v3 → uint8
+1. STR_DTYPE_TO_TORCH_DTYPE is patched with tq3/tq4/tq_k4v3 -> uint8
 2. kv_cache_dtype_str_to_dtype wrapper handles tq* directly
 3. AttentionLayer.get_kv_cache_spec returns a FullAttentionSpec
    with head_size remapped to padded_slot_size // 2 for tq* dtypes
 4. The resulting spec's real_page_size_bytes equals the actual
-   compressed slot size (the allocator-math contract — Test D)
+   compressed slot size
 5. MLAAttention.get_kv_cache_spec raises a clear error for tq*
    instead of silently mis-allocating
 
-Tests A, B, C, E, F, G can run without vLLM installed (they stub
-vLLM modules via unittest.mock). Test D requires vLLM because it
-needs the real FullAttentionSpec; it's skipped otherwise.
+Tests that stub vLLM via mock.patch.dict can run without vLLM
+installed; tests that need the real FullAttentionSpec /
+AttentionLayer / MLAAttention classes skip cleanly otherwise.
 """
 
+import contextlib
 import sys
 import unittest
 import unittest.mock as mock
@@ -33,23 +34,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
-def _reset_plugin_state():
-    """Reset module-level state between tests so patch idempotency
-    doesn't cause a test that runs second to see a stale cache."""
-    import turboquant_vllm._vllm_plugin as p
-    p._str_dtype_patched = False
-    p._native_backend_registered = False
+def _make_fake_vllm_torch_utils(orig_resolver=None, initial_dict=None):
+    """Build a sys.modules stub chain for `import vllm.utils.torch_utils`.
 
-
-def _make_fake_vllm_torch_utils(
-    orig_resolver=None,
-    initial_dict=None,
-):
-    """Return a dict of sys.modules entries that make
-    `import vllm.utils.torch_utils as _tu` resolve to our fake.
-
-    Subtlety: `import vllm.utils.torch_utils as _tu` binds `_tu` via
-    attribute access (_tu = vllm.utils.torch_utils), NOT via a direct
+    Subtlety: `import vllm.utils.torch_utils as _tu` binds _tu via
+    attribute access (_tu = vllm.utils.torch_utils), NOT a direct
     sys.modules lookup. So we must also wire the parent chain so
     fake_vllm.utils.torch_utils IS our fake_tu, not an auto-created
     MagicMock attribute.
@@ -63,8 +52,6 @@ def _make_fake_vllm_torch_utils(
             return torch.float16
     fake_tu.kv_cache_dtype_str_to_dtype = orig_resolver
 
-    # Wire the parent attribute chain so `import vllm.utils.torch_utils
-    # as _tu` produces our fake_tu, not an ephemeral MagicMock attribute.
     fake_vllm.utils = fake_utils
     fake_utils.torch_utils = fake_tu
 
@@ -73,6 +60,37 @@ def _make_fake_vllm_torch_utils(
         "vllm.utils": fake_utils,
         "vllm.utils.torch_utils": fake_tu,
     }, fake_tu
+
+
+@contextlib.contextmanager
+def _temporary_method_patch(cls, method_name, flag_name, replacement):
+    """Temporarily replace a method on cls and clear its patch-applied flag.
+
+    Installs `replacement` as cls.<method_name>, clears the idempotency
+    flag so the plugin's patcher re-runs, and restores both on exit. Used
+    by tests C, E, F, G to stage a baseline method the plugin can wrap,
+    then verify the wrapped behavior, without leaking state across tests.
+    """
+    orig_method = getattr(cls, method_name, None)
+    had_flag = flag_name in cls.__dict__
+    if had_flag:
+        delattr(cls, flag_name)
+    setattr(cls, method_name, replacement)
+    try:
+        yield
+    finally:
+        if orig_method is not None:
+            setattr(cls, method_name, orig_method)
+        elif method_name in cls.__dict__:
+            delattr(cls, method_name)
+        if flag_name in cls.__dict__:
+            delattr(cls, flag_name)
+
+
+def _reset_plugin_state():
+    """Clear all plugin patch flags so each test starts from scratch."""
+    from turboquant_vllm._vllm_plugin import _tq_reset_patches_for_test
+    _tq_reset_patches_for_test()
 
 
 # ============================================================================
@@ -84,7 +102,7 @@ class TestStrDtypeDictPatch(unittest.TestCase):
         _reset_plugin_state()
 
     def test_str_dtype_patch_adds_tq_entries(self):
-        """The dict patch must add tq3/tq4/tq_k4v3 with torch.uint8 values."""
+        """Adds tq3/tq4/tq_k4v3 -> uint8, preserves pre-existing entries."""
         fake_modules, fake_tu = _make_fake_vllm_torch_utils(
             initial_dict={"float16": torch.float16},
         )
@@ -92,25 +110,19 @@ class TestStrDtypeDictPatch(unittest.TestCase):
             from turboquant_vllm._vllm_plugin import _eager_patch_str_dtype_mapping
             _eager_patch_str_dtype_mapping()
 
-        self.assertIn("tq3", fake_tu.STR_DTYPE_TO_TORCH_DTYPE)
-        self.assertIn("tq4", fake_tu.STR_DTYPE_TO_TORCH_DTYPE)
-        self.assertIn("tq_k4v3", fake_tu.STR_DTYPE_TO_TORCH_DTYPE)
         self.assertIs(fake_tu.STR_DTYPE_TO_TORCH_DTYPE["tq3"], torch.uint8)
         self.assertIs(fake_tu.STR_DTYPE_TO_TORCH_DTYPE["tq4"], torch.uint8)
         self.assertIs(fake_tu.STR_DTYPE_TO_TORCH_DTYPE["tq_k4v3"], torch.uint8)
-        # Pre-existing entry must not be clobbered
         self.assertIs(fake_tu.STR_DTYPE_TO_TORCH_DTYPE["float16"], torch.float16)
 
     def test_str_dtype_patch_is_idempotent(self):
-        """Calling the patch twice must not error or double-wrap."""
+        """Second call must not error or re-mutate."""
         fake_modules, fake_tu = _make_fake_vllm_torch_utils()
         with mock.patch.dict(sys.modules, fake_modules):
             from turboquant_vllm._vllm_plugin import _eager_patch_str_dtype_mapping
             _eager_patch_str_dtype_mapping()
-            # Second call should be a no-op via the _str_dtype_patched guard
             _eager_patch_str_dtype_mapping()
 
-        # dict still populated, nothing crashed
         self.assertEqual(len(fake_tu.STR_DTYPE_TO_TORCH_DTYPE), 3)
 
 
@@ -123,8 +135,7 @@ class TestResolverWrapper(unittest.TestCase):
         _reset_plugin_state()
 
     def test_resolver_returns_uint8_for_tq_strings(self):
-        """The wrapped kv_cache_dtype_str_to_dtype must return torch.uint8
-        for tq* without calling the original resolver."""
+        """Wrapped resolver short-circuits tq*, delegates everything else."""
         original_calls = []
 
         def _orig(d, m):
@@ -137,19 +148,16 @@ class TestResolverWrapper(unittest.TestCase):
             _eager_patch_str_dtype_mapping()
             wrapped = fake_tu.kv_cache_dtype_str_to_dtype
 
-            # tq* strings return uint8 WITHOUT invoking the original
             self.assertIs(wrapped("tq3", None), torch.uint8)
             self.assertIs(wrapped("tq4", None), torch.uint8)
             self.assertIs(wrapped("tq_k4v3", None), torch.uint8)
             self.assertEqual(original_calls, [])
 
-            # Non-tq strings DO go through the original
-            result = wrapped("float16", None)
-            self.assertIs(result, torch.float16)
+            self.assertIs(wrapped("float16", None), torch.float16)
             self.assertEqual(original_calls, ["float16"])
 
     def test_wrapper_is_idempotent(self):
-        """Calling _eager_patch twice must not wrap the resolver twice."""
+        """Second eager-patch call must not double-wrap the resolver."""
         fake_modules, fake_tu = _make_fake_vllm_torch_utils()
         with mock.patch.dict(sys.modules, fake_modules):
             from turboquant_vllm._vllm_plugin import _eager_patch_str_dtype_mapping
@@ -158,22 +166,23 @@ class TestResolverWrapper(unittest.TestCase):
             _eager_patch_str_dtype_mapping()
             second_wrapped = fake_tu.kv_cache_dtype_str_to_dtype
 
-        # Second call should be a complete no-op — same wrapper object
         self.assertIs(first_wrapped, second_wrapped)
         self.assertTrue(getattr(first_wrapped, "_tq_wrapped", False))
 
 
 # ============================================================================
-# C: AttentionLayer.get_kv_cache_spec patch — TQ branch returns remapped spec
+# Fake vLLM types for the spec-construction tests below
 # ============================================================================
 
+class _FakeCacheConfig:
+    block_size = 16
+
+
 class _FakeVllmConfig:
-    class cache_config:  # noqa: N801 — matches vLLM naming
-        block_size = 16
+    cache_config = _FakeCacheConfig()
 
 
 class _FakeAttentionLayer:
-    """Mimics the shape of vLLM's AttentionLayer for the patched method."""
     def __init__(self, head_size=128, num_kv_heads=8, kv_cache_dtype="tq3"):
         self.head_size = head_size
         self.num_kv_heads = num_kv_heads
@@ -181,91 +190,79 @@ class _FakeAttentionLayer:
         self.kv_cache_torch_dtype = torch.uint8
 
 
+class _FakeMLALayer:
+    def __init__(self, kv_cache_dtype="tq3"):
+        self.kv_cache_dtype = kv_cache_dtype
+
+
+# ============================================================================
+# C: AttentionLayer.get_kv_cache_spec patch returns remapped spec
+# ============================================================================
+
 class TestGetKvCacheSpecPatch(unittest.TestCase):
+    def setUp(self):
+        _reset_plugin_state()
+
     def test_tq3_returns_remapped_spec(self):
-        """For tq3, the returned spec must have head_size =
-        padded_slot_size // 2 so allocator arithmetic yields the
-        compressed slot bytes.
-        """
+        """For tq3 the returned spec has head_size = padded_slot_size // 2."""
         try:
+            import vllm.model_executor.layers.attention.attention as al_mod  # noqa: F401
             import vllm.v1.kv_cache_interface  # noqa: F401
         except ImportError:
-            self.skipTest("vLLM not installed; skipping spec-construction test")
+            self.skipTest("vLLM not installed")
 
-        from turboquant_vllm._vllm_plugin import _patch_get_kv_cache_spec
-        from turboquant_vllm.tq_config import TurboQuantConfig
+        from turboquant_vllm._vllm_plugin import (
+            _patch_get_kv_cache_spec, _tq_effective_head_size,
+        )
+        from vllm.model_executor.layers.attention.attention import AttentionLayer
 
-        # Patch AttentionLayer in-memory, call the patched method via
-        # a fake instance, inspect the returned spec
-        import vllm.model_executor.layers.attention.attention as al_mod
-        AttentionLayer = al_mod.AttentionLayer
+        def _baseline(self, vllm_config):
+            return None
 
-        # Temporarily stash the original so we can restore it
-        _orig = getattr(AttentionLayer, "get_kv_cache_spec", None)
-        _orig_patched_flag = getattr(AttentionLayer, "_tq_spec_patched", False)
-
-        # Ensure we install fresh
-        if hasattr(AttentionLayer, "_tq_spec_patched"):
-            delattr(AttentionLayer, "_tq_spec_patched")
-
-        try:
-            # Install a minimal baseline method if vLLM's signature differs
-            # from what the patch expects
-            if _orig is None or list(
-                __import__("inspect").signature(_orig).parameters.keys()
-            ) != ["self", "vllm_config"]:
-                def _baseline(self, vllm_config):
-                    return None
-                AttentionLayer.get_kv_cache_spec = _baseline
-
+        with _temporary_method_patch(
+            AttentionLayer, "get_kv_cache_spec", "_tq_spec_patched", _baseline
+        ):
             _patch_get_kv_cache_spec()
-
-            # Build a fake layer and call the patched method
             fake = _FakeAttentionLayer(head_size=128, kv_cache_dtype="tq3")
             spec = AttentionLayer.get_kv_cache_spec(fake, _FakeVllmConfig())
 
-            self.assertIsNotNone(spec, "patch should return a real spec for tq3")
-            expected_effective = (
-                TurboQuantConfig.from_cache_dtype("tq3", head_dim=128)
-                .padded_slot_size // 2
-            )
-            self.assertEqual(spec.head_size, expected_effective)
-            self.assertEqual(spec.head_size_v, expected_effective)
-            self.assertIs(spec.dtype, torch.uint8)
-            self.assertEqual(spec.num_kv_heads, 8)
-            self.assertEqual(spec.block_size, 16)
-        finally:
-            # Restore
-            if _orig is not None:
-                AttentionLayer.get_kv_cache_spec = _orig
-            if _orig_patched_flag:
-                AttentionLayer._tq_spec_patched = True
-            elif hasattr(AttentionLayer, "_tq_spec_patched"):
-                delattr(AttentionLayer, "_tq_spec_patched")
+        self.assertIsNotNone(spec)
+        expected = _tq_effective_head_size("tq3", 128)
+        self.assertEqual(spec.head_size, expected)
+        self.assertEqual(spec.head_size_v, expected)
+        self.assertIs(spec.dtype, torch.uint8)
+        self.assertEqual(spec.num_kv_heads, 8)
+        self.assertEqual(spec.block_size, 16)
 
 
 # ============================================================================
-# D: The headline test — real_page_size_bytes matches compressed slot
+# D: Allocator math sanity check — real_page_size_bytes vs bf16 baseline
 # ============================================================================
 
-class TestRealPageSizeBytes(unittest.TestCase):
-    """Verify the allocator arithmetic actually works out to the
-    compressed slot size. This is the test that proves the capacity
-    multiplier story, not just that we returned a spec object.
+class TestFullAttentionSpecArithmetic(unittest.TestCase):
+    """Verify that passing head_size = padded_slot_size // 2 and
+    dtype = torch.uint8 to vLLM's FullAttentionSpec yields a
+    real_page_size_bytes equal to the compressed slot size.
+
+    This test does NOT exercise the plugin's patched method; it's a
+    sanity check on the *vLLM side* of the contract the plugin relies
+    on. If vLLM ever changes how real_page_size_bytes is computed
+    from head_size/dtype, this test fails and we know the plugin's
+    remap trick needs updating before the patch can be trusted.
     """
 
-    def test_tq3_real_page_size_matches_compressed_slot(self):
+    def _check(self, cache_dtype, min_ratio):
         try:
             from vllm.v1.kv_cache_interface import FullAttentionSpec
         except ImportError:
-            self.skipTest("vLLM not installed; skipping allocator math test")
+            self.skipTest("vLLM not installed")
 
         from turboquant_vllm.tq_config import TurboQuantConfig
 
         head_size = 128
         num_kv_heads = 8
         block_size = 16
-        tq_config = TurboQuantConfig.from_cache_dtype("tq3", head_dim=head_size)
+        tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_dim=head_size)
         effective = tq_config.padded_slot_size // 2
 
         spec = FullAttentionSpec(
@@ -276,46 +273,22 @@ class TestRealPageSizeBytes(unittest.TestCase):
             dtype=torch.uint8,
         )
 
-        # Allocator math: block_size * num_kv_heads * (hs + hs_v) * sizeof(dtype)
         expected_bytes = block_size * num_kv_heads * tq_config.padded_slot_size * 1
         self.assertEqual(spec.real_page_size_bytes, expected_bytes)
 
-        # And vs the bf16 baseline
         baseline_bytes = block_size * num_kv_heads * head_size * 2 * 2
         ratio = baseline_bytes / spec.real_page_size_bytes
         self.assertGreaterEqual(
-            ratio, 1.8,
-            f"tq3 should give at least 1.8x capacity vs bf16 (got {ratio:.2f}x). "
-            f"expected_bytes={expected_bytes}, baseline_bytes={baseline_bytes}",
+            ratio, min_ratio,
+            f"{cache_dtype} ratio {ratio:.2f}x < {min_ratio}x "
+            f"(compressed={expected_bytes}, bf16={baseline_bytes})",
         )
 
-    def test_tq4_real_page_size_matches_compressed_slot(self):
-        try:
-            from vllm.v1.kv_cache_interface import FullAttentionSpec
-        except ImportError:
-            self.skipTest("vLLM not installed; skipping allocator math test")
+    def test_tq3_capacity_ratio(self):
+        self._check("tq3", min_ratio=1.8)
 
-        from turboquant_vllm.tq_config import TurboQuantConfig
-
-        head_size = 128
-        num_kv_heads = 8
-        block_size = 16
-        tq_config = TurboQuantConfig.from_cache_dtype("tq4", head_dim=head_size)
-        effective = tq_config.padded_slot_size // 2
-
-        spec = FullAttentionSpec(
-            block_size=block_size,
-            num_kv_heads=num_kv_heads,
-            head_size=effective,
-            head_size_v=effective,
-            dtype=torch.uint8,
-        )
-
-        expected_bytes = block_size * num_kv_heads * tq_config.padded_slot_size * 1
-        self.assertEqual(spec.real_page_size_bytes, expected_bytes)
-        baseline_bytes = block_size * num_kv_heads * head_size * 2 * 2
-        ratio = baseline_bytes / spec.real_page_size_bytes
-        self.assertGreaterEqual(ratio, 1.5, f"tq4 ratio {ratio:.2f}x < 1.5x")
+    def test_tq4_capacity_ratio(self):
+        self._check("tq4", min_ratio=1.5)
 
 
 # ============================================================================
@@ -323,129 +296,95 @@ class TestRealPageSizeBytes(unittest.TestCase):
 # ============================================================================
 
 class TestGetKvCacheSpecPassThrough(unittest.TestCase):
+    def setUp(self):
+        _reset_plugin_state()
+
     def test_auto_dtype_calls_original(self):
-        """A non-tq kv_cache_dtype must fall through to the original method."""
+        """A non-tq kv_cache_dtype must delegate to the original method."""
         try:
-            import vllm.model_executor.layers.attention.attention as al_mod
+            import vllm.model_executor.layers.attention.attention as al_mod  # noqa: F401
         except ImportError:
-            self.skipTest("vLLM not installed; skipping pass-through test")
+            self.skipTest("vLLM not installed")
 
         from turboquant_vllm._vllm_plugin import _patch_get_kv_cache_spec
-        AttentionLayer = al_mod.AttentionLayer
-
-        _orig = getattr(AttentionLayer, "get_kv_cache_spec", None)
-        _orig_flag = getattr(AttentionLayer, "_tq_spec_patched", False)
-
-        if hasattr(AttentionLayer, "_tq_spec_patched"):
-            delattr(AttentionLayer, "_tq_spec_patched")
+        from vllm.model_executor.layers.attention.attention import AttentionLayer
 
         call_count = {"n": 0}
 
-        try:
-            def _baseline(self, vllm_config):
-                call_count["n"] += 1
-                return "BASELINE_SENTINEL"
+        def _baseline(self, vllm_config):
+            call_count["n"] += 1
+            return "BASELINE_SENTINEL"
 
-            AttentionLayer.get_kv_cache_spec = _baseline
+        with _temporary_method_patch(
+            AttentionLayer, "get_kv_cache_spec", "_tq_spec_patched", _baseline
+        ):
             _patch_get_kv_cache_spec()
-
             fake = _FakeAttentionLayer(head_size=128, kv_cache_dtype="auto")
             result = AttentionLayer.get_kv_cache_spec(fake, _FakeVllmConfig())
 
-            self.assertEqual(result, "BASELINE_SENTINEL",
-                             "non-tq path must delegate to original method")
-            self.assertEqual(call_count["n"], 1)
-        finally:
-            if _orig is not None:
-                AttentionLayer.get_kv_cache_spec = _orig
-            if _orig_flag:
-                AttentionLayer._tq_spec_patched = True
-            elif hasattr(AttentionLayer, "_tq_spec_patched"):
-                delattr(AttentionLayer, "_tq_spec_patched")
+        self.assertEqual(result, "BASELINE_SENTINEL")
+        self.assertEqual(call_count["n"], 1)
 
 
 # ============================================================================
 # F, G: MLA fail-loud guard
 # ============================================================================
 
-class _FakeMLALayer:
-    def __init__(self, kv_cache_dtype="tq3"):
-        self.kv_cache_dtype = kv_cache_dtype
-
-
 class TestMlaFailLoudGuard(unittest.TestCase):
+    def setUp(self):
+        _reset_plugin_state()
+
     def test_tq3_raises_runtime_error(self):
-        """MLA + tq3 must raise RuntimeError with a helpful message."""
+        """MLA + tq3 must raise RuntimeError mentioning MLA and TQ_KV_K_BITS."""
         try:
-            import vllm.model_executor.layers.attention.mla_attention as mla_mod
+            import vllm.model_executor.layers.attention.mla_attention as mla_mod  # noqa: F401
         except ImportError:
-            self.skipTest("vLLM not installed; skipping MLA guard test")
+            self.skipTest("vLLM not installed")
 
         from turboquant_vllm._vllm_plugin import _patch_mla_fail_loud
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
-        MLAAttention = mla_mod.MLAAttention
-        _orig = getattr(MLAAttention, "get_kv_cache_spec", None)
-        _orig_flag = getattr(MLAAttention, "_tq_mla_guard_patched", False)
+        def _baseline(self, vllm_config):
+            return "MLA_BASELINE"
 
-        if hasattr(MLAAttention, "_tq_mla_guard_patched"):
-            delattr(MLAAttention, "_tq_mla_guard_patched")
-
-        try:
-            def _baseline(self, vllm_config):
-                return "MLA_BASELINE"
-            MLAAttention.get_kv_cache_spec = _baseline
+        with _temporary_method_patch(
+            MLAAttention, "get_kv_cache_spec", "_tq_mla_guard_patched", _baseline
+        ):
             _patch_mla_fail_loud()
-
             fake = _FakeMLALayer(kv_cache_dtype="tq3")
             with self.assertRaises(RuntimeError) as ctx:
                 MLAAttention.get_kv_cache_spec(fake, _FakeVllmConfig())
-            msg = str(ctx.exception)
-            self.assertIn("MLA", msg)
-            self.assertIn("TQ_KV_K_BITS", msg)
-            self.assertIn("tq3", msg)
-        finally:
-            if _orig is not None:
-                MLAAttention.get_kv_cache_spec = _orig
-            if _orig_flag:
-                MLAAttention._tq_mla_guard_patched = True
-            elif hasattr(MLAAttention, "_tq_mla_guard_patched"):
-                delattr(MLAAttention, "_tq_mla_guard_patched")
+
+        msg = str(ctx.exception)
+        self.assertIn("MLA", msg)
+        self.assertIn("TQ_KV_K_BITS", msg)
+        self.assertIn("tq3", msg)
 
     def test_auto_dtype_passes_through(self):
         """MLA + auto must delegate to the original method."""
         try:
-            import vllm.model_executor.layers.attention.mla_attention as mla_mod
+            import vllm.model_executor.layers.attention.mla_attention as mla_mod  # noqa: F401
         except ImportError:
-            self.skipTest("vLLM not installed; skipping MLA pass-through test")
+            self.skipTest("vLLM not installed")
 
         from turboquant_vllm._vllm_plugin import _patch_mla_fail_loud
+        from vllm.model_executor.layers.attention.mla_attention import MLAAttention
 
-        MLAAttention = mla_mod.MLAAttention
-        _orig = getattr(MLAAttention, "get_kv_cache_spec", None)
-        _orig_flag = getattr(MLAAttention, "_tq_mla_guard_patched", False)
+        call_count = {"n": 0}
 
-        if hasattr(MLAAttention, "_tq_mla_guard_patched"):
-            delattr(MLAAttention, "_tq_mla_guard_patched")
+        def _baseline(self, vllm_config):
+            call_count["n"] += 1
+            return "MLA_BASELINE"
 
-        try:
-            call_count = {"n": 0}
-            def _baseline(self, vllm_config):
-                call_count["n"] += 1
-                return "MLA_BASELINE"
-            MLAAttention.get_kv_cache_spec = _baseline
+        with _temporary_method_patch(
+            MLAAttention, "get_kv_cache_spec", "_tq_mla_guard_patched", _baseline
+        ):
             _patch_mla_fail_loud()
-
             fake = _FakeMLALayer(kv_cache_dtype="auto")
             result = MLAAttention.get_kv_cache_spec(fake, _FakeVllmConfig())
-            self.assertEqual(result, "MLA_BASELINE")
-            self.assertEqual(call_count["n"], 1)
-        finally:
-            if _orig is not None:
-                MLAAttention.get_kv_cache_spec = _orig
-            if _orig_flag:
-                MLAAttention._tq_mla_guard_patched = True
-            elif hasattr(MLAAttention, "_tq_mla_guard_patched"):
-                delattr(MLAAttention, "_tq_mla_guard_patched")
+
+        self.assertEqual(result, "MLA_BASELINE")
+        self.assertEqual(call_count["n"], 1)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ Environment variables:
     TQ_KV_V_BITS: monkey-patch mode — value bits
     TQ_KV_ROTATION: rotation mode for monkey-patch ('wht' or 'planar')
 """
+import functools
 import logging
 import os
 import sys
@@ -32,9 +33,20 @@ except ImportError:
         logger.addHandler(handler)
         logger.setLevel(logging.INFO)
 
+# Canonical list of TurboQuant KV cache dtype strings. Kept here rather than
+# in tq_config.py because tq_config can be imported standalone for CPU testing
+# without involving this plugin; the plugin is the right home for the string
+# contract with vLLM's --kv-cache-dtype flag.
+_TQ_DTYPE_NAMES = ("tq3", "tq4", "tq_k4v3")
+
+
+def _is_tq_dtype(v) -> bool:
+    """True if v is one of the TurboQuant KV cache dtype strings."""
+    return isinstance(v, str) and v in _TQ_DTYPE_NAMES
+
+
 _patched = False
 _native_backend_registered = False
-_str_dtype_patched = False
 
 
 # ---------------------------------------------------------------------------
@@ -57,60 +69,106 @@ def _eager_patch_str_dtype_mapping() -> None:
     """Patch STR_DTYPE_TO_TORCH_DTYPE and kv_cache_dtype_str_to_dtype so
     vLLM's dtype resolver accepts tq3/tq4/tq_k4v3 as valid strings.
 
-    Called both at plugin module import time (top of file) and
-    redundantly inside _register_native_backend() for safety.
+    Fires at plugin module import time AND (redundantly) inside
+    _register_native_backend(). Both paths are idempotent via the
+    _tq_wrapped marker on the wrapped resolver — no module-level flag
+    needed, the wrapper function itself is the single source of truth.
     """
-    global _str_dtype_patched
-    if _str_dtype_patched:
-        return
     try:
         import torch
         import vllm.utils.torch_utils as _tu
-    except Exception:
-        # vLLM may not be installed (pure test / CI environment).
-        # Nothing to patch; downstream register() will report appropriately.
+    except ImportError:
+        # vLLM not installed (CPU test / CI environment). Nothing to
+        # patch; downstream register() handles reporting. Deliberately
+        # narrow: any *other* exception here is a real bug we want to
+        # surface instead of swallow.
         return
 
-    try:
-        # Primary fix: populate the dict with tq* → uint8 entries.
-        for name in ("tq3", "tq4", "tq_k4v3"):
-            _tu.STR_DTYPE_TO_TORCH_DTYPE.setdefault(name, torch.uint8)
+    # Idempotency gate — if the wrapper is already installed, both the
+    # dict and function mutations are already in place from a previous
+    # call. Checking the wrapped marker is cheaper and more robust than
+    # a separate module-level flag that can drift out of sync.
+    if getattr(_tu.kv_cache_dtype_str_to_dtype, "_tq_wrapped", False):
+        return
 
-        # Belt-and-suspenders: wrap the resolver function itself. Some
-        # callers may have imported it via
-        #   from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
-        # which binds the original function object. Mutating the module-
-        # level attribute handles the common "import vllm.utils.torch_utils
-        # as X; X.kv_cache_dtype_str_to_dtype(...)" pattern; the dict patch
-        # above handles the closure-captured pattern. Doing both is
-        # cheap and covers the majority of realistic call sites.
-        _orig_resolver = _tu.kv_cache_dtype_str_to_dtype
+    # Primary fix: populate STR_DTYPE_TO_TORCH_DTYPE with tq* → uint8.
+    # setdefault preserves any fork-provided entries (the fork already
+    # ships these; setdefault makes us a no-op in that case).
+    for name in _TQ_DTYPE_NAMES:
+        _tu.STR_DTYPE_TO_TORCH_DTYPE.setdefault(name, torch.uint8)
 
-        # Idempotent — if we've already wrapped, don't wrap again
-        if getattr(_orig_resolver, "_tq_wrapped", False):
-            _str_dtype_patched = True
-            return
+    # Belt-and-suspenders: wrap the resolver function itself. Some call
+    # sites may have imported it via
+    #   from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+    # which binds the original function object. Mutating the module-level
+    # attribute handles the common
+    #   import vllm.utils.torch_utils as X; X.kv_cache_dtype_str_to_dtype(...)
+    # pattern; the dict patch above handles closure-captured call sites.
+    _orig_resolver = _tu.kv_cache_dtype_str_to_dtype
 
-        def _tq_aware_resolver(kv_cache_dtype, model_config):
-            if isinstance(kv_cache_dtype, str) and kv_cache_dtype in (
-                "tq3", "tq4", "tq_k4v3",
-            ):
-                return torch.uint8
-            return _orig_resolver(kv_cache_dtype, model_config)
+    def _tq_aware_resolver(kv_cache_dtype, model_config):
+        if _is_tq_dtype(kv_cache_dtype):
+            return torch.uint8
+        return _orig_resolver(kv_cache_dtype, model_config)
 
-        _tq_aware_resolver._tq_wrapped = True  # type: ignore[attr-defined]
-        _tu.kv_cache_dtype_str_to_dtype = _tq_aware_resolver
-        _str_dtype_patched = True
-        logger.info(
-            "TurboQuant patched STR_DTYPE_TO_TORCH_DTYPE with tq3/tq4/tq_k4v3 "
-            "(pid=%d)", os.getpid(),
-        )
-    except Exception as e:
-        logger.warning("Could not patch STR_DTYPE_TO_TORCH_DTYPE: %s", e)
+    _tq_aware_resolver._tq_wrapped = True  # type: ignore[attr-defined]
+    _tu.kv_cache_dtype_str_to_dtype = _tq_aware_resolver
+    logger.info(
+        "TurboQuant patched STR_DTYPE_TO_TORCH_DTYPE with tq3/tq4/tq_k4v3 "
+        "(pid=%d)", os.getpid(),
+    )
 
 
 # Fire the eager patch on module load, before register() is called.
 _eager_patch_str_dtype_mapping()
+
+
+def _tq_reset_patches_for_test() -> None:
+    """Reset all plugin-side patch state. Test-only helper.
+
+    Clears:
+    - _native_backend_registered module flag
+    - AttentionLayer._tq_spec_patched / _tq_buffers_patched class attrs
+    - MLAAttention._tq_mla_guard_patched class attr
+
+    Does NOT unwind already-applied monkey patches (that would require
+    storing the originals somewhere); the tests that need to restore
+    specific patched methods do so via their own save/restore scopes.
+
+    Idempotent; safe to call when vLLM isn't importable.
+    """
+    global _native_backend_registered
+    _native_backend_registered = False
+    for mod_path, cls_name, flag in (
+        ("vllm.model_executor.layers.attention.attention",
+         "AttentionLayer", "_tq_spec_patched"),
+        ("vllm.model_executor.layers.attention.attention",
+         "AttentionLayer", "_tq_buffers_patched"),
+        ("vllm.model_executor.layers.attention.mla_attention",
+         "MLAAttention", "_tq_mla_guard_patched"),
+    ):
+        try:
+            mod = __import__(mod_path, fromlist=[cls_name])
+            cls = getattr(mod, cls_name, None)
+            if cls is not None and flag in cls.__dict__:
+                delattr(cls, flag)
+        except ImportError:
+            pass
+
+
+@functools.lru_cache(maxsize=8)
+def _tq_effective_head_size(cache_dtype: str, head_size: int) -> int:
+    """padded_slot_size // 2 for a given (cache_dtype, head_size).
+
+    Cached because get_kv_cache_spec calls this once per attention layer
+    at engine init — and the result is deterministic from the arguments.
+    Hoisting the TurboQuantConfig import to module scope would pull
+    scipy/torch into plugin-load time; this lazy path keeps import cheap
+    and the cached result removes the repeated-call cost.
+    """
+    from turboquant_vllm.tq_config import TurboQuantConfig
+    tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_size)
+    return tq_config.padded_slot_size // 2
 
 
 def _register_native_backend() -> bool:
@@ -142,7 +200,6 @@ def _register_native_backend() -> bool:
             AttentionBackendEnum,
             register_backend,
         )
-        from turboquant_vllm.native_backend import TurboQuantAttentionBackend
 
         register_backend(
             AttentionBackendEnum.CUSTOM,
@@ -163,7 +220,7 @@ def _register_native_backend() -> bool:
 
         def _tq_get_valid_backends(self, device_capability, attn_selector_config, num_heads=None):
             kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
-            if kv_cache_dtype is not None and str(kv_cache_dtype).startswith("tq"):
+            if _is_tq_dtype(kv_cache_dtype):
                 from vllm.v1.attention.backends.registry import AttentionBackendEnum
                 return [(AttentionBackendEnum.CUSTOM, 0)], {}
             return _orig_get_valid(self, device_capability, attn_selector_config, num_heads)
@@ -287,20 +344,16 @@ def _patch_get_kv_cache_spec() -> None:
 
     def _patched_get_kv_cache_spec(self, vllm_config):
         kv_cache_dtype = getattr(self, "kv_cache_dtype", "auto") or "auto"
-        if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("tq"):
-            from turboquant_vllm.tq_config import TurboQuantConfig
-            block_size = vllm_config.cache_config.block_size
-            tq_config = TurboQuantConfig.from_cache_dtype(
-                kv_cache_dtype, self.head_size
-            )
-            padded_slot = tq_config.padded_slot_size
-            effective_head_size = padded_slot // 2
+        if _is_tq_dtype(kv_cache_dtype):
             # Allocator arithmetic with dtype=uint8 (1 byte):
             #   block_size * num_kv_heads * (hs + hs_v) * 1
             # = block_size * num_kv_heads * padded_slot
             # which equals the real compressed slot byte count.
+            effective_head_size = _tq_effective_head_size(
+                kv_cache_dtype, self.head_size
+            )
             return FullAttentionSpec(
-                block_size=block_size,
+                block_size=vllm_config.cache_config.block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=effective_head_size,
                 head_size_v=effective_head_size,
@@ -341,7 +394,7 @@ def _patch_mla_fail_loud() -> None:
 
     def _guarded_mla_spec(self, vllm_config):
         kv_cache_dtype = getattr(self, "kv_cache_dtype", "auto") or "auto"
-        if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("tq"):
+        if _is_tq_dtype(kv_cache_dtype):
             raise RuntimeError(
                 f"--kv-cache-dtype {kv_cache_dtype} is not supported for "
                 "MLA models (GLM-4.7, DeepSeek-V3, etc.). The native "
@@ -383,7 +436,7 @@ def _patch_attention_layer_init() -> None:
     def _patched_init(self, *args, **kwargs):
         _orig_init(self, *args, **kwargs)
         kv_cache_dtype = getattr(self, "kv_cache_dtype", "auto")
-        if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("tq"):
+        if _is_tq_dtype(kv_cache_dtype):
             head_size = getattr(self, "head_size", None)
             prefix = getattr(self, "layer_name", "") or ""
             if head_size is not None:

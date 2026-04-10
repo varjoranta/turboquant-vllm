@@ -31,7 +31,6 @@ from typing import ClassVar, Optional
 
 import torch
 import torch.nn.functional as F
-from turboquant_vllm.tq_config import TurboQuantConfig
 
 from turboquant_vllm.tq_config import TurboQuantConfig
 
