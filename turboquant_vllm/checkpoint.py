@@ -88,13 +88,18 @@ def save_tq3_checkpoint(
     """
     from safetensors import safe_open
     from safetensors.torch import save_file
-    from huggingface_hub import hf_hub_download, HfApi
     from transformers import AutoConfig, AutoTokenizer
     from turboquant_vllm.torch_ops import PolarQuantTorch
 
     os.makedirs(output_dir, exist_ok=True)
 
-    logger.info("Downloading config and tokenizer for %s...", model_id)
+    # Accept either a HuggingFace model ID or a local path. A local path
+    # skips hf_hub entirely; the HF path downloads shards on demand.
+    is_local = os.path.isdir(model_id)
+    if is_local:
+        logger.info("Using local checkpoint at %s", model_id)
+    else:
+        logger.info("Downloading config and tokenizer for %s...", model_id)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     # Inject quantization_config so vLLM auto-detects the format
@@ -109,9 +114,19 @@ def save_tq3_checkpoint(
     config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
 
-    api = HfApi()
-    repo_files = api.list_repo_files(model_id)
-    shard_files = sorted([f for f in repo_files if f.endswith(".safetensors")])
+    if is_local:
+        shard_files = sorted(
+            f for f in os.listdir(model_id) if f.endswith(".safetensors")
+        )
+        if not shard_files:
+            raise FileNotFoundError(
+                f"No .safetensors shards found in local path {model_id}"
+            )
+    else:
+        from huggingface_hub import HfApi
+        api = HfApi()
+        repo_files = api.list_repo_files(model_id)
+        shard_files = sorted(f for f in repo_files if f.endswith(".safetensors"))
 
     from turboquant_vllm.weight_quant import select_bits, _SENSITIVE_PATTERNS
 
@@ -158,12 +173,17 @@ def save_tq3_checkpoint(
         total_size += tensor_bytes
 
     import tempfile
-    _tmp_download_dir = tempfile.mkdtemp(prefix="tq3_dl_")
+    _tmp_download_dir = None if is_local else tempfile.mkdtemp(prefix="tq3_dl_")
 
     for shard_name in shard_files:
         logger.info("Processing shard: %s", shard_name)
-        shard_path = hf_hub_download(model_id, shard_name,
-                                     local_dir=_tmp_download_dir)
+        if is_local:
+            shard_path = os.path.join(model_id, shard_name)
+        else:
+            from huggingface_hub import hf_hub_download
+            shard_path = hf_hub_download(
+                model_id, shard_name, local_dir=_tmp_download_dir
+            )
 
         with safe_open(shard_path, framework="pt", device="cpu") as f:
             for tensor_name in f.keys():
@@ -214,9 +234,10 @@ def save_tq3_checkpoint(
 
     _flush_shard()  # write remaining tensors
 
-    # Clean up temp download directory
-    import shutil
-    shutil.rmtree(_tmp_download_dir, ignore_errors=True)
+    # Clean up temp download directory (only created in HF-download mode)
+    if _tmp_download_dir is not None:
+        import shutil
+        shutil.rmtree(_tmp_download_dir, ignore_errors=True)
 
     # Rename shards with correct total count
     total_shards = shard_idx
