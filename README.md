@@ -348,27 +348,56 @@ Same math, same CUDA kernels. Weight compression reduces the hardware you need. 
 
 Contributions and testing on different models welcome. Write-up: [varjosoft.com/weight-compression.html](https://varjosoft.com/weight-compression.html)
 
-## Native vLLM fork
+## Native backend: fork vs plugin
 
-For production use without monkey-patching, we maintain a vLLM fork with TurboQuant built in as a native attention backend:
+Two ways to get `--kv-cache-dtype tq3` without monkey-patching — pick whichever matches your deployment constraints.
+
+### Option A — Plugin, stock vLLM
 
 ```bash
-# Install from fork
-pip install git+https://github.com/varjoranta/vllm-1.git@turboquant-integration
+pip install turboquant-plus-vllm
+vllm serve Qwen/Qwen2.5-3B --kv-cache-dtype tq3
+```
 
-# Use directly — no patching needed
+No fork, no custom image. 2× KV cache capacity (see GPU validation table below). Hot path currently falls back to PyTorch store/decode (~10% below baseline throughput until the Triton kernels are vendored).
+
+### Option B — vLLM fork with Triton kernels built in
+
+```bash
+pip install git+https://github.com/varjoranta/vllm-1.git@turboquant-integration
 vllm serve Qwen/Qwen3-8B --kv-cache-dtype tq3
 ```
 
-The fork includes a standalone `TurboQuantAttentionBackend` with Triton/CUDA kernels, FP8 value storage for quality preservation, and asymmetric K/V support (`--kv-cache-dtype tq_k4v3`). Based on [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) with quality fixes.
-
-**This library** (monkey-patch approach) remains useful for quick testing with any existing vLLM install, weight quantization, and models not yet supported by the native backend.
+Same capacity win, plus the fused Triton store/decode kernels for throughput parity with the baseline. Includes FP8 value storage for quality preservation and asymmetric K/V support (`--kv-cache-dtype tq_k4v3`). Based on [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) with quality fixes.
 
 Fork: [varjoranta/vllm-1 `turboquant-integration`](https://github.com/varjoranta/vllm-1/tree/turboquant-integration)
 
-### Plugin-side native backend: current status
+**This library** (monkey-patch approach) remains useful for MLA models (GLM-4.7, DeepSeek-V3) via the `TQ_KV_K_BITS` env var, weight quantization, and models not yet supported by the native backend.
 
-`turboquant_vllm` also ships a plugin-side `TurboQuantAttentionBackend` (`turboquant_vllm/native_backend.py`) that registers itself via vLLM's `register_backend(AttentionBackendEnum.CUSTOM, ...)` so that stock vLLM installs can activate it with `--kv-cache-dtype tq3/tq4/tq_k4v3` — no fork required. This path is functional and correct, but **currently runs the Python store/decode fallback**: the fused Triton store/decode kernels live in the vLLM fork (`vllm/v1/attention/ops/triton_tq_{store,decode}.py`) and have not yet been vendored into this package. Install the fork if you need the fast path; use the plugin if you want portability and can tolerate the Python overhead during evaluation.
+### Plugin-side native backend: stock vLLM, no fork required
+
+`turboquant_vllm` ships a plugin-side `TurboQuantAttentionBackend` (`turboquant_vllm/native_backend.py`) that registers itself via vLLM's `register_backend(AttentionBackendEnum.CUSTOM, ...)` so stock vLLM installs can activate it with `--kv-cache-dtype tq3/tq4/tq_k4v3` — no fork required.
+
+```bash
+pip install turboquant-plus-vllm
+vllm serve Qwen/Qwen2.5-3B --kv-cache-dtype tq3   # 2× KV cache capacity
+```
+
+**GPU-validated on A100 80GB, vLLM 0.19.0** (PR #5). Observed capacity ratio vs `--kv-cache-dtype auto`:
+
+| Model | head_dim | `auto` tokens | `tq3` tokens | ratio |
+|---|---|---|---|---|
+| Qwen/Qwen2.5-0.5B | 64 | 5,742,768 | 11,487,264 | **2.0×** |
+| Qwen/Qwen2.5-3B | 128 | 1,772,288 | 3,545,040 | **2.0×** |
+
+Both models served real completions under both dtypes. The 2.0× ratio — rather than the theoretical 3.9× — reflects vLLM's power-of-two slot padding: TQ3's real 178-byte slot gets rounded to 256 bytes, losing ~44% of the theoretical gain. Reclaiming the rest requires an upstream vLLM change to accept non-power-of-two slot sizes.
+
+**Current limitation**: the hot path still runs the Python store/decode fallback. The fused Triton kernels live in the vLLM fork (`vllm/v1/attention/ops/triton_tq_{store,decode}.py`) and will be vendored into this package in a follow-up branch (`feat/vendor-triton-kv-kernels`). Throughput is roughly 10% below `--kv-cache-dtype auto` baseline until those kernels land; the capacity gain is already real.
+
+**Which path to use:**
+- Plugin-side (this package + stock vLLM): portability and `pip install`, 2× capacity, -10% decode throughput. Suitable for non-MLA models and evaluation.
+- Fork (`varjoranta/vllm-1`): both capacity AND peak throughput. Suitable for production.
+- Monkey-patch (`TQ_KV_K_BITS` env var): MLA models (GLM-4.7, DeepSeek-V3) where the native backend is not yet supported.
 
 ## Environment variables
 
