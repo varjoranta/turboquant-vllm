@@ -547,6 +547,9 @@ class TurboQuantAttentionImpl:
                     bo = j * vqb
                     bi, si = bo // 8, bo % 8
                     packed_val[:, bi] |= ((v_u8[:, j].int() << si) & 0xFF).to(torch.uint8)
+                    if si + vqb > 8 and bi + 1 < val_data_bytes:
+                        packed_val[:, bi + 1] |= (
+                            (v_u8[:, j].int() >> (8 - si)) & 0xFF).to(torch.uint8)
             v_scale_b = v_scale.squeeze(-1).half().contiguous().view(torch.uint8).reshape(-1, 2)
             v_zero_b = vmin.squeeze(-1).half().contiguous().view(torch.uint8).reshape(-1, 2)
             packed_value = torch.cat([packed_val, v_scale_b, v_zero_b], dim=1)
@@ -799,8 +802,13 @@ class TurboQuantAttentionImpl:
                     bo = j * vqb
                     bi = (bo // 8).long()
                     si = (bo % 8).int()
-                    b0 = val_raw[:, :, bi]
-                    v_idx = ((b0.int() >> si) & qmax).float()
+                    val_raw_padded = F.pad(val_raw, (0, 1))
+                    b0 = val_raw_padded[:, :, bi].int()
+                    low = (b0 >> si) & qmax
+                    need_next = si + vqb > 8
+                    b1 = val_raw_padded[:, :, bi + 1].int()
+                    high = (b1 << (8 - si)) & qmax
+                    v_idx = torch.where(need_next, low | high, low).float()
                 sc_off = kps + val_data_bytes
                 v_scale = slots[:, :, sc_off:sc_off + 2].contiguous().view(torch.float16).squeeze(-1).float()
                 v_zero = slots[:, :, sc_off + 2:sc_off + 4].contiguous().view(torch.float16).squeeze(-1).float()

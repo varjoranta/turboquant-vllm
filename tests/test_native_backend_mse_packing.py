@@ -186,3 +186,147 @@ def test_decode_roundtrip_3bit_mse():
         )
         assert output.shape == (1, 1, d), f"decode output shape mismatch for D={d}"
         assert torch.isfinite(output).all(), f"decode output has non-finite values for D={d}"
+
+
+@torch.no_grad()
+def test_store_kv_value_3bit_generic_pack_unpacks_for_straddled_offsets():
+    torch.manual_seed(7)
+    d = 16
+    n = 9
+    impl = TurboQuantAttentionImpl(
+        num_heads=1,
+        head_size=d,
+        scale=1.0,
+        num_kv_heads=1,
+        kv_cache_dtype="tq_k4v3",
+    )
+    impl.tq_config = TurboQuantConfig(
+        head_dim=d, total_bits=4, asymmetric=True, v_total_bits=3, no_qjl=True
+    )
+
+    centroids, midpoints = _make_synthetic_centroids_and_midpoints(d, 4)
+    layer = torch.nn.Module()
+    layer._tq_PiT = torch.eye(d, dtype=torch.float32)
+    layer._tq_Pi_S_T = torch.eye(d, dtype=torch.float32)
+    layer._tq_midpoints = midpoints
+    impl._current_layer = layer
+
+    key = torch.randn(n, 1, d)
+    value = torch.randn(n, 1, d)
+
+    block_size = 16
+    slot_size = impl.tq_config.slot_size
+    kv_cache = torch.zeros(1, block_size, 1, slot_size, dtype=torch.uint8)
+    slot_mapping = torch.arange(n, dtype=torch.int64)
+
+    impl._store_kv(
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        slot_mapping=slot_mapping,
+        Pi=torch.eye(d),
+        S=torch.eye(d),
+        centroids=centroids,
+    )
+
+    vqb = impl.tq_config.effective_value_quant_bits
+    qmax = (1 << vqb) - 1
+    kps = impl.tq_config.key_packed_size
+    val_data_bytes = math.ceil(d * vqb / 8)
+    packed_val = kv_cache[0, :n, 0, kps:kps + val_data_bytes]
+
+    v_flat = value.float().reshape(-1, d)
+    vmin = v_flat.min(dim=1, keepdim=True).values
+    vmax = v_flat.max(dim=1, keepdim=True).values
+    v_scale = ((vmax - vmin) / qmax).clamp(min=1e-8)
+    expected_idx = ((v_flat - vmin) / v_scale).round().clamp(0, qmax).to(torch.int32)
+
+    j = torch.arange(d)
+    bo = j * vqb
+    bi = (bo // 8).long()
+    si = (bo % 8).int()
+    packed_val_padded = torch.nn.functional.pad(packed_val, (0, 1))
+    b0 = packed_val_padded[:, bi].int()
+    low = (b0 >> si) & qmax
+    need_next = si + vqb > 8
+    b1 = packed_val_padded[:, bi + 1].int()
+    high = (b1 << (8 - si)) & qmax
+    decoded_idx = torch.where(need_next, low | high, low)
+
+    assert torch.equal(decoded_idx, expected_idx)
+    straddle_cols = torch.where((si + vqb) > 8)[0]
+    assert straddle_cols.numel() > 0
+    assert torch.equal(decoded_idx[:, straddle_cols], expected_idx[:, straddle_cols])
+
+
+@torch.no_grad()
+def test_decode_roundtrip_tq_k4v3_value_3bit_straddled_offsets():
+    torch.manual_seed(123)
+    d = 16
+    impl = TurboQuantAttentionImpl(
+        num_heads=1,
+        head_size=d,
+        scale=1.0,
+        num_kv_heads=1,
+        kv_cache_dtype="tq_k4v3",
+    )
+    impl.tq_config = TurboQuantConfig(
+        head_dim=d, total_bits=4, asymmetric=True, v_total_bits=3, no_qjl=True
+    )
+
+    centroids, midpoints = _make_synthetic_centroids_and_midpoints(d, 4)
+    layer = torch.nn.Module()
+    layer._tq_PiT = torch.eye(d, dtype=torch.float32)
+    layer._tq_Pi_S_T = torch.eye(d, dtype=torch.float32)
+    layer._tq_midpoints = midpoints
+    impl._current_layer = layer
+
+    n = 1
+    key = torch.randn(n, 1, d)
+    value = torch.randn(n, 1, d)
+    block_size = 16
+    slot_size = impl.tq_config.slot_size
+    kv_cache = torch.zeros(1, block_size, 1, slot_size, dtype=torch.uint8)
+    slot_mapping = torch.arange(n, dtype=torch.int64)
+
+    impl._store_kv(
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        slot_mapping=slot_mapping,
+        Pi=torch.eye(d),
+        S=torch.eye(d),
+        centroids=centroids,
+    )
+
+    query = torch.randn(1, 1, d)
+    meta = _FakeDecodeMetadata(
+        seq_lens=torch.tensor([1]),
+        block_table=torch.tensor([[0]], dtype=torch.int64),
+        query_start_loc=torch.tensor([0, 1]),
+        slot_mapping=torch.zeros(1, dtype=torch.int64),
+        num_actual_tokens=1,
+        max_query_len=1,
+        max_seq_len=1,
+    )
+    output = impl._decode_attention_python(
+        query=query,
+        kv_cache=kv_cache,
+        attn_metadata=meta,
+        Pi=torch.eye(d),
+        S=torch.eye(d),
+        centroids=centroids,
+    )
+
+    qmax = (1 << impl.tq_config.effective_value_quant_bits) - 1
+    v_flat = value.float().reshape(-1, d)
+    vmin = v_flat.min(dim=1, keepdim=True).values
+    vmax = v_flat.max(dim=1, keepdim=True).values
+    v_scale = ((vmax - vmin) / qmax).clamp(min=1e-8)
+    v_idx = ((v_flat - vmin) / v_scale).round().clamp(0, qmax)
+    expected_decoded = (
+        v_idx
+        * v_scale.half().float()
+        + vmin.half().float()
+    )
+    assert torch.allclose(output[0, 0].float(), expected_decoded[0], atol=5e-3, rtol=5e-3)
