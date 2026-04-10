@@ -31,7 +31,9 @@ SSH_KEY="$HOME/.ssh/id_ed25519_varjosoft_hez"
 SSH_OPTS=(-i "$SSH_KEY" -o StrictHostKeyChecking=no -o ConnectTimeout=10 -o ServerAliveInterval=30)
 
 HERE="$(cd "$(dirname "$0")/../.." && pwd)"
-REMOTE_DIR='$HOME/turboquant-vllm'
+# Verda instances run as root; pin the remote path to avoid local $HOME leaking
+# into rsync destinations or env files.
+REMOTE_DIR='/root/turboquant-vllm'
 
 echo "=== PR #5 GPU test launcher ==="
 echo "instance:    $IP"
@@ -55,7 +57,7 @@ rsync -az --delete \
     --exclude='build' --exclude='dist' --exclude='*.egg-info' \
     --exclude='.pytest_cache' --exclude='.ruff_cache' \
     -e "ssh ${SSH_OPTS[*]}" \
-    "$HERE/" "root@$IP:$HOME/turboquant-vllm/"
+    "$HERE/" "root@$IP:$REMOTE_DIR/"
 
 # ----------------------------------------------------------------------
 # Step 2: generate the env file locally and rsync it to /tmp/tq-test.env
@@ -67,7 +69,7 @@ cat > "$TMP_ENV" <<EOF
 export MODEL_LIST='$MODEL_LIST_ENV'
 export GPU_MEM='$GPU_MEM_ENV'
 export MAX_MODEL_LEN='$MAX_MODEL_LEN_ENV'
-export WORKDIR='$HOME/turboquant-vllm'
+export WORKDIR='$REMOTE_DIR'
 EOF
 rsync -az -e "ssh ${SSH_OPTS[*]}" "$TMP_ENV" "root@$IP:/tmp/tq-test.env"
 
