@@ -24,8 +24,10 @@ from __future__ import annotations
 
 import math
 import logging
+from typing import TYPE_CHECKING
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 logger = logging.getLogger(__name__)
 
@@ -163,6 +165,7 @@ class TurboQuantOps:
         k_centroids, k_boundaries = _lloyds_centroids(k_pq_bits, head_dim)
         v_centroids, v_boundaries = _lloyds_centroids(v_pq_bits, head_dim)
 
+        torch = _get_torch()
         self._k_centroids = torch.tensor(k_centroids, dtype=torch.float32, device=device)
         self._k_boundaries = torch.tensor(k_boundaries, dtype=torch.float32, device=device)
         self._v_centroids = torch.tensor(v_centroids, dtype=torch.float32, device=device)
@@ -212,6 +215,7 @@ class TurboQuantOps:
 
     def quantize(self, vectors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Quantize fp16 vectors (PolarQuant only). Returns (indices, norms)."""
+        torch = _get_torch()
         n = vectors.shape[0]
         indices = torch.empty(n, self.head_dim, dtype=torch.uint8, device=self.device)
         norms = torch.empty(n, dtype=torch.float32, device=self.device)
@@ -220,6 +224,7 @@ class TurboQuantOps:
 
     def dequantize(self, indices: torch.Tensor, norms: torch.Tensor) -> torch.Tensor:
         """Dequantize indices + norms back to fp16 vectors (PolarQuant only)."""
+        torch = _get_torch()
         n = indices.shape[0]
         output = torch.empty(n, self.head_dim, dtype=torch.float16, device=self.device)
         _get_cuda_module().dequantize(indices, norms, output)
@@ -274,6 +279,7 @@ class TurboQuantOps:
         Returns (key_cache, value_cache, k_norms, v_norms).
         K and V caches may have different packed_dim if asymmetric.
         """
+        torch = _get_torch()
         key_cache = torch.zeros(
             num_blocks,
             block_size,
