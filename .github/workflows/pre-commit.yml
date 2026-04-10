@@ -16,7 +16,6 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   pre-commit:
@@ -27,6 +26,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+      - name: Cache pre-commit hook environments
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ hashFiles('.pre-commit-config.yaml') }}
       - uses: pre-commit/action@v3.0.1
         with:
           extra_args: --all-files --hook-stage manual

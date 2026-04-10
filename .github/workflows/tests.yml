@@ -24,6 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Keep in sync with `requires-python` in pyproject.toml.
         python-version: ["3.11", "3.12", "3.13"]
 
     steps:
@@ -33,16 +34,13 @@ jobs:
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
-          cache-dependency-glob: "pyproject.toml"
+          cache-dependency-glob: "uv.lock"
 
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install project with dev + test dependencies
-        run: |
-          uv sync --extra dev
-          uv pip install safetensors
+      - name: Install project with dev dependencies
+        run: uv sync --extra dev
 
       - name: Run CPU test suite
-        run: |
-          uv run python -m pytest tests/ --ignore=tests/gpu -v
+        run: uv run python -m pytest tests/ --ignore=tests/gpu -v
