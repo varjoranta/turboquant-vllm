@@ -98,18 +98,23 @@ except ImportError:
     logger = logging.getLogger(__name__)
 
 
+# Inherit from vLLM's base classes (when available) so we pick up default
+# classmethods that vLLM's selector probes — supports_alibi_sqrt, supports_sink,
+# is_mla, get_required_kv_cache_layout, _cudagraph_support, etc. — without
+# having to re-declare each one.
+try:
+    from vllm.v1.attention.backend import (
+        AttentionBackend as _VLLMBackendBase,
+        AttentionMetadataBuilder as _VLLMBuilderBase,
+    )
+except ImportError:
+    _VLLMBackendBase = object  # type: ignore[misc,assignment]
+    _VLLMBuilderBase = object  # type: ignore[misc,assignment]
+
+
 # ---------------------------------------------------------------------------
 # Backend class
 # ---------------------------------------------------------------------------
-
-# Resolve the base class at import time. Inheriting from vLLM's AttentionBackend
-# gives us default implementations of the ~20 classmethods vLLM's selector
-# probes (supports_alibi_sqrt, supports_sink, is_mla, etc.). We still override
-# the ones that are genuinely TurboQuant-specific.
-try:
-    from vllm.v1.attention.backend import AttentionBackend as _VLLMBackendBase
-except ImportError:
-    _VLLMBackendBase = object  # type: ignore[misc,assignment]
 
 
 class TurboQuantAttentionBackend(_VLLMBackendBase):
@@ -125,10 +130,7 @@ class TurboQuantAttentionBackend(_VLLMBackendBase):
 
     @staticmethod
     def get_name() -> str:
-        # We register as CUSTOM via AttentionBackendEnum.CUSTOM. vLLM 0.19
-        # validates backend names against the enum elsewhere, so the name
-        # returned here must match the enum member — 'TURBOQUANT' would
-        # raise ValueError: Unknown attention backend.
+        # Must match AttentionBackendEnum member name — vLLM validates it.
         return "CUSTOM"
 
     @staticmethod
@@ -190,16 +192,6 @@ class TurboQuantAttentionBackend(_VLLMBackendBase):
             return [f"kv_cache_dtype must be tq3/tq4/tq_k4v3, got {kv_cache_dtype}"]
         return []
 
-    @classmethod
-    def get_required_kv_cache_layout(cls):
-        """Return None to let vLLM pick a layout. Required by vLLM >=0.19.
-
-        vLLM's selector calls this on every registered backend. The default
-        implementation lives on AttentionBackend but we don't inherit from it
-        (we duck-type) — so we re-declare the no-op here.
-        """
-        return None
-
 
 # ---------------------------------------------------------------------------
 # Metadata
@@ -218,44 +210,20 @@ class TurboQuantMetadata:
     is_prefill: bool = False
 
 
-# Inheriting from vLLM's AttentionMetadataBuilder (when available) gives us
-# default class attributes — reorder_batch_threshold, _cudagraph_support,
-# supports_update_block_table — that vLLM 0.19 consults via getattr and that
-# would otherwise crash with AttributeError.
-try:
-    from vllm.v1.attention.backend import (
-        AttentionMetadataBuilder as _VLLMBuilderBase,
-    )
-except ImportError:
-    _VLLMBuilderBase = object  # type: ignore[misc,assignment]
-
-
 class TurboQuantMetadataBuilder(_VLLMBuilderBase):  # type: ignore[misc,valid-type]
-    """Builds TurboQuantMetadata from scheduler output."""
+    """Builds TurboQuantMetadata from scheduler output.
+
+    Inherits class-level defaults from AttentionMetadataBuilder:
+    _cudagraph_support = NEVER, reorder_batch_threshold = None.
+    """
 
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         # Skip super().__init__() — base is an abstract Generic whose default
-        # just copies these same four attributes. Calling it drags in the
-        # Generic[M] machinery we don't need.
+        # just copies these same four attributes.
         self.kv_cache_spec = kv_cache_spec
         self.layer_names = layer_names
         self.vllm_config = vllm_config
         self.device = device
-        # Base class defines reorder_batch_threshold as a class-level None,
-        # but vLLM 0.19's selector reads it via instance attribute — set it
-        # explicitly so the attribute exists on the instance.
-        self.reorder_batch_threshold = None
-
-    @classmethod
-    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
-        """CUDA graph support level consulted by vLLM 0.19.
-
-        Returning NEVER keeps vLLM from trying to replay a graph that would
-        silently skip our Python-level store/decode work.
-        """
-        from vllm.v1.attention.backend import AttentionCGSupport
-
-        return AttentionCGSupport.NEVER
 
     def reorder_batch(self, input_batch, scheduler_output):
         return False
@@ -294,13 +262,8 @@ class TurboQuantAttentionImpl:
     supports_quant_query_input: bool = False
 
     def process_weights_after_loading(self, act_dtype) -> None:
-        """No-op weight finalization hook.
-
-        vLLM 0.19's model loader calls this on every attention impl. We have
-        no per-layer weights of our own (codebooks live in the backend), so
-        nothing to do — but the method must exist or loading raises
-        AttributeError.
-        """
+        # vLLM's model loader calls this on every impl; we have no per-layer
+        # weights of our own (codebooks live in the backend).
         return None
 
     def __init__(
