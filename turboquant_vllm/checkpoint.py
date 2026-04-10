@@ -303,7 +303,6 @@ def _compress_tensor(
     """
     from turboquant_vllm.weight_quant import pack_indices
 
-    orig_shape = tensor.shape
     if tensor.dim() == 3:
         # MoE: (num_experts, out_dim, in_dim) -> flatten to 2D
         n_exp, out_dim, in_dim = tensor.shape

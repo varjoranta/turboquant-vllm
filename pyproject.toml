@@ -39,6 +39,48 @@ build-backend = "hatchling.build"
 
 [tool.ruff]
 line-length = 120
+target-version = "py311"
+exclude = [
+    ".venv",
+    "build",
+    "dist",
+    "__pycache__",
+    "csrc",
+]
+
+[tool.ruff.lint]
+# Start with ruff's default rule set (E + F). Expanding to UP/B/I/SIM/G
+# matches vLLM's conventions and can be enabled in a follow-up once the
+# repo has been through a one-time ruff-format pass.
+select = ["E", "F"]
+ignore = [
+    # Line length is enforced by ruff-format, not lint. E501 fires on
+    # comments and f-strings the formatter can't split, which is noise.
+    "E501",
+    # Triton kernel grid launchers conventionally use a lambda:
+    #   grid = lambda META: (cdiv(M, META['BLOCK_M']), ...)
+    # Rewriting as def obscures the pattern. vLLM also ignores this rule.
+    "E731",
+    # Mathematical code uses `l` (length), `I` (identity matrix), `O` (operator)
+    # as legitimate single-letter names. E741 flags these as ambiguous; in
+    # matrix / rotation / centroid code they're the canonical names.
+    "E741",
+    # Conditional imports for optional deps (vllm, scipy, safetensors) need
+    # to happen after environment checks. E402 forces all imports to file
+    # head which defeats the pattern.
+    "E402",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Benchmark/utility scripts are more permissive — they're not library code
+# and developer ergonomics > strict style. E702 is the `del x; gc.collect()`
+# pattern common in CUDA benchmarks. F841 is captured-but-unused results.
+"scripts/**" = ["E702", "F841", "F541", "F401"]
+# Tests frequently define unused fixtures for symmetry.
+"tests/**" = ["F841"]
+
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

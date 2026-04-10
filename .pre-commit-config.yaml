@@ -1,0 +1,22 @@
+default_install_hook_types:
+  - pre-commit
+default_stages:
+  - pre-commit  # Run locally on git commit
+  - manual       # Run in CI via pre-commit/action with --hook-stage manual
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.0
+    hooks:
+      - id: ruff-check
+        args: [--output-format, github, --fix]
+    # Note: ruff-format is intentionally NOT enabled yet. Enabling it would
+    # reformat ~40 files in a single sweep, poisoning git blame and causing
+    # merge conflicts with in-flight feature branches. The format pass will
+    # be its own follow-up PR with a .git-blame-ignore-revs entry so
+    # historical authorship survives.
+
+  - repo: https://github.com/rhysd/actionlint
+    rev: v1.7.7
+    hooks:
+      - id: actionlint

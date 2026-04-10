@@ -18,7 +18,6 @@ Usage:
 """
 
 import logging
-import math
 import torch
 import torch.nn as nn
 
@@ -169,9 +168,6 @@ def optimize_all_rotations(
     """
     rotations: dict[str, torch.Tensor] = {}
     total_layers = 0
-
-    # Group layers by similar statistics to share rotations
-    layer_groups: dict[str, list[str]] = {}  # cluster_key → [layer_names]
 
     for name, module in model.named_modules():
         if not isinstance(module, nn.Linear):

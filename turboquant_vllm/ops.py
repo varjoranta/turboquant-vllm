@@ -22,8 +22,15 @@ Usage:
 
 from __future__ import annotations
 
-import math
 import logging
+import math
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    # Allows static analysis (ruff, pyright) to resolve `torch.Tensor`
+    # annotations without forcing a top-level runtime import — keeping
+    # ops.py importable on codebook / CLI paths that don't need GPU.
+    import torch  # noqa: F401
 
 logger = logging.getLogger(__name__)
 

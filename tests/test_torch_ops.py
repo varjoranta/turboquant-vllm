@@ -12,7 +12,7 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA not available", allow_module_level=True)
 
-from turboquant_vllm.torch_ops import PolarQuantTorch, QJLTorch, KVCacheCompressorTorch
+from turboquant_vllm.torch_ops import PolarQuantTorch, KVCacheCompressorTorch
 
 HEAD_DIM = 128
 SEED = 42
