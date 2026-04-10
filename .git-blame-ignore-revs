@@ -1,0 +1,14 @@
+# Revisions listed here are skipped by `git blame` when the file is
+# passed via --ignore-revs-file (or configured via core.blameIgnoreRevsFile).
+# GitHub's web blame view honors this file automatically.
+#
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Only list commits here that are purely mechanical — formatting, renames,
+# whitespace. Functional changes MUST NOT be listed, since hiding them would
+# obscure real authorship.
+
+# ruff-format pass across entire codebase (40 files reformatted, zero
+# behavior changes, verified via `pytest` delta = 0). PR #10.
+3f789a8e43dbe5ec911580a89263d45ccfc381f1
