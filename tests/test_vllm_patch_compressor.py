@@ -77,5 +77,54 @@ class TestGetCompressor(unittest.TestCase):
         self.assertEqual(keys[0], (128, 4))
 
 
+class TestIterSlots(unittest.TestCase):
+    """Regression: _iter_slots must skip -1 (padding) entries in slot_mapping.
+
+    Historical bug: negative slot values were passed through to slot //
+    block_size which returned -1, scattering compressed entries into the
+    wrong dict key and corrupting cache on read. vLLM uses -1 in slot_mapping
+    as a placeholder for unscheduled tokens when a batch is smaller than
+    the max sequence length.
+    """
+
+    def test_negative_slots_are_skipped(self):
+        from turboquant_vllm.vllm_patch import _iter_slots
+
+        # Mixed: valid, padding, valid, padding
+        slot_mapping = torch.tensor([5, -1, 17, -1, 32], dtype=torch.int64)
+        block_size = 16
+        results = list(_iter_slots(slot_mapping, block_size))
+
+        # Only the 3 non-negative entries should be yielded
+        self.assertEqual(len(results), 3)
+        token_indices = [r[0] for r in results]
+        self.assertEqual(token_indices, [0, 2, 4])
+
+        # And each yielded result must have non-negative block_idx/offset
+        for t, block_idx, offset in results:
+            self.assertGreaterEqual(block_idx, 0,
+                                    f"token {t}: block_idx must be >= 0")
+            self.assertGreaterEqual(offset, 0,
+                                    f"token {t}: offset must be >= 0")
+
+    def test_all_negative_yields_nothing(self):
+        """All-padding batch should be a no-op, not corrupt anything."""
+        from turboquant_vllm.vllm_patch import _iter_slots
+
+        slot_mapping = torch.tensor([-1, -1, -1], dtype=torch.int64)
+        results = list(_iter_slots(slot_mapping, block_size=16))
+        self.assertEqual(results, [])
+
+    def test_valid_slots_unchanged(self):
+        """Sanity: positive slots still decompose correctly."""
+        from turboquant_vllm.vllm_patch import _iter_slots
+
+        slot_mapping = torch.tensor([0, 15, 16, 17, 31, 32], dtype=torch.int64)
+        results = list(_iter_slots(slot_mapping, block_size=16))
+        self.assertEqual(len(results), 6)
+        expected = [(0, 0, 0), (1, 0, 15), (2, 1, 0), (3, 1, 1), (4, 1, 15), (5, 2, 0)]
+        self.assertEqual(results, expected)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

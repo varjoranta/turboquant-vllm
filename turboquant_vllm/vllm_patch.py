@@ -109,9 +109,18 @@ def _auto_register_layer(_layer, layer_id):
 
 
 def _iter_slots(slot_mapping, block_size):
-    """Yield (token_idx, block_idx, offset) for each token in slot_mapping."""
+    """Yield (token_idx, block_idx, offset) for each token in slot_mapping.
+
+    Skips entries where slot < 0. vLLM uses -1 as a placeholder for
+    padding or unscheduled token positions in the slot_mapping tensor.
+    Without this guard, Python's negative integer division on -1 gives
+    (-1, block_size-1) which would scatter compressed entries into the
+    last block of the sidecar dict and later collide with real reads.
+    """
     for t in range(slot_mapping.shape[0]):
         slot = slot_mapping[t].item()
+        if slot < 0:
+            continue
         yield t, slot // block_size, slot % block_size
 
 
