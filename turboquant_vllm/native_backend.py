@@ -598,9 +598,13 @@ class TurboQuantAttentionImpl:
         query_start_loc = attn_metadata.query_start_loc
         num_reqs = query_start_loc.shape[0] - 1
         output = torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
+        # Single CPU<->GPU sync for the whole batch instead of 2*num_reqs
+        # .item() calls inside the loop. Same optimization vibhavagarwal5/vllm#7
+        # measured as the prefill TTFT win.
+        qsl = query_start_loc.tolist()
         for i in range(num_reqs):
-            q_start = query_start_loc[i].item()
-            q_end = query_start_loc[i + 1].item()
+            q_start = qsl[i]
+            q_end = qsl[i + 1]
             if q_end <= q_start:
                 continue
             q_t = query[q_start:q_end].transpose(0, 1).contiguous()
@@ -685,9 +689,13 @@ class TurboQuantAttentionImpl:
             mse_sh = None
             mse_mask = (1 << mse_bits) - 1
 
+        # Single CPU<->GPU sync for the whole batch instead of B
+        # per-iteration .item() calls.
+        seq_lens_list = attn_metadata.seq_lens.tolist()
+
         outputs = []
         for i in range(B):
-            seq_len = attn_metadata.seq_lens[i].item()
+            seq_len = seq_lens_list[i]
             if seq_len <= 0:
                 outputs.append(torch.zeros(Hq, D, device=device, dtype=query.dtype))
                 continue
@@ -846,17 +854,24 @@ class TurboQuantAttentionImpl:
         decode_mask = (q_lens == 1)
         prefill_mask = ~decode_mask
 
+        # Single CPU<->GPU sync for query_start_loc; consumed by both the
+        # prefill loop below and the decode scatter at the end.
+        qsl = query_start_loc.tolist()
+
         if prefill_mask.any():
+            # Materialize decode_mask once so we can index it in pure Python
+            # instead of paying for a per-iteration Tensor[bool] lookup.
+            decode_mask_list = decode_mask.tolist()
+            Hk = key.shape[1]
+            use_gqa = Hk < Hq
             for i in range(num_reqs):
-                if decode_mask[i]:
+                if decode_mask_list[i]:
                     continue
-                q_start = query_start_loc[i].item()
-                q_end = query_start_loc[i + 1].item()
+                q_start = qsl[i]
+                q_end = qsl[i + 1]
                 q_len = q_end - q_start
                 if q_len <= 0:
                     continue
-                Hk = key.shape[1]
-                use_gqa = Hk < Hq
                 q_t = query[q_start:q_end].transpose(0, 1).contiguous()
                 k_t = key[q_start:q_end].transpose(0, 1).contiguous()
                 v_t = value[q_start:q_end].transpose(0, 1).contiguous()
@@ -869,18 +884,22 @@ class TurboQuantAttentionImpl:
             num_decodes = decode_indices.shape[0]
             decode_token_offsets = query_start_loc[decode_indices]
             decode_q = query[decode_token_offsets]
+            decode_seq_lens = attn_metadata.seq_lens[decode_indices]
             decode_meta = TurboQuantMetadata(
-                seq_lens=attn_metadata.seq_lens[decode_indices],
+                seq_lens=decode_seq_lens,
                 slot_mapping=attn_metadata.slot_mapping,
                 block_table=attn_metadata.block_table[decode_indices],
                 query_start_loc=torch.arange(num_decodes + 1, device=device, dtype=torch.int32),
                 num_actual_tokens=num_decodes,
                 max_query_len=1,
-                max_seq_len=attn_metadata.seq_lens[decode_indices].max().item(),
+                max_seq_len=decode_seq_lens.max().item(),
                 is_prefill=False,
             )
             decode_out = self._decode_attention(decode_q, kv_cache, decode_meta, Pi, S, centroids)
+            # Scatter results back to the right token positions. tolist()
+            # once instead of num_decodes .item() calls.
+            offsets_list = decode_token_offsets.tolist()
             for j in range(num_decodes):
-                output[decode_token_offsets[j].item()] = decode_out[j]
+                output[offsets_list[j]] = decode_out[j]
 
         return output
