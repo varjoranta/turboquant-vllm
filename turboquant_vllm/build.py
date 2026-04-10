@@ -22,6 +22,27 @@ if not (CSRC_DIR / "turbo_quant.cu").exists():
     )
 
 
+def _cuda_version_tuple():
+    """Return (major, minor) tuple for the nvcc the toolchain will invoke."""
+    import subprocess
+
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    nvcc = f"{CUDA_HOME}/bin/nvcc" if CUDA_HOME else "nvcc"
+    try:
+        out = subprocess.check_output([nvcc, "--version"], text=True)
+    except (OSError, subprocess.CalledProcessError):
+        return (0, 0)
+    for line in out.splitlines():
+        if "release" in line:
+            # "Cuda compilation tools, release 12.8, V12.8.93"
+            for token in line.split():
+                if token[:1].isdigit() and "." in token.rstrip(","):
+                    major, minor = token.rstrip(",").split(".")[:2]
+                    return (int(major), int(minor))
+    return (0, 0)
+
+
 def build():
     """JIT-compile the CUDA extension. Returns the loaded module."""
     from torch.utils.cpp_extension import load
@@ -32,6 +53,8 @@ def build():
         str(CSRC_DIR / "torch_bindings.cpp"),
     ]
 
+    # sm_121 (GB10 / DGX Spark) needs CUDA >= 12.9. Older toolchains fail hard.
+    cuda_major, cuda_minor = _cuda_version_tuple()
     extra_cuda_cflags = [
         "-O3",
         "--use_fast_math",
@@ -41,8 +64,11 @@ def build():
         "-gencode=arch=compute_89,code=sm_89",    # L40S, RTX 4090
         "-gencode=arch=compute_90,code=sm_90",    # H100, H200
         "-gencode=arch=compute_120,code=sm_120",  # Blackwell consumer (RTX 50xx)
-        "-gencode=arch=compute_121,code=sm_121",  # GB10 (DGX Spark)
     ]
+    if (cuda_major, cuda_minor) >= (12, 9):
+        extra_cuda_cflags.append(
+            "-gencode=arch=compute_121,code=sm_121",  # GB10 (DGX Spark)
+        )
 
     module = load(
         name="turbo_quant_cuda",
