@@ -29,7 +29,7 @@ from turboquant_vllm.torch_ops import KVCacheCompressorTorch, CompressedKV
 
 logger = logging.getLogger(__name__)
 
-_compressors: dict[int, KVCacheCompressorTorch] = {}
+_compressors: dict[tuple[int, int], KVCacheCompressorTorch] = {}
 _cache: dict[int, dict[tuple[int, int, int], tuple[CompressedKV, CompressedKV]]] = {}
 _mla_cache: dict[int, dict[tuple[int, int], CompressedKV]] = {}
 
@@ -93,7 +93,7 @@ def _get_compressor(dim: int, device: torch.device, layer_idx: int = -1) -> KVCa
             "TurboQuant+ compressor [%s]: dim=%d K=%d-bit V=%d-bit → %.1fx compression",
             backend, dim, _k_bits, _v_bits, stats["compression_ratio"],
         )
-    return _compressors[dim]
+    return _compressors[key]
 
 
 def _auto_register_layer(_layer, layer_id):
