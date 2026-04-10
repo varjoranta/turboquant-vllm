@@ -26,6 +26,7 @@ patches the vLLM backend selector and CacheDType validator at plugin load.
 
 import math
 import os
+import sys
 from dataclasses import dataclass
 from typing import ClassVar, Optional
 
@@ -43,6 +44,7 @@ _store_stream: Optional[torch.cuda.Stream] = None
 # Triton fast paths — try to import from vllm fork, then from our own ops,
 # then fall back to Python.
 # ---------------------------------------------------------------------------
+_TRITON_STORE_SOURCE = None
 _USE_TRITON_STORE = False
 _triton_tq_store = None
 if os.environ.get("TQ_PYTHON_STORE", "0") != "1":
@@ -56,10 +58,12 @@ if os.environ.get("TQ_PYTHON_STORE", "0") != "1":
             _mod = importlib.import_module(_store_src)
             _triton_tq_store = _mod.triton_tq_store
             _USE_TRITON_STORE = True
+            _TRITON_STORE_SOURCE = _store_src
             break
         except (ImportError, AttributeError):
             pass
 
+_TRITON_DECODE_SOURCE = None
 _USE_TRITON_DECODE = False
 _triton_tq_decode = None
 if os.environ.get("TQ_PYTHON_DECODE", "0") != "1":
@@ -73,9 +77,26 @@ if os.environ.get("TQ_PYTHON_DECODE", "0") != "1":
             _mod = importlib.import_module(_decode_src)
             _triton_tq_decode = _mod.triton_tq_decode_attention
             _USE_TRITON_DECODE = True
+            _TRITON_DECODE_SOURCE = _decode_src
             break
         except (ImportError, AttributeError):
             pass
+
+# Print the selected paths to stderr at module load so operators (and the
+# CI test harness) can see which kernel source is active without enabling
+# debug logging. Matches the pattern used for STR_DTYPE patch messages.
+if _USE_TRITON_STORE:
+    print(
+        f"TurboQuant: using Triton store from {_TRITON_STORE_SOURCE}",
+        file=sys.stderr,
+        flush=True,
+    )
+if _USE_TRITON_DECODE:
+    print(
+        f"TurboQuant: using Triton decode from {_TRITON_DECODE_SOURCE}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 # Flash attention for prefill
 try:

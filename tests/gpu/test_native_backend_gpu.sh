@@ -233,6 +233,52 @@ send_completion() {
 }
 
 # ---------------------------------------------------------------------------
+# Helper: measure decode throughput by generating N tokens with max_tokens=N
+# at temperature=0, timing wall-clock, computing tokens/sec. Writes result
+# to the named output variable as "<tok_per_sec>".
+#
+# Does a warmup call first so torch.compile / cudagraph capture / KV prefix
+# population don't pollute the measured run.
+# ---------------------------------------------------------------------------
+measure_throughput() {
+    local model=$1
+    local out_var=$2
+    local n_tokens=${3:-128}
+    local prompt="In 2026, the most important technological breakthrough was"
+
+    # Warmup — not measured
+    curl -sf "http://127.0.0.1:$PORT/v1/completions" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$model\",\"prompt\":\"$prompt\",\"max_tokens\":16,\"temperature\":0}" \
+        >/dev/null 2>&1 || true
+
+    local t0 t1 resp elapsed toks_per_sec
+    t0=$(python3 -c "import time; print(time.time())")
+    resp=$(curl -sf "http://127.0.0.1:$PORT/v1/completions" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$model\",\"prompt\":\"$prompt\",\"max_tokens\":$n_tokens,\"temperature\":0,\"ignore_eos\":true}" 2>/dev/null || echo "")
+    t1=$(python3 -c "import time; print(time.time())")
+
+    if [[ -z "$resp" ]]; then
+        printf -v "$out_var" "%s" "0"
+        return 1
+    fi
+
+    # Extract actual completion_tokens from usage (may differ from max_tokens
+    # if the model emits EOS despite ignore_eos).
+    local actual_toks
+    actual_toks=$(echo "$resp" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("usage",{}).get("completion_tokens",0))' 2>/dev/null || echo "0")
+    if [[ "$actual_toks" -eq 0 ]]; then
+        printf -v "$out_var" "%s" "0"
+        return 1
+    fi
+
+    elapsed=$(python3 -c "print(round($t1 - $t0, 4))")
+    toks_per_sec=$(python3 -c "e=$t1-$t0; t=$actual_toks; print(round(t/e, 2) if e>0 else 0)")
+    printf -v "$out_var" "%s" "$toks_per_sec"
+}
+
+# ---------------------------------------------------------------------------
 # Phase 1: Import sanity
 # ---------------------------------------------------------------------------
 echo "[Phase 1/8] Import sanity check"
@@ -387,6 +433,10 @@ for MODEL in "${MODELS_ARR[@]}"; do
         echo "  WARN: auto completion failed: '$AUTO_GEN'"
     fi
 
+    AUTO_TPS="0"
+    measure_throughput "$MODEL" AUTO_TPS 128
+    echo "  AUTO throughput: $AUTO_TPS tok/s (128 tokens)"
+
     # Save full server log for this run
     cp "$SERVER_LOG" "/tmp/tq-server-${MODEL_SLUG}-auto.log"
     stop_vllm
@@ -449,6 +499,17 @@ for MODEL in "${MODELS_ARR[@]}"; do
         echo "  WARN: tq3 completion failed: '$TQ3_GEN'"
     fi
 
+    TQ3_TPS="0"
+    measure_throughput "$MODEL" TQ3_TPS 128
+    echo "  TQ3 throughput:  $TQ3_TPS tok/s (128 tokens)"
+
+    # Detect which TQ3 code path the backend took — Triton kernels vendored
+    # from the fork, or the Python fallback in native_backend.py.
+    TRITON_STORE=$(grep -c "TurboQuant: using Triton store" "$SERVER_LOG" 2>/dev/null || echo "0")
+    TRITON_DECODE=$(grep -c "TurboQuant: using Triton decode" "$SERVER_LOG" 2>/dev/null || echo "0")
+    echo "  Triton store path loaded:  $([[ $TRITON_STORE -gt 0 ]] && echo YES || echo no)"
+    echo "  Triton decode path loaded: $([[ $TRITON_DECODE -gt 0 ]] && echo YES || echo no)"
+
     cp "$SERVER_LOG" "/tmp/tq-server-${MODEL_SLUG}-tq3.log"
     stop_vllm
 
@@ -471,6 +532,14 @@ for MODEL in "${MODELS_ARR[@]}"; do
 
     echo "[Phase 8/8] Capacity ratio: $RATIO ($RATIO_STATUS)"
 
+    # Throughput ratio: tq3 tok/s as a fraction of auto tok/s.
+    # 1.0 = parity, <1.0 = tq3 slower, >1.0 = tq3 faster.
+    TPS_RATIO="0.0"
+    if [[ "$AUTO_TPS" != "0" && "$TQ3_TPS" != "0" ]]; then
+        TPS_RATIO=$(python3 -c "print(round($TQ3_TPS / $AUTO_TPS, 3))")
+    fi
+    echo "  Throughput: auto=$AUTO_TPS tok/s  tq3=$TQ3_TPS tok/s  ratio=$TPS_RATIO"
+
     # Append per-model results to result file
     {
         echo ""
@@ -482,6 +551,11 @@ for MODEL in "${MODELS_ARR[@]}"; do
         echo "MODEL_${MODEL_IDX}_RATIO_STATUS=$RATIO_STATUS"
         echo "MODEL_${MODEL_IDX}_TIMING_STATUS=$TIMING_STATUS"
         echo "MODEL_${MODEL_IDX}_SIG_WARN_COUNT=$SIG_WARN"
+        echo "MODEL_${MODEL_IDX}_AUTO_TPS=$AUTO_TPS"
+        echo "MODEL_${MODEL_IDX}_TQ3_TPS=$TQ3_TPS"
+        echo "MODEL_${MODEL_IDX}_TPS_RATIO=$TPS_RATIO"
+        echo "MODEL_${MODEL_IDX}_TRITON_STORE=$TRITON_STORE"
+        echo "MODEL_${MODEL_IDX}_TRITON_DECODE=$TRITON_DECODE"
         echo "MODEL_${MODEL_IDX}_AUTO_GEN=$(echo "$AUTO_GEN" | head -c 200 | tr '\n' ' ')"
         echo "MODEL_${MODEL_IDX}_TQ3_GEN=$(echo "$TQ3_GEN" | head -c 200 | tr '\n' ' ')"
     } >> "$RESULT"
