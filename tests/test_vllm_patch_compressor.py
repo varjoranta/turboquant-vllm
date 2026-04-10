@@ -19,6 +19,7 @@ class TestGetCompressor(unittest.TestCase):
     def setUp(self):
         # Reset module-level state between tests
         from turboquant_vllm import vllm_patch
+
         vllm_patch._compressors.clear()
         vllm_patch._k_bits = 4
         vllm_patch._v_bits = 4
@@ -102,10 +103,8 @@ class TestIterSlots(unittest.TestCase):
 
         # And each yielded result must have non-negative block_idx/offset
         for t, block_idx, offset in results:
-            self.assertGreaterEqual(block_idx, 0,
-                                    f"token {t}: block_idx must be >= 0")
-            self.assertGreaterEqual(offset, 0,
-                                    f"token {t}: offset must be >= 0")
+            self.assertGreaterEqual(block_idx, 0, f"token {t}: block_idx must be >= 0")
+            self.assertGreaterEqual(offset, 0, f"token {t}: offset must be >= 0")
 
     def test_all_negative_yields_nothing(self):
         """All-padding batch should be a no-op, not corrupt anything."""

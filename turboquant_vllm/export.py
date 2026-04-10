@@ -84,13 +84,13 @@ def _compute_awq_params(weight: torch.Tensor, group_size: int = 128, bits: int =
     assert out_dim % pack_factor == 0, f"out_dim {out_dim} not divisible by pack_factor {pack_factor}"
     packed = torch.zeros(padded_in, out_dim // pack_factor, dtype=torch.int32, device=weight.device)
     for i in range(pack_factor):
-        packed |= (w_int_flat[:, i::pack_factor] << (i * bits))
+        packed |= w_int_flat[:, i::pack_factor] << (i * bits)
 
     # qzeros: pack the same way as qweight
     zeros_int = torch.round(zeros).clamp(0, max_val).to(torch.int32)
     qzeros = torch.zeros(n_groups, out_dim // pack_factor, dtype=torch.int32, device=weight.device)
     for i in range(pack_factor):
-        qzeros |= (zeros_int[:, i::pack_factor] << (i * bits))
+        qzeros |= zeros_int[:, i::pack_factor] << (i * bits)
 
     return packed, scales.to(torch.float16), qzeros
 
@@ -123,9 +123,7 @@ def compress_and_export(
     logger.info("Loading model %s...", model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     config = AutoConfig.from_pretrained(model_id)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=torch.bfloat16, device_map="cuda"
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.bfloat16, device_map="cuda")
 
     mem_original = torch.cuda.memory_allocated() / 1e9
     logger.info("Loaded: %.1f GB", mem_original)
@@ -134,8 +132,10 @@ def compress_and_export(
     pruned_info = {}
     if prune_experts > 0:
         from turboquant_vllm.expert_pruning import reap_prune
+
         pruned_info = reap_prune(
-            model, tokenizer,
+            model,
+            tokenizer,
             prune_fraction=prune_experts,
             num_samples=num_calibration_samples,
         )
@@ -183,9 +183,7 @@ def compress_and_export(
         w_reconstructed = w_hat.reshape(out_dim, padded_in)[:, :in_dim]
 
         # Now pack as AWQ format
-        qweight, scales, qzeros = _compute_awq_params(
-            w_reconstructed, group_size=group_size, bits=bits
-        )
+        qweight, scales, qzeros = _compute_awq_params(w_reconstructed, group_size=group_size, bits=bits)
 
         awq_state_dict[name + ".qweight"] = qweight.cpu()
         awq_state_dict[name + ".qzeros"] = qzeros.cpu()
@@ -204,6 +202,7 @@ def compress_and_export(
     logger.info("Saving %d layers to %s...", layers_exported, output_dir)
     try:
         from safetensors.torch import save_file
+
         save_file(awq_state_dict, os.path.join(output_dir, "model.safetensors"))
     except ImportError:
         logger.warning("safetensors not available, falling back to torch.save (pickle format)")
@@ -234,6 +233,9 @@ def compress_and_export(
     ratio = total_original_bytes / max(total_exported_bytes, 1)
     logger.info(
         "Export complete: %d layers, %.1f GB -> %.1f GB (%.1fx), saved to %s",
-        layers_exported, total_original_bytes / 1e9, total_exported_bytes / 1e9,
-        ratio, output_dir,
+        layers_exported,
+        total_original_bytes / 1e9,
+        total_exported_bytes / 1e9,
+        ratio,
+        output_dir,
     )

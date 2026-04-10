@@ -26,10 +26,10 @@ def _find_moe_blocks(model: nn.Module) -> list[tuple[str, nn.Module]]:
     """
     blocks = []
     for name, module in model.named_modules():
-        gate = getattr(module, 'gate', None)
-        if gate is not None and hasattr(gate, 'weight'):
+        gate = getattr(module, "gate", None)
+        if gate is not None and hasattr(gate, "weight"):
             # Check if this module also has experts
-            experts = getattr(module, 'experts', None)
+            experts = getattr(module, "experts", None)
             if experts is not None:
                 blocks.append((name, module))
     return blocks
@@ -67,9 +67,7 @@ def compute_reap_saliency(
     device = next(model.parameters()).device
 
     # Prepare calibration data
-    calibration_inputs = _prepare_calibration_data(
-        tokenizer, num_samples, max_length, dataset_name, device
-    )
+    calibration_inputs = _prepare_calibration_data(tokenizer, num_samples, max_length, dataset_name, device)
 
     # Register hooks to collect gate values and expert activation norms
     collectors: dict[str, _SaliencyCollector] = {}
@@ -82,21 +80,16 @@ def compute_reap_saliency(
         collectors[block_path] = collector
 
         # Detect top_k from model config
-        top_k = getattr(model.config, 'num_experts_per_tok',
-                 getattr(model.config, 'num_selected_experts', 8))
+        top_k = getattr(model.config, "num_experts_per_tok", getattr(model.config, "num_selected_experts", 8))
 
         # Hook the gate to capture routing decisions
-        hooks.append(gate_module.register_forward_hook(
-            _make_gate_hook(collector, top_k=top_k)
-        ))
+        hooks.append(gate_module.register_forward_hook(_make_gate_hook(collector, top_k=top_k)))
 
         # Hook each expert to capture activation norms
         for idx in range(num_experts):
             expert = _get_expert_by_index(block, idx)
             if expert is not None:
-                hooks.append(expert.register_forward_hook(
-                    _make_expert_hook(collector, idx)
-                ))
+                hooks.append(expert.register_forward_hook(_make_expert_hook(collector, idx)))
 
     # Run calibration forward passes
     model.eval()
@@ -104,7 +97,7 @@ def compute_reap_saliency(
 
     with torch.no_grad():
         for i in range(0, len(calibration_inputs), batch_size):
-            batch = calibration_inputs[i:i + batch_size]
+            batch = calibration_inputs[i : i + batch_size]
             input_ids = torch.nn.utils.rnn.pad_sequence(
                 batch, batch_first=True, padding_value=tokenizer.pad_token_id or 0
             )
@@ -112,7 +105,9 @@ def compute_reap_saliency(
             model(input_ids=input_ids, attention_mask=attention_mask)
 
             if (i // batch_size) % 50 == 0:
-                logger.info("  Calibration progress: %d/%d samples", min(i + batch_size, len(calibration_inputs)), num_samples)
+                logger.info(
+                    "  Calibration progress: %d/%d samples", min(i + batch_size, len(calibration_inputs)), num_samples
+                )
 
     # Remove hooks
     for hook in hooks:
@@ -126,10 +121,12 @@ def compute_reap_saliency(
         top3 = scores.argsort(descending=True)[:3].tolist()
         bot3 = scores.argsort()[:3].tolist()
         logger.info(
-            "REAP saliency %s: top experts %s, bottom experts %s, "
-            "max=%.4f, min=%.4f, ratio=%.1f",
-            block_path, top3, bot3,
-            scores.max().item(), scores.min().item(),
+            "REAP saliency %s: top experts %s, bottom experts %s, max=%.4f, min=%.4f, ratio=%.1f",
+            block_path,
+            top3,
+            bot3,
+            scores.max().item(),
+            scores.min().item(),
             scores.max().item() / max(scores.min().item(), 1e-10),
         )
 
@@ -154,13 +151,12 @@ class _SaliencyCollector:
         self._current_gate_values = gate_values.detach()
         self._current_top_k_indices = top_k_indices.detach()
 
-    def record_expert_activation(self, expert_idx: int, activation_norm: float,
-                                  num_tokens: int):
+    def record_expert_activation(self, expert_idx: int, activation_norm: float, num_tokens: int):
         """Called by expert hook."""
         if self._current_gate_values is None:
             return
         # Find tokens where this expert was in top-k (vectorized)
-        expert_mask = (self._current_top_k_indices == expert_idx)  # (batch*seq, top_k)
+        expert_mask = self._current_top_k_indices == expert_idx  # (batch*seq, top_k)
         active = expert_mask.any(dim=-1)  # (batch*seq,)
         if active.any():
             # Sum gate values across all top-k slots where this expert appears
@@ -171,8 +167,7 @@ class _SaliencyCollector:
 
     def compute_saliency(self) -> torch.Tensor:
         """Compute final saliency: weighted_sum / active_count."""
-        safe_count = torch.where(self.active_count > 0, self.active_count,
-                                  torch.ones_like(self.active_count))
+        safe_count = torch.where(self.active_count > 0, self.active_count, torch.ones_like(self.active_count))
         return self.weighted_sum / safe_count
 
 
@@ -189,6 +184,7 @@ def _get_expert_by_index(moe_block: nn.Module, idx: int) -> nn.Module | None:
 
 def _make_gate_hook(collector: _SaliencyCollector, top_k: int = 8):
     """Create a forward hook for the gate/router module."""
+
     def hook(module, input, output):
         # Gate output is logits (batch*seq, num_experts)
         if isinstance(output, tuple):
@@ -197,19 +193,19 @@ def _make_gate_hook(collector: _SaliencyCollector, top_k: int = 8):
             logits = output
         logits = logits.float()
         k = min(top_k, logits.shape[-1])
-        gate_values, top_k_indices = torch.topk(
-            torch.softmax(logits, dim=-1), k=k, dim=-1
-        )
+        gate_values, top_k_indices = torch.topk(torch.softmax(logits, dim=-1), k=k, dim=-1)
         # Flatten batch and seq dimensions
         if gate_values.dim() > 2:
             gate_values = gate_values.reshape(-1, top_k)
             top_k_indices = top_k_indices.reshape(-1, top_k)
         collector.record_gate(gate_values, top_k_indices)
+
     return hook
 
 
 def _make_expert_hook(collector: _SaliencyCollector, expert_idx: int):
     """Create a forward hook for an individual expert module."""
+
     def hook(module, input, output):
         if isinstance(output, tuple):
             out = output[0]
@@ -219,16 +215,21 @@ def _make_expert_hook(collector: _SaliencyCollector, expert_idx: int):
         norm = out.float().norm().item()
         num_tokens = out.shape[0] if out.dim() >= 2 else 1
         collector.record_expert_activation(expert_idx, norm, num_tokens)
+
     return hook
 
 
 def _prepare_calibration_data(
-    tokenizer, num_samples: int, max_length: int, dataset_name: str,
+    tokenizer,
+    num_samples: int,
+    max_length: int,
+    dataset_name: str,
     device: torch.device,
 ) -> list[torch.Tensor]:
     """Load and tokenize calibration samples."""
     try:
         from datasets import load_dataset
+
         ds = load_dataset(dataset_name, "en", split="train", streaming=True)
         texts = []
         for i, sample in enumerate(ds):
@@ -236,14 +237,15 @@ def _prepare_calibration_data(
                 break
             text = sample.get("text", "")
             if len(text) > 50:  # skip very short
-                texts.append(text[:max_length * 4])  # rough char limit
+                texts.append(text[: max_length * 4])  # rough char limit
     except Exception as e:
         logger.warning("Could not load %s dataset: %s. Using synthetic data.", dataset_name, e)
         texts = ["The quick brown fox jumps over the lazy dog. " * 20] * num_samples
 
     # Batch tokenize for efficiency
-    batch = tokenizer(texts[:num_samples], truncation=True, max_length=max_length,
-                      padding=False, return_attention_mask=False)
+    batch = tokenizer(
+        texts[:num_samples], truncation=True, max_length=max_length, padding=False, return_attention_mask=False
+    )
     inputs = [torch.tensor(ids, device=device) for ids in batch["input_ids"]]
 
     logger.info("Prepared %d calibration samples (max_length=%d)", len(inputs), max_length)
@@ -310,10 +312,10 @@ def reap_prune(
             def _gate_mask_hook(module, input, output, mask=prune_mask):
                 if isinstance(output, tuple):
                     logits = output[0]
-                    logits[:, mask] = float('-inf')
+                    logits[:, mask] = float("-inf")
                     return (logits,) + output[1:]
                 else:
-                    output[:, mask] = float('-inf')
+                    output[:, mask] = float("-inf")
                     return output
 
             gate.register_forward_hook(_gate_mask_hook)
@@ -321,7 +323,9 @@ def reap_prune(
         total_pruned += n_prune
         logger.info(
             "REAP pruned %s: removed %d/%d experts (indices: %s)",
-            block_path, n_prune, num_experts,
+            block_path,
+            n_prune,
+            num_experts,
             prune_indices[:5] if len(prune_indices) > 5 else prune_indices,
         )
 
@@ -332,6 +336,7 @@ def reap_prune(
 # ---------------------------------------------------------------------------
 # Router fine-tuning post-REAP (MC# ICLR 2025)
 # ---------------------------------------------------------------------------
+
 
 def finetune_router(
     model: nn.Module,
@@ -371,16 +376,15 @@ def finetune_router(
         return 0.0
 
     optimizer = torch.optim.Adam(gate_params, lr=lr)
-    calibration_inputs = _prepare_calibration_data(
-        tokenizer, num_samples, max_length, "allenai/c4", device
-    )
+    calibration_inputs = _prepare_calibration_data(tokenizer, num_samples, max_length, "allenai/c4", device)
 
     model.train()
     total_loss = 0.0
     step = 0
 
-    logger.info("Router fine-tuning: %d steps, %d gate params, lr=%g",
-                num_steps, sum(p.numel() for p in gate_params), lr)
+    logger.info(
+        "Router fine-tuning: %d steps, %d gate params, lr=%g", num_steps, sum(p.numel() for p in gate_params), lr
+    )
 
     for epoch in range(num_steps // max(len(calibration_inputs), 1) + 1):
         for input_ids in calibration_inputs:
@@ -420,6 +424,7 @@ def finetune_router(
 # Hessian diagonal collection (for mixed-precision + sparse outliers)
 # ---------------------------------------------------------------------------
 
+
 def collect_hessian_diagonal(
     model: nn.Module,
     tokenizer,
@@ -434,9 +439,7 @@ def collect_hessian_diagonal(
     Returns: {param_name: hessian_diag tensor (same shape as weight)}
     """
     device = next(model.parameters()).device
-    calibration_inputs = _prepare_calibration_data(
-        tokenizer, num_samples, max_length, "allenai/c4", device
-    )
+    calibration_inputs = _prepare_calibration_data(tokenizer, num_samples, max_length, "allenai/c4", device)
 
     # Collect squared activations for each linear layer
     hessian_accum: dict[str, torch.Tensor] = {}
@@ -486,6 +489,7 @@ def collect_hessian_diagonal(
 # Mixed-precision bit selection per expert
 # ---------------------------------------------------------------------------
 
+
 def compute_expert_bit_widths(
     model: nn.Module,
     hessian: dict[str, torch.Tensor],
@@ -522,7 +526,8 @@ def compute_expert_bit_widths(
                     if name.startswith(block_path):
                         # Extract expert index from name
                         import re
-                        m = re.search(r'experts\.(\d+)', name)
+
+                        m = re.search(r"experts\.(\d+)", name)
                         if m:
                             idx = int(m.group(1))
                             if idx < scores.shape[0]:
@@ -548,6 +553,7 @@ def compute_expert_bit_widths(
 # ---------------------------------------------------------------------------
 # Dense-and-Sparse decomposition
 # ---------------------------------------------------------------------------
+
 
 def extract_sparse_outliers(
     model: nn.Module,
@@ -587,11 +593,12 @@ def extract_sparse_outliers(
 
         # Reconstruct the weight to compute error
         from turboquant_vllm.weight_quant import unpack_indices, _get_quantizer
+
         quantizer = _get_quantizer(module.group_size, module.bits, str(module.packed_weight.device))
         indices = unpack_indices(module.packed_weight, module.bits, module.group_size)
         norms_flat = module.norms.reshape(-1)
         w_hat = quantizer.dequantize(indices, norms_flat)
-        w_hat = w_hat.reshape(module.out_features, module.padded_in)[:, :module.in_features]
+        w_hat = w_hat.reshape(module.out_features, module.padded_in)[:, : module.in_features]
 
         # We don't have the original weight anymore, but we can use w_hat
         # and focus on high-Hessian positions where even small errors matter.
@@ -620,6 +627,8 @@ def extract_sparse_outliers(
     overhead_pct = total_outlier_bytes / max(total_weight_bytes, 1) * 100
     logger.info(
         "Sparse outliers: %d layers, %.1f KB total (%.2f%% overhead)",
-        len(outliers), total_outlier_bytes / 1024, overhead_pct,
+        len(outliers),
+        total_outlier_bytes / 1024,
+        overhead_pct,
     )
     return outliers

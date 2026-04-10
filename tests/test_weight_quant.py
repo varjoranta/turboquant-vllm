@@ -130,7 +130,7 @@ class TestLinearMethod:
         y_comp = method.decompress_and_matmul(compressed, x, linear.bias)
 
         # Should be close
-        rel_error = ((y_orig - y_comp) ** 2).mean() / (y_orig ** 2).mean()
+        rel_error = ((y_orig - y_comp) ** 2).mean() / (y_orig**2).mean()
         assert rel_error < 0.05, f"Relative error {rel_error:.4f} too high"
 
     def test_compression_ratio(self):
@@ -157,7 +157,7 @@ class TestWrapper:
         with torch.no_grad():
             y_wrapped = wrapper(x)
 
-        rel_error = ((y_orig - y_wrapped) ** 2).mean() / (y_orig ** 2).mean()
+        rel_error = ((y_orig - y_wrapped) ** 2).mean() / (y_orig**2).mean()
         assert rel_error < 0.05, f"Wrapper relative error {rel_error:.4f} too high"
 
     def test_wrapper_no_bias(self):

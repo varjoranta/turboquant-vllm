@@ -39,7 +39,8 @@ class TestReplaceLinearLayersCpu(unittest.TestCase):
         # default min_size=1024, so our 1024x1024 layer qualifies
         total = _replace_linear_layers(model, bits=3, group_size=128)
         self.assertGreaterEqual(
-            total, 1,
+            total,
+            1,
             "the 1024x1024 Linear should have been replaced at least once",
         )
 

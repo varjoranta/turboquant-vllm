@@ -52,6 +52,7 @@ def _try_cuda_init() -> bool:
     global _use_cuda
     try:
         from turboquant_vllm.build import build
+
         build()
         _use_cuda = True
         logger.info("TurboQuant+ using CUDA kernels")
@@ -80,8 +81,11 @@ def _get_compressor(dim: int, device: torch.device, layer_idx: int = -1) -> KVCa
 
     if key not in _compressors:
         _compressors[key] = KVCacheCompressorTorch(
-            dim, k_bits=k, v_bits=_v_bits,
-            seed=42, device=str(device),
+            dim,
+            k_bits=k,
+            v_bits=_v_bits,
+            seed=42,
+            device=str(device),
             use_cuda=_use_cuda,
             norm_correction=_norm_correction,
             use_qjl=_use_qjl,
@@ -91,7 +95,11 @@ def _get_compressor(dim: int, device: torch.device, layer_idx: int = -1) -> KVCa
         backend = "CUDA" if _use_cuda else "PyTorch"
         logger.info(
             "TurboQuant+ compressor [%s]: dim=%d K=%d-bit V=%d-bit → %.1fx compression",
-            backend, dim, _k_bits, _v_bits, stats["compression_ratio"],
+            backend,
+            dim,
+            _k_bits,
+            _v_bits,
+            stats["compression_ratio"],
         )
     return _compressors[key]
 
@@ -127,6 +135,7 @@ def _iter_slots(slot_mapping, block_size):
 # ============================================================================
 # FlashAttention patches (standard GQA/MHA)
 # ============================================================================
+
 
 def _make_patched_cache_update(original_fn):
     """Wrap do_kv_cache_update to compress K/V with TurboQuant+."""
@@ -210,6 +219,7 @@ def _make_patched_forward(original_fn):
 # receive a separate layer argument (unlike FlashAttention).
 # ============================================================================
 
+
 def _make_mla_patched_cache_update(original_fn):
     """Wrap MLA do_kv_cache_update to compress kv_c_normed with TurboQuant+.
 
@@ -270,6 +280,7 @@ def _make_mla_patched_forward(original_fn, cache_arg_idx):
 # Public API
 # ============================================================================
 
+
 def patch_vllm_attention(
     k_bits: int = 4,
     v_bits: int = 4,
@@ -323,12 +334,9 @@ def patch_vllm_attention(
 
     try:
         from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
-        FlashAttentionImpl.do_kv_cache_update = _make_patched_cache_update(
-            FlashAttentionImpl.do_kv_cache_update
-        )
-        FlashAttentionImpl.forward = _make_patched_forward(
-            FlashAttentionImpl.forward
-        )
+
+        FlashAttentionImpl.do_kv_cache_update = _make_patched_cache_update(FlashAttentionImpl.do_kv_cache_update)
+        FlashAttentionImpl.forward = _make_patched_forward(FlashAttentionImpl.forward)
         patched_backends.append("FlashAttention")
     except ImportError:
         logger.warning("FlashAttentionImpl not found, skipping FlashAttention patch")
@@ -338,23 +346,17 @@ def patch_vllm_attention(
     try:
         import inspect
         from vllm.model_executor.layers.attention.mla_attention import MLACommonImpl
-        MLACommonImpl.do_kv_cache_update = _make_mla_patched_cache_update(
-            MLACommonImpl.do_kv_cache_update
-        )
+
+        MLACommonImpl.do_kv_cache_update = _make_mla_patched_cache_update(MLACommonImpl.do_kv_cache_update)
         for method_name in ("forward_mha", "forward_mqa"):
             if hasattr(MLACommonImpl, method_name):
                 fn = getattr(MLACommonImpl, method_name)
                 params = list(inspect.signature(fn).parameters.keys())
-                cache_idx = next(
-                    (i for i, p in enumerate(params) if "cache" in p.lower()),
-                    None
-                )
+                cache_idx = next((i for i, p in enumerate(params) if "cache" in p.lower()), None)
                 if cache_idx is None:
                     logger.warning("Could not find cache param in %s, skipping", method_name)
                     continue
-                setattr(MLACommonImpl, method_name, _make_mla_patched_forward(
-                    fn, cache_idx - 1
-                ))
+                setattr(MLACommonImpl, method_name, _make_mla_patched_forward(fn, cache_idx - 1))
         patched_backends.append("MLA")
     except ImportError:
         logger.warning("MLACommonImpl not found, skipping MLA patch")
@@ -364,5 +366,7 @@ def patch_vllm_attention(
 
     logger.info(
         "TurboQuant+ patched vLLM [%s]: K=%d-bit V=%d-bit",
-        "+".join(patched_backends), k_bits, v_bits,
+        "+".join(patched_backends),
+        k_bits,
+        v_bits,
     )

@@ -8,6 +8,7 @@ Usage:
     # Step 2: Upload to HuggingFace
     python3 scripts/publish_model.py upload ./gemma4-tq3 varjosoft/gemma-4-26B-A4B-it-TQ3
 """
+
 import argparse
 import os
 import sys
@@ -67,7 +68,7 @@ library_name: transformers
 pipeline_tag: text-generation
 ---
 
-# {model_id.split('/')[-1]} (TQ{bits} Compressed)
+# {model_id.split("/")[-1]} (TQ{bits} Compressed)
 
 TurboQuant TQ{bits}-compressed version of [{model_id}](https://huggingface.co/{model_id}).
 
@@ -91,14 +92,14 @@ Quality validated on 20 multi-turn conversation scenarios scored by Llama-3.3-70
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-model = AutoModelForCausalLM.from_pretrained("{model_id.split('/')[-1]}-TQ{bits}")
-tokenizer = AutoTokenizer.from_pretrained("{model_id.split('/')[-1]}-TQ{bits}")
+model = AutoModelForCausalLM.from_pretrained("{model_id.split("/")[-1]}-TQ{bits}")
+tokenizer = AutoTokenizer.from_pretrained("{model_id.split("/")[-1]}-TQ{bits}")
 ```
 
 ### With vLLM
 
 ```bash
-vllm serve varjosoft/{model_id.split('/')[-1]}-TQ{bits}
+vllm serve varjosoft/{model_id.split("/")[-1]}-TQ{bits}
 ```
 
 ### With runtime TQ{bits} compression (~12 GB GPU memory)

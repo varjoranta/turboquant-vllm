@@ -41,6 +41,7 @@ _cuda_module = None
 def _get_torch():
     """Lazy import torch — not needed for codebook computation."""
     import torch
+
     return torch
 
 
@@ -49,6 +50,7 @@ def _get_cuda_module():
     global _cuda_module
     if _cuda_module is None:
         from turboquant_vllm.build import build
+
         _cuda_module = build()
         logger.info("TurboQuant+ CUDA extension loaded")
     return _cuda_module
@@ -183,14 +185,20 @@ class TurboQuantOps:
         # Initialize CUDA constant memory — separate K and V
         cuda = _get_cuda_module()
         cuda.init_k(
-            self._k_centroids, self._k_boundaries,
-            k_signs1.to(device), k_signs2.to(device),
-            head_dim, k_pq_bits,
+            self._k_centroids,
+            self._k_boundaries,
+            k_signs1.to(device),
+            k_signs2.to(device),
+            head_dim,
+            k_pq_bits,
         )
         cuda.init_v(
-            self._v_centroids, self._v_boundaries,
-            v_signs1.to(device), v_signs2.to(device),
-            head_dim, v_pq_bits,
+            self._v_centroids,
+            self._v_boundaries,
+            v_signs1.to(device),
+            v_signs2.to(device),
+            head_dim,
+            v_pq_bits,
         )
 
         # QJL for K cache (Algorithm 2: PolarQuant residual → sign bits)
@@ -203,7 +211,9 @@ class TurboQuantOps:
         mode = f"K={k_bits}b({'PQ' + str(k_pq_bits) + '+QJL1' if use_qjl else 'PQ' + str(k_pq_bits)}) V={v_bits}b(PQ{v_pq_bits})"
         logger.info(
             "TurboQuant+ initialized: head_dim=%d %s → %.1fx compression",
-            head_dim, mode, stats["compression_ratio"],
+            head_dim,
+            mode,
+            stats["compression_ratio"],
         )
 
     def quantize(self, vectors: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -223,30 +233,47 @@ class TurboQuantOps:
 
     def reshape_and_cache(
         self,
-        key: torch.Tensor, value: torch.Tensor,
-        key_cache: torch.Tensor, value_cache: torch.Tensor,
-        k_norms: torch.Tensor, v_norms: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        k_norms: torch.Tensor,
+        v_norms: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
         """Fused quantize + pack into paged cache. Drop-in for vLLM."""
         _get_cuda_module().reshape_and_cache(
-            key.half(), value.half(),
-            key_cache, value_cache, k_norms, v_norms, slot_mapping,
+            key.half(),
+            value.half(),
+            key_cache,
+            value_cache,
+            k_norms,
+            v_norms,
+            slot_mapping,
         )
 
     def dequant_paged_cache(
         self,
-        cache: torch.Tensor, norms: torch.Tensor,
-        output: torch.Tensor, block_table: torch.Tensor,
+        cache: torch.Tensor,
+        norms: torch.Tensor,
+        output: torch.Tensor,
+        block_table: torch.Tensor,
         seq_len: int,
     ):
         """Dequantize from paged cache to contiguous buffer."""
         _get_cuda_module().dequant_paged_cache(
-            cache, norms, output, block_table, seq_len,
+            cache,
+            norms,
+            output,
+            block_table,
+            seq_len,
         )
 
     def allocate_cache(
-        self, num_blocks: int, block_size: int, num_kv_heads: int,
+        self,
+        num_blocks: int,
+        block_size: int,
+        num_kv_heads: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Allocate paged cache tensors with correct packed dimensions.
 
@@ -254,12 +281,20 @@ class TurboQuantOps:
         K and V caches may have different packed_dim if asymmetric.
         """
         key_cache = torch.zeros(
-            num_blocks, block_size, num_kv_heads, self.k_packed_dim,
-            dtype=torch.uint8, device=self.device,
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            self.k_packed_dim,
+            dtype=torch.uint8,
+            device=self.device,
         )
         value_cache = torch.zeros(
-            num_blocks, block_size, num_kv_heads, self.v_packed_dim,
-            dtype=torch.uint8, device=self.device,
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            self.v_packed_dim,
+            dtype=torch.uint8,
+            device=self.device,
         )
         norms_shape = (num_blocks, block_size, num_kv_heads)
         k_norms = torch.zeros(norms_shape, dtype=torch.float32, device=self.device)

@@ -24,6 +24,7 @@ sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent.parent))
 # Helpers
 # ============================================================================
 
+
 def assert_close(a, b, atol=1e-4, msg=""):
     if not torch.allclose(a.float(), b.float(), atol=atol):
         diff = (a.float() - b.float()).abs().max().item()
@@ -38,9 +39,11 @@ def make_dummy_kv_cache(num_blocks=4, block_size=16, num_kv_heads=4, slot_size=6
 # 1. TurboQuantConfig
 # ============================================================================
 
+
 class TestTurboQuantConfig(unittest.TestCase):
     def test_tq3_no_qjl(self):
         from turboquant_vllm.tq_config import TurboQuantConfig
+
         c = TurboQuantConfig.from_cache_dtype("tq3", head_dim=128)
         self.assertEqual(c.total_bits, 3)
         self.assertEqual(c.mse_bits, 3)
@@ -54,6 +57,7 @@ class TestTurboQuantConfig(unittest.TestCase):
 
     def test_tq4_no_qjl(self):
         from turboquant_vllm.tq_config import TurboQuantConfig
+
         c = TurboQuantConfig.from_cache_dtype("tq4", head_dim=128)
         self.assertEqual(c.mse_bits, 4)
         self.assertEqual(c.n_centroids, 16)
@@ -62,6 +66,7 @@ class TestTurboQuantConfig(unittest.TestCase):
 
     def test_tq_k4v3(self):
         from turboquant_vllm.tq_config import TurboQuantConfig
+
         c = TurboQuantConfig.from_cache_dtype("tq_k4v3", head_dim=128)
         self.assertTrue(c.asymmetric)
         self.assertEqual(c.total_bits, 4)
@@ -77,10 +82,12 @@ class TestTurboQuantConfig(unittest.TestCase):
     def test_tq_k4v3_vs_tq4_differ(self):
         """tq_k4v3 and tq4 must produce different slot sizes (regression)."""
         from turboquant_vllm.tq_config import TurboQuantConfig
+
         tq4 = TurboQuantConfig.from_cache_dtype("tq4", head_dim=128)
         tq_k4v3 = TurboQuantConfig.from_cache_dtype("tq_k4v3", head_dim=128)
         self.assertNotEqual(
-            tq4.slot_size, tq_k4v3.slot_size,
+            tq4.slot_size,
+            tq_k4v3.slot_size,
             "tq_k4v3 must use 3-bit V storage; if this fails the asymmetric "
             "path is broken and tq_k4v3 is silently aliased to tq4.",
         )
@@ -89,6 +96,7 @@ class TestTurboQuantConfig(unittest.TestCase):
 
     def test_unknown_raises(self):
         from turboquant_vllm.tq_config import TurboQuantConfig
+
         with self.assertRaises(ValueError):
             TurboQuantConfig.from_cache_dtype("tq5", head_dim=128)
 
@@ -97,51 +105,58 @@ class TestTurboQuantConfig(unittest.TestCase):
 # 2. Centroids
 # ============================================================================
 
+
 class TestCentroids(unittest.TestCase):
     def test_lloyd_max_shape(self):
         from turboquant_vllm.tq_config import get_centroids
+
         c = get_centroids(d=8, bits=3)
         self.assertEqual(c.shape, (8,))
 
     def test_centroids_sorted(self):
         from turboquant_vllm.tq_config import get_centroids
+
         c = get_centroids(d=8, bits=3)
         self.assertTrue((c[1:] > c[:-1]).all(), "centroids must be sorted")
 
     def test_centroids_symmetric(self):
         from turboquant_vllm.tq_config import get_centroids
+
         c = get_centroids(d=8, bits=3)
         # Lloyd-Max on symmetric distribution → symmetric centroids
-        self.assertTrue(torch.allclose(c, -c.flip(0), atol=1e-5),
-                        "centroids should be symmetric around 0")
+        self.assertTrue(torch.allclose(c, -c.flip(0), atol=1e-5), "centroids should be symmetric around 0")
 
 
 # ============================================================================
 # 3. Rotation matrices
 # ============================================================================
 
+
 class TestRotationMatrices(unittest.TestCase):
     def test_rotation_orthogonal(self):
         from turboquant_vllm.tq_config import generate_rotation_matrix
+
         Pi = generate_rotation_matrix(d=64, seed=42)
         I = Pi @ Pi.T
-        self.assertTrue(torch.allclose(I, torch.eye(64), atol=1e-5),
-                        "Pi @ Pi.T should be identity")
+        self.assertTrue(torch.allclose(I, torch.eye(64), atol=1e-5), "Pi @ Pi.T should be identity")
 
     def test_rotation_deterministic(self):
         from turboquant_vllm.tq_config import generate_rotation_matrix
+
         Pi1 = generate_rotation_matrix(d=32, seed=1337)
         Pi2 = generate_rotation_matrix(d=32, seed=1337)
         self.assertTrue(torch.allclose(Pi1, Pi2), "same seed → same matrix")
 
     def test_different_seeds_different(self):
         from turboquant_vllm.tq_config import generate_rotation_matrix
+
         Pi1 = generate_rotation_matrix(d=32, seed=1)
         Pi2 = generate_rotation_matrix(d=32, seed=2)
         self.assertFalse(torch.allclose(Pi1, Pi2), "different seeds → different matrix")
 
     def test_qjl_matrix_shape(self):
         from turboquant_vllm.tq_config import generate_qjl_matrix
+
         S = generate_qjl_matrix(d=64, seed=42)
         self.assertEqual(S.shape, (64, 64))
 
@@ -150,12 +165,14 @@ class TestRotationMatrices(unittest.TestCase):
 # 4. Buffer init
 # ============================================================================
 
+
 class TestBufferInit(unittest.TestCase):
     def test_init_tq_buffers_shapes(self):
         from turboquant_vllm._vllm_plugin import _init_tq_buffers
 
         class FakeLayer:
             """Minimal nn.Module-like for register_buffer."""
+
             def register_buffer(self, name, tensor):
                 setattr(self, name, tensor)
 
@@ -177,19 +194,25 @@ class TestBufferInit(unittest.TestCase):
         _init_tq_buffers(l0, "tq3", head_size=64, prefix="model.layers.0.self_attn")
         _init_tq_buffers(l5, "tq3", head_size=64, prefix="model.layers.5.self_attn")
         # Different layer indices → different seeds → different Pi matrices
-        self.assertFalse(torch.allclose(l0._tq_Pi, l5._tq_Pi),
-                         "layers 0 and 5 should have different rotation matrices")
+        self.assertFalse(torch.allclose(l0._tq_Pi, l5._tq_Pi), "layers 0 and 5 should have different rotation matrices")
 
 
 # ============================================================================
 # 5. Store + decode round-trip (CPU)
 # ============================================================================
 
+
 class TestStoreDecodeCPU(unittest.TestCase):
     """Smoke test: compress a few K/V vectors, write to cache, read back, check MSE."""
 
     def setUp(self):
-        from turboquant_vllm.tq_config import TurboQuantConfig, generate_rotation_matrix, generate_qjl_matrix, get_centroids
+        from turboquant_vllm.tq_config import (
+            TurboQuantConfig,
+            generate_rotation_matrix,
+            generate_qjl_matrix,
+            get_centroids,
+        )
+
         self.D = 64
         self.H = 2
         self.cfg = TurboQuantConfig.from_cache_dtype("tq3", head_dim=self.D)
@@ -215,9 +238,9 @@ class TestStoreDecodeCPU(unittest.TestCase):
 
     def _make_impl(self):
         from turboquant_vllm.native_backend import TurboQuantAttentionImpl
+
         impl = TurboQuantAttentionImpl(
-            num_heads=self.H, head_size=self.D, scale=1.0 / math.sqrt(self.D),
-            num_kv_heads=self.H, kv_cache_dtype="tq3"
+            num_heads=self.H, head_size=self.D, scale=1.0 / math.sqrt(self.D), num_kv_heads=self.H, kv_cache_dtype="tq3"
         )
         # Pre-initialize tq_config (normally done in _ensure_on_device)
         impl.tq_config = self.cfg
@@ -237,16 +260,16 @@ class TestStoreDecodeCPU(unittest.TestCase):
         key = torch.randn(N, self.H, self.D)
         value = torch.randn(N, self.H, self.D)
 
-        impl._store_kv(key, value, kv_cache, slot_mapping,
-                       self.layer._tq_Pi, self.layer._tq_S, self.layer._tq_centroids)
+        impl._store_kv(
+            key, value, kv_cache, slot_mapping, self.layer._tq_Pi, self.layer._tq_S, self.layer._tq_centroids
+        )
 
         # Cache should now be non-zero in written slots
         for i in range(N):
             blk = i // 16
             off = i % 16
             slot_data = kv_cache[blk, off]  # (H, slot_size)
-            self.assertFalse(slot_data.sum() == 0,
-                             f"slot {i} should be non-zero after store")
+            self.assertFalse(slot_data.sum() == 0, f"slot {i} should be non-zero after store")
 
     def test_tq3_mse_reasonable(self):
         """TQ3 MSE on random normalized vectors should be < 0.15."""
@@ -264,8 +287,9 @@ class TestStoreDecodeCPU(unittest.TestCase):
         slot_mapping = torch.arange(N)
 
         impl = self._make_impl()
-        impl._store_kv(key, value, kv_cache, slot_mapping,
-                       self.layer._tq_Pi, self.layer._tq_S, self.layer._tq_centroids)
+        impl._store_kv(
+            key, value, kv_cache, slot_mapping, self.layer._tq_Pi, self.layer._tq_S, self.layer._tq_centroids
+        )
 
         # Manually decode one token to check quality
         # Decode slot 0: read packed key, unpack MSE indices, reconstruct
@@ -278,23 +302,26 @@ class TestStoreDecodeCPU(unittest.TestCase):
         b0 = mse_raw[0::3].int()  # (D/8,)
         b1 = mse_raw[1::3].int()
         b2 = mse_raw[2::3].int()
-        idx = torch.stack([
-            b0 & 0x7,
-            (b0 >> 3) & 0x7,
-            ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2),
-            (b1 >> 1) & 0x7,
-            (b1 >> 4) & 0x7,
-            ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1),
-            (b2 >> 2) & 0x7,
-            (b2 >> 5) & 0x7,
-        ], dim=-1).reshape(-1)[:D]
+        idx = torch.stack(
+            [
+                b0 & 0x7,
+                (b0 >> 3) & 0x7,
+                ((b0 >> 6) & 0x3) | ((b1 & 0x1) << 2),
+                (b1 >> 1) & 0x7,
+                (b1 >> 4) & 0x7,
+                ((b1 >> 7) & 0x1) | ((b2 & 0x3) << 1),
+                (b2 >> 2) & 0x7,
+                (b2 >> 5) & 0x7,
+            ],
+            dim=-1,
+        ).reshape(-1)[:D]
 
         centroids = get_centroids(D, cfg.mse_bits)
         c_vals = centroids[idx.long()]
 
         # Recover norm
         noff = mse_bytes_n
-        nd = slot[noff:noff + 2].contiguous()
+        nd = slot[noff : noff + 2].contiguous()
         vec_norm = nd.view(torch.float16).item()
 
         # Reconstruct: un-rotate c_vals back to original domain.
@@ -314,6 +341,7 @@ class TestStoreDecodeCPU(unittest.TestCase):
 # 6. Plugin registration mock test
 # ============================================================================
 
+
 class TestPluginRegistration(unittest.TestCase):
     """Test that _register_native_backend calls the right vLLM APIs."""
 
@@ -330,24 +358,28 @@ class TestPluginRegistration(unittest.TestCase):
             calls.append((backend, class_path))
             return lambda x: x
 
-        with mock.patch.dict("sys.modules", {
-            "vllm": mock.MagicMock(),
-            "vllm.v1": mock.MagicMock(),
-            "vllm.v1.attention": mock.MagicMock(),
-            "vllm.v1.attention.backends": mock.MagicMock(),
-            "vllm.v1.attention.backends.registry": mock.MagicMock(
-                AttentionBackendEnum=FakeEnum,
-                register_backend=fake_register_backend,
-            ),
-            "vllm.platforms": mock.MagicMock(),
-            "vllm.platforms.cuda": mock.MagicMock(),
-            "vllm.model_executor": mock.MagicMock(),
-            "vllm.model_executor.layers": mock.MagicMock(),
-            "vllm.model_executor.layers.attention": mock.MagicMock(),
-            "vllm.model_executor.layers.attention.attention": mock.MagicMock(),
-        }):
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "vllm": mock.MagicMock(),
+                "vllm.v1": mock.MagicMock(),
+                "vllm.v1.attention": mock.MagicMock(),
+                "vllm.v1.attention.backends": mock.MagicMock(),
+                "vllm.v1.attention.backends.registry": mock.MagicMock(
+                    AttentionBackendEnum=FakeEnum,
+                    register_backend=fake_register_backend,
+                ),
+                "vllm.platforms": mock.MagicMock(),
+                "vllm.platforms.cuda": mock.MagicMock(),
+                "vllm.model_executor": mock.MagicMock(),
+                "vllm.model_executor.layers": mock.MagicMock(),
+                "vllm.model_executor.layers.attention": mock.MagicMock(),
+                "vllm.model_executor.layers.attention.attention": mock.MagicMock(),
+            },
+        ):
             import importlib
             import turboquant_vllm._vllm_plugin as plugin
+
             importlib.reload(plugin)
 
             plugin._native_backend_registered = False
@@ -371,7 +403,7 @@ class TestPluginRegistration(unittest.TestCase):
             ("no_layer_index", 0),  # fallback
         ]
         for prefix, expected_idx in prefixes:
-            m = re.search(r'\.(\d+)\.', prefix)
+            m = re.search(r"\.(\d+)\.", prefix)
             idx = int(m.group(1)) if m else 0
             self.assertEqual(idx, expected_idx, f"prefix={prefix}")
 

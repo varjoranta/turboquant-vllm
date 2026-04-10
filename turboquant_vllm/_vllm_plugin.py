@@ -17,6 +17,7 @@ Environment variables:
     TQ_KV_V_BITS: monkey-patch mode — value bits
     TQ_KV_ROTATION: rotation mode for monkey-patch ('wht' or 'planar')
 """
+
 import functools
 import logging
 import os
@@ -24,6 +25,7 @@ import sys
 
 try:
     from vllm.logger import init_logger
+
     logger = init_logger("turboquant_vllm.plugin")
 except ImportError:
     logger = logging.getLogger("turboquant_vllm.plugin")
@@ -64,6 +66,7 @@ _native_backend_registered = False
 # STR_DTYPE_TO_TORCH_DTYPE at call time; the function wrap handles call
 # sites that have already resolved the function by name (closure-captured).
 # ---------------------------------------------------------------------------
+
 
 def _eager_patch_str_dtype_mapping() -> None:
     """Patch STR_DTYPE_TO_TORCH_DTYPE and kv_cache_dtype_str_to_dtype so
@@ -113,10 +116,7 @@ def _eager_patch_str_dtype_mapping() -> None:
 
     _tq_aware_resolver._tq_wrapped = True  # type: ignore[attr-defined]
     _tu.kv_cache_dtype_str_to_dtype = _tq_aware_resolver
-    msg = (
-        f"TurboQuant patched STR_DTYPE_TO_TORCH_DTYPE with tq3/tq4/tq_k4v3 "
-        f"(pid={os.getpid()})"
-    )
+    msg = f"TurboQuant patched STR_DTYPE_TO_TORCH_DTYPE with tq3/tq4/tq_k4v3 (pid={os.getpid()})"
     logger.info(msg)
     # Also print to stderr: vLLM's subprocess launcher sometimes runs before
     # the logging handlers are attached, and the CI timing check greps raw
@@ -154,6 +154,7 @@ def _eager_patch_cache_dtype_literal() -> None:
         return
 
     import typing as _typing
+
     existing = _typing.get_args(current)
     if all(name in existing for name in _TQ_DTYPE_NAMES):
         return  # already extended
@@ -204,7 +205,8 @@ def _eager_patch_cache_dtype_literal() -> None:
 
     logger.info(
         "TurboQuant extended CacheDType Literal with %s (pid=%d)",
-        list(_TQ_DTYPE_NAMES), os.getpid(),
+        list(_TQ_DTYPE_NAMES),
+        os.getpid(),
     )
 
 
@@ -233,12 +235,9 @@ def _tq_reset_patches_for_test() -> None:
     global _native_backend_registered
     _native_backend_registered = False
     for mod_path, cls_name, flag in (
-        ("vllm.model_executor.layers.attention.attention",
-         "AttentionLayer", "_tq_spec_patched"),
-        ("vllm.model_executor.layers.attention.attention",
-         "AttentionLayer", "_tq_buffers_patched"),
-        ("vllm.model_executor.layers.attention.mla_attention",
-         "MLAAttention", "_tq_mla_guard_patched"),
+        ("vllm.model_executor.layers.attention.attention", "AttentionLayer", "_tq_spec_patched"),
+        ("vllm.model_executor.layers.attention.attention", "AttentionLayer", "_tq_buffers_patched"),
+        ("vllm.model_executor.layers.attention.mla_attention", "MLAAttention", "_tq_mla_guard_patched"),
     ):
         try:
             mod = __import__(mod_path, fromlist=[cls_name])
@@ -260,6 +259,7 @@ def _tq_effective_head_size(cache_dtype: str, head_size: int) -> int:
     and the cached result removes the repeated-call cost.
     """
     from turboquant_vllm.tq_config import TurboQuantConfig
+
     tq_config = TurboQuantConfig.from_cache_dtype(cache_dtype, head_size)
     return tq_config.padded_slot_size // 2
 
@@ -321,6 +321,7 @@ def _register_native_backend() -> bool:
             kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
             if _is_tq_dtype(kv_cache_dtype):
                 from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
                 return [(AttentionBackendEnum.CUSTOM, 0)], {}
             return _orig_get_valid(device_capability, attn_selector_config, num_heads)
 
@@ -371,6 +372,7 @@ def _patch_cache_dtype_validation() -> None:
     """Allow tq3/tq4/tq_k4v3 as valid kv_cache_dtype values in CacheConfig."""
     try:
         import vllm.config.cache as cache_mod
+
         # Some vLLM versions have explicit validation in validate_cache_dtype
         if hasattr(cache_mod, "validate_cache_dtype"):
             _orig_validate = cache_mod.validate_cache_dtype
@@ -388,6 +390,7 @@ def _patch_cache_dtype_validation() -> None:
     # Fallback: look for the CacheConfig class validator
     try:
         from vllm.config.cache import CacheConfig
+
         if hasattr(CacheConfig, "__validators__"):
             # Remove dtype validator if it rejects unknown types
             pass
@@ -426,6 +429,7 @@ def _patch_get_kv_cache_spec() -> None:
     # (self, vllm_config). If vLLM changes this we want to fail
     # closed (skip + warn) rather than silently apply a broken patch.
     import inspect
+
     try:
         sig = inspect.signature(_orig_get_spec)
         params = list(sig.parameters.keys())
@@ -448,9 +452,7 @@ def _patch_get_kv_cache_spec() -> None:
             #   block_size * num_kv_heads * (hs + hs_v) * 1
             # = block_size * num_kv_heads * padded_slot
             # which equals the real compressed slot byte count.
-            effective_head_size = _tq_effective_head_size(
-                kv_cache_dtype, self.head_size
-            )
+            effective_head_size = _tq_effective_head_size(kv_cache_dtype, self.head_size)
             return FullAttentionSpec(
                 block_size=vllm_config.cache_config.block_size,
                 num_kv_heads=self.num_kv_heads,
@@ -463,8 +465,8 @@ def _patch_get_kv_cache_spec() -> None:
     AttentionLayer.get_kv_cache_spec = _patched_get_kv_cache_spec
     AttentionLayer._tq_spec_patched = True
     logger.info(
-        "TurboQuant patched AttentionLayer.get_kv_cache_spec for tq* dtypes "
-        "(pid=%d)", os.getpid(),
+        "TurboQuant patched AttentionLayer.get_kv_cache_spec for tq* dtypes (pid=%d)",
+        os.getpid(),
     )
 
 
@@ -509,7 +511,8 @@ def _patch_mla_fail_loud() -> None:
     MLAAttention.get_kv_cache_spec = _guarded_mla_spec
     MLAAttention._tq_mla_guard_patched = True
     logger.info(
-        "TurboQuant installed MLA fail-loud guard (pid=%d)", os.getpid(),
+        "TurboQuant installed MLA fail-loud guard (pid=%d)",
+        os.getpid(),
     )
 
 
@@ -550,7 +553,8 @@ def _patch_attention_layer_init() -> None:
     layer_cls.__init__ = _patched_init
     layer_cls._tq_buffers_patched = True
     logger.debug(
-        "TurboQuant patched %s.__init__ for TQ buffer init", layer_cls.__name__,
+        "TurboQuant patched %s.__init__ for TQ buffer init",
+        layer_cls.__name__,
     )
 
 
@@ -569,7 +573,8 @@ def _init_tq_buffers(layer, cache_dtype: str, head_size: int, prefix: str) -> No
     layer_idx = 0
     try:
         import re
-        m = re.search(r'\.(\d+)\.', prefix)
+
+        m = re.search(r"\.(\d+)\.", prefix)
         if m:
             layer_idx = int(m.group(1))
     except Exception:
@@ -590,6 +595,7 @@ def register():
     # Always register weight quantization config (needed for TQ3 checkpoint loading)
     try:
         from turboquant_vllm.vllm_quant import register as register_quant_config
+
         register_quant_config()
     except Exception as e:
         logger.debug("Could not register TurboQuant quant config: %s", e)
@@ -604,7 +610,9 @@ def register():
     if weight_bits is not None or kv_k_bits is not None:
         logger.info(
             "TurboQuant plugin activated (pid=%d, TQ_WEIGHT_BITS=%s, TQ_KV_K_BITS=%s)",
-            os.getpid(), weight_bits, kv_k_bits,
+            os.getpid(),
+            weight_bits,
+            kv_k_bits,
         )
 
     if weight_bits is None and kv_k_bits is None:
@@ -620,9 +628,9 @@ def register():
         group_size = int(os.environ.get("TQ_WEIGHT_GROUP_SIZE", "128"))
         try:
             from turboquant_vllm.weight_quant import patch_vllm_loader
+
             patch_vllm_loader(bits=bits, group_size=group_size, min_size=128)
-            logger.info("TurboQuant TQ%d-g%d weight compression registered (pid=%d)",
-                        bits, group_size, os.getpid())
+            logger.info("TurboQuant TQ%d-g%d weight compression registered (pid=%d)", bits, group_size, os.getpid())
         except ImportError as e:
             logger.warning("Failed to register weight compression: %s", e)
 
@@ -634,13 +642,15 @@ def register():
         rotation = os.environ.get("TQ_KV_ROTATION", "wht")
         try:
             from turboquant_vllm.vllm_patch import patch_vllm_attention
-            patch_vllm_attention(k_bits=k_bits, v_bits=v_bits,
-                                 norm_correction=norm_correction, rotation=rotation)
+
+            patch_vllm_attention(k_bits=k_bits, v_bits=v_bits, norm_correction=norm_correction, rotation=rotation)
             logger.info(
                 "TurboQuant K%d/V%d KV cache compression registered via monkey-patch "
                 "(pid=%d) — note: breaks with vLLM V1 CUDA graphs. "
                 "Use --kv-cache-dtype tq3 for native backend.",
-                k_bits, v_bits, os.getpid(),
+                k_bits,
+                v_bits,
+                os.getpid(),
             )
         except ImportError as e:
             logger.warning("Failed to register KV cache compression: %s", e)

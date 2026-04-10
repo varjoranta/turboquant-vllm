@@ -48,8 +48,10 @@ def _make_fake_vllm_torch_utils(orig_resolver=None, initial_dict=None):
     fake_tu = mock.MagicMock()
     fake_tu.STR_DTYPE_TO_TORCH_DTYPE = dict(initial_dict or {})
     if orig_resolver is None:
+
         def orig_resolver(d, m):  # noqa: E306
             return torch.float16
+
     fake_tu.kv_cache_dtype_str_to_dtype = orig_resolver
 
     fake_vllm.utils = fake_utils
@@ -90,12 +92,14 @@ def _temporary_method_patch(cls, method_name, flag_name, replacement):
 def _reset_plugin_state():
     """Clear all plugin patch flags so each test starts from scratch."""
     from turboquant_vllm._vllm_plugin import _tq_reset_patches_for_test
+
     _tq_reset_patches_for_test()
 
 
 # ============================================================================
 # A: STR_DTYPE dict patch
 # ============================================================================
+
 
 class TestStrDtypeDictPatch(unittest.TestCase):
     def setUp(self):
@@ -108,6 +112,7 @@ class TestStrDtypeDictPatch(unittest.TestCase):
         )
         with mock.patch.dict(sys.modules, fake_modules):
             from turboquant_vllm._vllm_plugin import _eager_patch_str_dtype_mapping
+
             _eager_patch_str_dtype_mapping()
 
         self.assertIs(fake_tu.STR_DTYPE_TO_TORCH_DTYPE["tq3"], torch.uint8)
@@ -120,6 +125,7 @@ class TestStrDtypeDictPatch(unittest.TestCase):
         fake_modules, fake_tu = _make_fake_vllm_torch_utils()
         with mock.patch.dict(sys.modules, fake_modules):
             from turboquant_vllm._vllm_plugin import _eager_patch_str_dtype_mapping
+
             _eager_patch_str_dtype_mapping()
             _eager_patch_str_dtype_mapping()
 
@@ -129,6 +135,7 @@ class TestStrDtypeDictPatch(unittest.TestCase):
 # ============================================================================
 # B: Resolver wrapper
 # ============================================================================
+
 
 class TestResolverWrapper(unittest.TestCase):
     def setUp(self):
@@ -145,6 +152,7 @@ class TestResolverWrapper(unittest.TestCase):
         fake_modules, fake_tu = _make_fake_vllm_torch_utils(orig_resolver=_orig)
         with mock.patch.dict(sys.modules, fake_modules):
             from turboquant_vllm._vllm_plugin import _eager_patch_str_dtype_mapping
+
             _eager_patch_str_dtype_mapping()
             wrapped = fake_tu.kv_cache_dtype_str_to_dtype
 
@@ -161,6 +169,7 @@ class TestResolverWrapper(unittest.TestCase):
         fake_modules, fake_tu = _make_fake_vllm_torch_utils()
         with mock.patch.dict(sys.modules, fake_modules):
             from turboquant_vllm._vllm_plugin import _eager_patch_str_dtype_mapping
+
             _eager_patch_str_dtype_mapping()
             first_wrapped = fake_tu.kv_cache_dtype_str_to_dtype
             _eager_patch_str_dtype_mapping()
@@ -173,6 +182,7 @@ class TestResolverWrapper(unittest.TestCase):
 # ============================================================================
 # Fake vLLM types for the spec-construction tests below
 # ============================================================================
+
 
 class _FakeCacheConfig:
     block_size = 16
@@ -199,6 +209,7 @@ class _FakeMLALayer:
 # C: AttentionLayer.get_kv_cache_spec patch returns remapped spec
 # ============================================================================
 
+
 class TestGetKvCacheSpecPatch(unittest.TestCase):
     def setUp(self):
         _reset_plugin_state()
@@ -212,16 +223,15 @@ class TestGetKvCacheSpecPatch(unittest.TestCase):
             self.skipTest("vLLM not installed")
 
         from turboquant_vllm._vllm_plugin import (
-            _patch_get_kv_cache_spec, _tq_effective_head_size,
+            _patch_get_kv_cache_spec,
+            _tq_effective_head_size,
         )
         from vllm.model_executor.layers.attention.attention import AttentionLayer
 
         def _baseline(self, vllm_config):
             return None
 
-        with _temporary_method_patch(
-            AttentionLayer, "get_kv_cache_spec", "_tq_spec_patched", _baseline
-        ):
+        with _temporary_method_patch(AttentionLayer, "get_kv_cache_spec", "_tq_spec_patched", _baseline):
             _patch_get_kv_cache_spec()
             fake = _FakeAttentionLayer(head_size=128, kv_cache_dtype="tq3")
             spec = AttentionLayer.get_kv_cache_spec(fake, _FakeVllmConfig())
@@ -238,6 +248,7 @@ class TestGetKvCacheSpecPatch(unittest.TestCase):
 # ============================================================================
 # D: Allocator math sanity check — real_page_size_bytes vs bf16 baseline
 # ============================================================================
+
 
 class TestFullAttentionSpecArithmetic(unittest.TestCase):
     """Verify that passing head_size = padded_slot_size // 2 and
@@ -279,9 +290,9 @@ class TestFullAttentionSpecArithmetic(unittest.TestCase):
         baseline_bytes = block_size * num_kv_heads * head_size * 2 * 2
         ratio = baseline_bytes / spec.real_page_size_bytes
         self.assertGreaterEqual(
-            ratio, min_ratio,
-            f"{cache_dtype} ratio {ratio:.2f}x < {min_ratio}x "
-            f"(compressed={expected_bytes}, bf16={baseline_bytes})",
+            ratio,
+            min_ratio,
+            f"{cache_dtype} ratio {ratio:.2f}x < {min_ratio}x (compressed={expected_bytes}, bf16={baseline_bytes})",
         )
 
     def test_tq3_capacity_ratio(self):
@@ -294,6 +305,7 @@ class TestFullAttentionSpecArithmetic(unittest.TestCase):
 # ============================================================================
 # E: get_kv_cache_spec pass-through for non-tq dtypes
 # ============================================================================
+
 
 class TestGetKvCacheSpecPassThrough(unittest.TestCase):
     def setUp(self):
@@ -315,9 +327,7 @@ class TestGetKvCacheSpecPassThrough(unittest.TestCase):
             call_count["n"] += 1
             return "BASELINE_SENTINEL"
 
-        with _temporary_method_patch(
-            AttentionLayer, "get_kv_cache_spec", "_tq_spec_patched", _baseline
-        ):
+        with _temporary_method_patch(AttentionLayer, "get_kv_cache_spec", "_tq_spec_patched", _baseline):
             _patch_get_kv_cache_spec()
             fake = _FakeAttentionLayer(head_size=128, kv_cache_dtype="auto")
             result = AttentionLayer.get_kv_cache_spec(fake, _FakeVllmConfig())
@@ -329,6 +339,7 @@ class TestGetKvCacheSpecPassThrough(unittest.TestCase):
 # ============================================================================
 # F, G: MLA fail-loud guard
 # ============================================================================
+
 
 class TestMlaFailLoudGuard(unittest.TestCase):
     def setUp(self):
@@ -347,9 +358,7 @@ class TestMlaFailLoudGuard(unittest.TestCase):
         def _baseline(self, vllm_config):
             return "MLA_BASELINE"
 
-        with _temporary_method_patch(
-            MLAAttention, "get_kv_cache_spec", "_tq_mla_guard_patched", _baseline
-        ):
+        with _temporary_method_patch(MLAAttention, "get_kv_cache_spec", "_tq_mla_guard_patched", _baseline):
             _patch_mla_fail_loud()
             fake = _FakeMLALayer(kv_cache_dtype="tq3")
             with self.assertRaises(RuntimeError) as ctx:
@@ -376,9 +385,7 @@ class TestMlaFailLoudGuard(unittest.TestCase):
             call_count["n"] += 1
             return "MLA_BASELINE"
 
-        with _temporary_method_patch(
-            MLAAttention, "get_kv_cache_spec", "_tq_mla_guard_patched", _baseline
-        ):
+        with _temporary_method_patch(MLAAttention, "get_kv_cache_spec", "_tq_mla_guard_patched", _baseline):
             _patch_mla_fail_loud()
             fake = _FakeMLALayer(kv_cache_dtype="auto")
             result = MLAAttention.get_kv_cache_spec(fake, _FakeVllmConfig())

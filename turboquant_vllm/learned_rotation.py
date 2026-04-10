@@ -105,7 +105,7 @@ def optimize_rotation(
     safe_norms = torch.where(norms > 0, norms, torch.ones_like(norms))
     w_unit = w_sample / safe_norms
 
-    best_loss = float('inf')
+    best_loss = float("inf")
     best_R = R_init.clone()
 
     for step in range(steps):
@@ -195,8 +195,7 @@ def optimize_all_rotations(
         if total_layers % 100 == 0:
             logger.info("Optimized rotations for %d layers...", total_layers)
 
-    logger.info("Rotation optimization complete: %d layers, %d unique rotations",
-                total_layers, len(rotations))
+    logger.info("Rotation optimization complete: %d layers, %d unique rotations", total_layers, len(rotations))
     return rotations
 
 
@@ -242,8 +241,7 @@ def quantize_with_learned_rotation(
     y = units @ rotation.T
 
     # Quantize
-    centroids = torch.tensor(optimal_centroids(bits, group_size),
-                             device=weight.device, dtype=torch.float32)
+    centroids = torch.tensor(optimal_centroids(bits, group_size), device=weight.device, dtype=torch.float32)
     boundaries = (centroids[:-1] + centroids[1:]) / 2
     indices = torch.searchsorted(boundaries, y.contiguous())
 
