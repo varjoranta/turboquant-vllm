@@ -115,6 +115,8 @@ patch_vllm_attention(k_bits=4, v_bits=3, norm_correction=True,
 
 Phase 2 features: **norm correction** fixes magnitude shrinkage at low bit widths. **Sink tokens** keep the first 4 positions at FP16 (attention sinks get universal attention). **Boundary layers** give the first/last 5 layers K=8-bit precision (they carry more signal through the residual stream). Validated on Gemma 4 26B: token-for-token identical output to FP16 baseline at temperature=0.
 
+> **Note on norm_correction + CUDA**: the CUDA KV store kernel does not yet apply norm correction. If you pass `norm_correction=True` the library automatically falls back to the PyTorch path and logs a warning. To use the CUDA kernel, set `norm_correction=False` (or rely on the default native-backend `--kv-cache-dtype tq3` which uses its own store path).
+
 The patch covers both standard FlashAttention (Qwen3, Llama, Mistral) and MLA attention (GLM-4.7-Flash, DeepSeek-V3) via `MLACommonImpl`.
 
 ### Standalone compression (without vLLM)
@@ -180,7 +182,7 @@ Design choices:
 - **Separate K/V codebooks** in constant memory for asymmetric bit widths.
 - **Constant memory caching**: codebook and sign vectors only re-uploaded when config changes.
 - **4-bit packing**: two indices per byte, halves cache bandwidth.
-- Targets A100 (sm_80), L40S/RTX4090 (sm_89), H100 (sm_90).
+- Targets T4/RTX 2080 (sm_75), A100 (sm_80), A10/A40/RTX 3090 (sm_86), L40S/RTX 4090 (sm_89), H100/H200 (sm_90). The PyTorch fallback runs on any CUDA GPU, CPU, or Apple MPS.
 
 ## Bandwidth argument
 
@@ -363,6 +365,45 @@ The fork includes a standalone `TurboQuantAttentionBackend` with Triton/CUDA ker
 **This library** (monkey-patch approach) remains useful for quick testing with any existing vLLM install, weight quantization, and models not yet supported by the native backend.
 
 Fork: [varjoranta/vllm-1 `turboquant-integration`](https://github.com/varjoranta/vllm-1/tree/turboquant-integration)
+
+### Plugin-side native backend: current status
+
+`turboquant_vllm` also ships a plugin-side `TurboQuantAttentionBackend` (`turboquant_vllm/native_backend.py`) that registers itself via vLLM's `register_backend(AttentionBackendEnum.CUSTOM, ...)` so that stock vLLM installs can activate it with `--kv-cache-dtype tq3/tq4/tq_k4v3` — no fork required. This path is functional and correct, but **currently runs the Python store/decode fallback**: the fused Triton store/decode kernels live in the vLLM fork (`vllm/v1/attention/ops/triton_tq_{store,decode}.py`) and have not yet been vendored into this package. Install the fork if you need the fast path; use the plugin if you want portability and can tolerate the Python overhead during evaluation.
+
+## Environment variables
+
+These env vars are read at plugin activation / config load time. Most users should leave them alone:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `TQ_KV_K_BITS` | unset | Activates monkey-patch KV compression with this many bits for K. Setting it triggers the legacy monkey-patch path instead of (or alongside) the native backend. |
+| `TQ_KV_V_BITS` | same as K | Bits for V in monkey-patch mode. |
+| `TQ_KV_ROTATION` | `wht` | Rotation used by the monkey-patch path: `wht` (Walsh-Hadamard) or `planar` (2D Givens). |
+| `TQ_KV_NORM_CORRECTION` | `1` | Enable Phase-2 norm correction for monkey-patch compression. Set `0` to disable. |
+| `TQ_WEIGHT_BITS` | unset | Activates weight quantization in the plugin with this many bits. |
+| `TQ_WEIGHT_GROUP_SIZE` | `128` | Group size for weight quantization. |
+| `TQ_VALUE_BITS` | `8` | V-cache storage bits in the native backend's `TurboQuantConfig`. Default 8 = FP8 (near-lossless). Set to 4 or 2 for more aggressive compression. Overridden by `--kv-cache-dtype tq_k4v3` which forces V=3. |
+| `TQ_NO_QJL` | `1` | Skip QJL residual correction (recommended). Set `0` to re-enable QJL — it's known to hurt quality at every bit width and is kept only for research reproduction. |
+| `TQ_PYTHON_STORE` | `0` | Force the Python store path in the native backend even if Triton kernels are available. |
+| `TQ_PYTHON_DECODE` | `0` | Force the Python decode path in the native backend. |
+| `TQ_STREAM_OVERLAP` | `0` | Launch the KV store on a secondary CUDA stream. Disabled by default — it degrades TTFT under concurrent load. |
+
+## Running tests
+
+Tests live in `tests/`. The CPU suite runs in <2 s and has no vLLM dependency. Use the `[dev]` extra to get pytest:
+
+```bash
+# From the repo root
+uv run --extra dev python3 -m pytest tests/ --ignore=tests/gpu -q
+
+# Or run individual files directly
+uv run python3 tests/test_native_backend_local.py
+uv run python3 tests/test_vllm_patch_compressor.py
+uv run python3 tests/test_checkpoint_local_path.py
+uv run python3 tests/test_cuda_norm_correction_fallback.py
+```
+
+GPU tests live in `tests/gpu/` and are meant to run on a remote instance via the `tests/gpu/run_on_verda.sh` launcher. See `tests/gpu/test_native_backend_gpu.sh` for the test script itself. Don't run GPU tests over an interactive SSH session — the launcher uses `nohup` + `disown` so the test survives connection drops.
 
 ## Serverless deployment
 
