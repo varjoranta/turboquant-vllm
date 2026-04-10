@@ -689,13 +689,34 @@ class TurboQuantAttentionImpl:
             elif mse_bits == 4 and D % 2 == 0:
                 expanded = mse_raw.unsqueeze(-1).int() >> mse_sh
                 idx = (expanded & mse_mask).reshape(seq_len, Hk, -1)[:, :, :D]
+            elif mse_bits == 3 and D % 8 == 0:
+                b0 = mse_raw[:, :, 0::3].int()
+                b1 = mse_raw[:, :, 1::3].int()
+                b2 = mse_raw[:, :, 2::3].int()
+                idx = torch.stack([
+                    b0 & 7,
+                    (b0 >> 3) & 7,
+                    ((b0 >> 6) | (b1 << 2)) & 7,
+                    (b1 >> 1) & 7,
+                    (b1 >> 4) & 7,
+                    ((b1 >> 7) | (b2 << 1)) & 7,
+                    (b2 >> 2) & 7,
+                    (b2 >> 5) & 7,
+                ], dim=-1).reshape(seq_len, Hk, D)
             else:
                 j = torch.arange(D, device=device)
                 bo = j * mse_bits
                 bi = (bo // 8).long()
                 si = (bo % 8).int()
-                b0 = mse_raw[:, :, bi]
-                idx = (b0.int() >> si) & ((1 << mse_bits) - 1)
+                b0 = mse_raw[:, :, bi].int()
+                val = (b0 >> si) & ((1 << mse_bits) - 1)
+                need_next = si + mse_bits > 8
+                if need_next.any():
+                    bi_next = (bi + 1).clamp(max=mse_raw.shape[-1] - 1)
+                    b1 = mse_raw[:, :, bi_next].int()
+                    high = (b1 << (8 - si)) & ((1 << mse_bits) - 1)
+                    val = torch.where(need_next, val | high, val)
+                idx = val
 
             c_vals = centroids[idx.long()]
 
