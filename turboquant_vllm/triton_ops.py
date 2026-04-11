@@ -343,6 +343,29 @@ def rotate_input(
 
 if HAS_TRITON:
 
+    # Autotune key deliberately excludes `batch_size`. Under vLLM 0.19
+    # piecewise CUDA graph capture, each of the ~51 capture batch sizes
+    # would otherwise trigger its own 10-config autotune run per Linear
+    # layer — that is where the 10-25 minute capture-time stall came
+    # from on the first TQ3 benchmark runs (see archive branch
+    # archive/fwht-input-cache-unmerged for the full history).
+    #
+    # Keying only on the weight-shape components makes autotune run
+    # once per distinct (out_f, in_f_padded) pair — roughly 3-5×
+    # per decoder layer instead of 150+. Measured on A100 80GB:
+    #
+    #   Qwen2.5-0.5B TQ3 startup: 310 s -> 217 s (incl. ~250 s -> ~16 s
+    #     on the piecewise CUDA graph capture phase alone, a ~16×
+    #     speedup on that phase).
+    #   Qwen3-8B TQ3 startup:    1060 s -> 382 s (~2.8× overall; the
+    #     remaining 382 s is dominated by model download + weight load
+    #     + CUDA ext build, not capture).
+    #
+    # Tradeoff: the selected config is frozen at the first batch size
+    # the kernel sees. For decoder-dominated workloads (small batch,
+    # BLOCK_M=1 optimal) this is fine because the initial capture runs
+    # at batch=1. For prefill-heavy workloads a coarser bucketed-key
+    # pass may be worth revisiting.
     @triton.autotune(
         configs=[
             triton.Config({"BLOCK_M": 1, "BLOCK_N": 128}, num_warps=4, num_stages=2),
@@ -356,7 +379,7 @@ if HAS_TRITON:
             triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=8, num_stages=2),
             triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
         ],
-        key=["batch_size", "out_f", "in_f_padded"],
+        key=["out_f", "in_f_padded"],
     )
     @triton.jit
     def _polar_fused_gemm_kernel(
@@ -490,19 +513,21 @@ def tq_fwht_input_gemm(
 ) -> torch.Tensor:
     """FWHT-on-input fused GEMM. Rotates input once, then codebook dot product.
 
-    2x+ faster than dequant-GEMM because:
+    Faster than dequant-GEMM on wide output matmuls because:
     - FWHT applied to input (1 vector) not weights (N rows)
     - No intermediate decompressed weight buffer
 
-    Previously accepted an FWHTInputCache argument that reused the rotated
-    input across Q/K/V projections (67% hit rate). Removed because the
-    fingerprint check did a D2H `.cpu()` copy, which is illegal under CUDA
-    graph capture (cudaErrorStreamCaptureUnsupported). Once the function
-    is wrapped as a `torch.library.custom_op`, the body is opaque to
-    inductor so CSE across Q/K/V projections is NOT automatic — this is
-    a real ~2x regression on the FWHT path and a capture-safe replacement
-    cache (or a rotation hoisted into its own op called once per attention
-    block) is the next optimization to revisit.
+    An earlier iteration of this module kept an FWHTInputCache that
+    reused the rotated input across Q/K/V projections. A capture-safe
+    version of that cache was tried and is preserved on the branch
+    ``archive/fwht-input-cache-unmerged``. It is NOT wired in here
+    because modern vLLM model implementations (Qwen3, Llama 3, Gemma
+    families, most transformers ≥2024) use a **fused** ``qkv_proj``
+    Linear that produces [Q|K|V] in one call. The cache's "same x
+    across three calls" premise only holds on architectures with
+    separate ``q_proj``/``k_proj``/``v_proj`` Linears — a shrinking
+    minority — so it is zero-benefit on today's benchmarks. Revisit
+    if such a model ever becomes a target.
     """
     if not HAS_TRITON:
         raise ImportError("Triton required")
