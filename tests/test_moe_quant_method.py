@@ -74,28 +74,33 @@ class _FakeTurboQuantFusedMoEMethod:
     base class requirement. The walker only calls __init__ and passes the
     instance to _replace_quant_method, so this is sufficient."""
 
-    def __init__(self, moe_config, scratch_pool):
+    def __init__(self, moe_config, w13_compressed, w2_compressed, scratch_pool):
         self.moe = moe_config
+        self.w13_compressed = w13_compressed
+        self.w2_compressed = w2_compressed
         self.scratch_pool = scratch_pool
 
 
 class _FakeScratchPool:
     """Stand-in for TurboQuantFusedMoEScratchPool.
 
-    The walker pre-allocates scratch via ensure() during install (so
-    vLLM's memory profile sees the scratch bytes before CUDA graph
-    capture). The fake just records the call args.
+    Eagerly allocates the four scratch slots from the first FusedMoE
+    layer's compressed objects — matches the real pool's contract
+    (sized up front so vLLM's memory profile sees the scratch bytes
+    before CUDA graph capture).
     """
 
-    def __init__(self):
-        self.w13 = None
-        self.w2 = None
-        self.ensure_calls = []
+    def __init__(self, w13_compressed, w2_compressed):
+        self.w13 = torch.empty(w13_compressed.shape, dtype=w13_compressed.dtype)
+        self.w2 = torch.empty(w2_compressed.shape, dtype=w2_compressed.dtype)
+        self.w13_fp32 = torch.empty(w13_compressed.shape, dtype=torch.float32)
+        self.w2_fp32 = torch.empty(w2_compressed.shape, dtype=torch.float32)
+        self.shape_w13 = w13_compressed.shape
+        self.shape_w2 = w2_compressed.shape
 
-    def ensure(self, attr, shape, dtype, device):
-        self.ensure_calls.append((attr, tuple(shape), dtype, device))
-        # Return any sentinel; the walker doesn't read it back.
-        return torch.empty(0)
+    def assert_matches(self, w13_compressed, w2_compressed) -> None:
+        assert w13_compressed.shape == self.shape_w13
+        assert w2_compressed.shape == self.shape_w2
 
 
 def _patch_moe_walker_to_use_fakes():
@@ -238,24 +243,26 @@ class TestFusedMoEWalkerInstallation(unittest.TestCase):
             self.assertIsInstance(expert._tq_w13_weight, Compressed3D)
             self.assertIsInstance(expert._tq_w2_weight, Compressed3D)
 
-    def test_walker_frees_bf16_originals(self):
-        model = self._build_model(n_layers=1)
-        expert = model.block_0
-        orig_numel = expert.w13_weight.data.numel()
-        self.assertGreater(orig_numel, 0)
-
+    def test_walker_repoints_weight_data_at_scratch_pool(self):
+        """After compression the walker must re-point w13/w2 .data at the
+        shared scratch buffers so the base unquant method reads freshly
+        dequantized values. The original bf16 allocation is freed by
+        ``_compress_3d_param`` before the re-point, so no extra copy lingers.
+        """
+        model = self._build_model(n_layers=2)
         _replace_linear_layers(model, bits=3, group_size=128)
 
-        self.assertEqual(
-            expert.w13_weight.data.numel(),
-            0,
-            "w13_weight.data should be resized to 0 after compression",
-        )
-        self.assertEqual(
-            expert.w2_weight.data.numel(),
-            0,
-            "w2_weight.data should be resized to 0 after compression",
-        )
+        pool = model.block_0.installed_method.scratch_pool
+        for i in range(2):
+            expert = getattr(model, f"block_{i}")
+            self.assertEqual(
+                expert.w13_weight.data.data_ptr(),
+                pool.w13.data_ptr(),
+                f"block_{i} w13_weight.data must alias the shared scratch buffer",
+            )
+            self.assertEqual(
+                expert.w2_weight.data.data_ptr(), pool.w2.data_ptr()
+            )
 
     def test_walker_shares_scratch_pool_across_layers(self):
         """Scratch pool must be shared across every FusedMoE in the model.

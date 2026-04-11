@@ -918,27 +918,10 @@ def _replace_linear_layers(
         total_compressed += compressed_bytes
         replacements += 1
 
-    # Phase 2: Compress MoE expert weights with real memory savings.
-    #
-    # We support two MoE layouts:
-    #
-    # (A) vLLM FusedMoE modules (the production path).
-    #     Fused 3D tensors live on a FusedMoE instance as layer.w13_weight
-    #     and layer.w2_weight. We compress each into a Compressed3D, attach
-    #     as layer._tq_w13_compressed / layer._tq_w2_compressed, free the
-    #     bf16 originals, then install TurboQuantFusedMoEMethod via
-    #     layer._replace_quant_method. From that point on, every MoE
-    #     forward call routes through our apply() which decompresses into
-    #     a pooled scratch buffer and calls fused_experts with bf16 —
-    #     everything happens inside torch.ops.vllm.moe_forward, opaque to
-    #     dynamo, safe under vLLM 0.19 fullgraph + piecewise CUDA graphs.
-    #
-    # (B) Non-FusedMoE 3D parameters (fallback for eager/non-vLLM models
-    #     or test fixtures). We compress in-place the same way, but do NOT
-    #     install forward hooks — the old hook pattern was incompatible
-    #     with vLLM 0.19's AOT compile and the FusedMoE path has replaced
-    #     it. If you need to serve a non-FusedMoE 3D-expert model through
-    #     vLLM, add support via FusedMoEMethodBase in moe_quant.py.
+    # Phase 2: Compress MoE expert weights. 2A handles vLLM FusedMoE
+    # instances (compress + install TurboQuantFusedMoEMethod); 2B is
+    # a fallback for non-FusedMoE 3D parameters in test fixtures and
+    # non-vLLM HF models.
     #
     # Expert pruning: if prune_experts > 0, find router gate weights and zero out
     # the least-important experts before compression. Zeroed rows produce norms ≈ 0
@@ -976,20 +959,14 @@ def _replace_linear_layers(
                 prune_experts * 100,
             )
 
-    # DEBUG escape hatch: set TQ_SKIP_MOE_COMPRESSION=1 to bypass Phase 2
-    # entirely (for isolating Phase 1 correctness on MoE models).
-    _skip_moe = os.environ.get("TQ_SKIP_MOE_COMPRESSION") == "1"
     _moe_compressed_count = 0
 
     # --- Phase 2A: FusedMoE quant method replacement (vLLM path) ---
-    #
-    # Walk modules looking for FusedMoE instances; for each one, compress
-    # w13_weight/w2_weight in place via _compress_3d_param (which stores
-    # the Compressed3D as layer._tq_w13_weight / layer._tq_w2_weight)
-    # and install TurboQuantFusedMoEMethod via _replace_quant_method.
-    # The shared scratch pool is allocated once and reused across every
-    # FusedMoE layer to avoid holding N × uncompressed-expert-size bytes
-    # of per-layer scratch (which would wipe the compression savings).
+    # Walk modules for FusedMoE instances; for each, compress w13/w2 in
+    # place via _compress_3d_param and install TurboQuantFusedMoEMethod
+    # via _replace_quant_method. A single scratch pool is shared across
+    # all FusedMoE layers — per-layer scratch would hold N × uncompressed
+    # expert bytes on the side and wipe the compression savings.
     try:
         from vllm.model_executor.layers.fused_moe import FusedMoE
 
@@ -1003,10 +980,12 @@ def _replace_linear_layers(
         TurboQuantFusedMoEScratchPool = None
 
     moe_scratch_pool = None
-    if FusedMoE is not None and TurboQuantFusedMoEScratchPool is not None:
-        moe_scratch_pool = TurboQuantFusedMoEScratchPool()
 
-    if FusedMoE is not None and not _skip_moe:
+    if (
+        FusedMoE is not None
+        and TurboQuantFusedMoEMethod is not None
+        and TurboQuantFusedMoEScratchPool is not None
+    ):
         for name, module in list(model.named_modules()):
             if not isinstance(module, FusedMoE):
                 continue
@@ -1050,43 +1029,34 @@ def _replace_linear_layers(
             total_compressed += w13_comp + w2_comp
             expert_layers += 2
 
-            # Eagerly allocate the shared scratch pool from the FIRST
-            # FusedMoE layer's expert shapes. Doing this here, BEFORE
-            # vLLM's memory profile + KV cache allocation + CUDA graph
-            # capture, ensures vLLM's profile pass sees the scratch
-            # bytes and sizes the KV cache accordingly.
-            #
-            # Four slots: w13 / w2 bf16 destinations + w13_fp32 /
-            # w2_fp32 intermediates for the CUDA dequant kernel.
-            if moe_scratch_pool is not None:
-                w13_c = module._tq_w13_weight
-                w2_c = module._tq_w2_weight
-                w13_buf = moe_scratch_pool.ensure(
-                    "w13", w13_c.shape, w13_c.dtype, w13_c.packed.device
-                )
-                w2_buf = moe_scratch_pool.ensure(
-                    "w2", w2_c.shape, w2_c.dtype, w2_c.packed.device
-                )
-                moe_scratch_pool.ensure(
-                    "w13_fp32", w13_c.shape, torch.float32, w13_c.packed.device
-                )
-                moe_scratch_pool.ensure(
-                    "w2_fp32", w2_c.shape, torch.float32, w2_c.packed.device
-                )
+            w13_c = module._tq_w13_weight
+            w2_c = module._tq_w2_weight
 
-                # Permanently re-point every FusedMoE layer's w13_weight.data
-                # / w2_weight.data at the shared scratch buffers. ALL layers
-                # point at the SAME physical memory — fine because only one
-                # layer runs at a time, and CUDA graph replay sees stable
-                # addresses from install time onward. apply() then just
-                # writes fresh dequantized values into those addresses.
-                module.w13_weight.data = w13_buf
-                module.w2_weight.data = w2_buf
+            # Allocate the shared scratch pool from the FIRST FusedMoE
+            # layer's expert shapes, BEFORE vLLM's memory profile + KV
+            # cache allocation + CUDA graph capture, so the profile pass
+            # sees the scratch bytes and sizes the KV cache accordingly.
+            # All subsequent layers must have matching shapes (asserted).
+            if moe_scratch_pool is None:
+                moe_scratch_pool = TurboQuantFusedMoEScratchPool(w13_c, w2_c)
+            else:
+                moe_scratch_pool.assert_matches(w13_c, w2_c)
+
+            # Permanently re-point every FusedMoE layer's w13_weight.data
+            # / w2_weight.data at the shared scratch buffers. ALL layers
+            # point at the SAME physical memory — fine because only one
+            # layer runs at a time, and CUDA graph replay sees stable
+            # addresses from install time onward. apply() then just
+            # writes fresh dequantized values into those addresses.
+            module.w13_weight.data = moe_scratch_pool.w13
+            module.w2_weight.data = moe_scratch_pool.w2
 
             # Swap the FusedMoE quant method. _replace_quant_method both
             # updates self.quant_method AND re-inits the runner so the
             # runner's captured reference points at our new method.
-            new_method = TurboQuantFusedMoEMethod(module.moe_config, moe_scratch_pool)
+            new_method = TurboQuantFusedMoEMethod(
+                module.moe_config, w13_c, w2_c, moe_scratch_pool
+            )
             module._replace_quant_method(new_method)
             _moe_compressed_count += 1
 
@@ -1148,13 +1118,11 @@ def _replace_linear_layers(
 
     if _moe_compressed_count > 0:
         logger.warning(
-            "TurboQuant compressed %d FusedMoE layer(s). The MoE compressed "
-            "forward path is only validated in eager mode — vLLM CUDA graph "
-            "capture produces incorrect output due to shared-scratch "
-            "write-after-read aliasing across layers. Pass --enforce-eager "
-            "when starting vllm serve, or set VLLM_ENFORCE_EAGER=1 in the "
-            "environment. Fix tracked on branch fix/moe-fused-quant-method; "
-            "proper fix needs a custom fused MoE kernel with inline dequant.",
+            "TurboQuant compressed %d FusedMoE layer(s). Pass "
+            "--enforce-eager to vllm serve — the MoE forward path "
+            "produces incorrect output under CUDA graph capture "
+            "(shared dequant scratch aliases across layers). See "
+            "varjoranta/turboquant-vllm#14 for status.",
             _moe_compressed_count,
         )
 

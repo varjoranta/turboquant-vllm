@@ -81,6 +81,7 @@ GLM-4.7 355B: native TQ3 checkpoint verified (14.7 GB, 4.2x compression). Full q
 | GLM-4.7-Flash 355B | **MLA** | Works (native TQ3 ckpt) | **Works** | **Only place TurboQuant KV works on MLA today** — #38479 does not cover MLA |
 | DeepSeek-V3 | **MLA** | Pending (larger disk) | Works | Same: MLA requires the legacy monkey-patch path |
 | Qwen3.5-35B-A3B | MoE + GatedDeltaNet + GQA | Works (as of varjoranta/turboquant-vllm#15) | Untested | Hybrid architecture; weight quant validated via @gaby's fixes |
+| Qwen3-30B-A3B | MoE + GQA | Works with `--enforce-eager` (see [#14](https://github.com/varjoranta/turboquant-vllm/issues/14)) | Works | Correct output under eager; dequant runs every forward so throughput is significantly reduced vs BF16. CUDA graph capture produces gibberish due to shared scratch pool aliasing |
 | gpt-oss-20b | Alternating full/sliding window + sinks | Works | Not yet | Sliding window + attention sinks need pass-through support in the KV path |
 
 **Where to get KV cache compression:**
@@ -298,6 +299,8 @@ The **3.07× live weight-memory compression** is real and matches the math. The 
 | Qwen3-8B TQ3 — total | 1060 s | 382 s | **2.8×** |
 
 Until a faster compressed-GEMM kernel lands, TQ3 is a **memory win, not a speed win**, on current vLLM 0.19. This plugin still unblocks 52 GB → 12 GB loading scenarios (Gemma 4 26B on L40S 48GB, GLM-4.7-Flash 355B MoE on A100 80GB) where BF16 simply does not fit, and the quality/PPL results below are unchanged.
+
+**MoE weight quantization under vLLM 0.19 — correctness only, eager mode.** `FusedMoE` expert weights are now compressed via a `FusedMoEMethodBase` subclass installed through `FusedMoE._replace_quant_method` ([varjoranta/turboquant-vllm#14](https://github.com/varjoranta/turboquant-vllm/issues/14)). `apply()` decompresses both `w13` / `w2` per layer per forward into a shared scratch pool and delegates to the base unquantized method. Validated end-to-end on Qwen3-30B-A3B (48 layers, 128 experts) — coherent output, first-token question-answering works. Because a single scratch pool is shared across all layers, CUDA graph capture produces gibberish (write-after-read aliasing across the captured piecewise graphs), so **`--enforce-eager` is required**. Throughput under eager mode is a small fraction of the BF16 baseline (~11 tok/s at c=16 vs ~290 tok/s BF16 on A100 80GB): every forward re-dequants every expert tensor from scratch. The proper fix is a fused compressed-MoE-GEMM kernel analogous to `moe_wna16.py` that reads packed indices inline; that work lives in the follow-up kernel track.
 
 3-bit sub-byte packing: 8 indices per 3 bytes. Norm correction: stores `original_norm / reconstruction_norm` ratio per group to fix 5-10% magnitude shrinkage at 3-bit.
 
