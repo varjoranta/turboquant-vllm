@@ -196,6 +196,12 @@ class TurboQuantWrapper(nn.Module):
         self._has_learned_rotation = rotation is not None
 
         weight = original.weight.data  # (out_features, in_features)
+        # Flatten to 2D when weight has extra leading dimensions (e.g. vLLM
+        # parallel linears or MoE expert tensors passed directly).
+        if weight.ndim > 2:
+            weight = weight.reshape(-1, weight.shape[-1])
+            self.in_features = weight.shape[-1]
+            self.out_features = weight.shape[0]
         out_dim, in_dim = weight.shape
 
         # Pad in_features to multiple of group_size
