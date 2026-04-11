@@ -217,6 +217,21 @@ def register():
             layer.tq_packed = nn.Parameter(layer.tq_packed.data.contiguous(), requires_grad=False)
             layer.tq_norms = nn.Parameter(layer.tq_norms.data.contiguous(), requires_grad=False)
 
+            # Eagerly populate the module-level rotation matrix cache so
+            # the first forward (potentially the warmup pass before CUDA
+            # graph capture) does not hit a cache miss and run a
+            # butterfly WHT inside the custom_op body. Mirrors the
+            # equivalent eager call in TurboQuantWrapper.__init__; see
+            # turboquant_vllm.triton_ops._rotation_matrix_cache for the
+            # capture-safety invariant.
+            try:
+                from turboquant_vllm.triton_ops import _get_cached_rotation_matrix
+
+                quantizer = _get_quantizer(self.group_size, self.bits, str(layer.tq_packed.device))
+                _get_cached_rotation_matrix(quantizer.signs1, quantizer.signs2, self.group_size)
+            except ImportError:
+                pass
+
         def apply(
             self,
             layer: nn.Module,

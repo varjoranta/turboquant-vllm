@@ -254,6 +254,20 @@ class TurboQuantWrapper(nn.Module):
         self.register_buffer("tq_signs2", _pq.signs2)
         self.register_buffer("tq_centroids", _pq.centroids)
 
+        # Eagerly populate the module-level rotation matrix cache so the
+        # first forward (which may be the warmup pass before CUDA graph
+        # capture) does not hit a cache miss and allocate / run a
+        # butterfly WHT inside the custom_op body at capture time. The
+        # rotation matrix is a pure function of (signs1, signs2,
+        # group_size) and fits in 64 KB for group_size=128, so building
+        # it once per wrapper instance at construction time is cheap and
+        # removes an implicit "warmup must run before capture" coupling.
+        # See turboquant_vllm.triton_ops._rotation_matrix_cache comment.
+        if _triton_available:
+            from turboquant_vllm.triton_ops import _get_cached_rotation_matrix
+
+            _get_cached_rotation_matrix(self.tq_signs1, self.tq_signs2, group_size)
+
         weight = original.weight.data  # (out_features, in_features)
         # Flatten to 2D when weight has extra leading dimensions (e.g. vLLM
         # parallel linears or MoE expert tensors passed directly).

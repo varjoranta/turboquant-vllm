@@ -296,6 +296,31 @@ def tq_fused_gemm(
 #
 # The rotation moves from N weight rows to 1 input vector.
 
+# Process-wide cache of pre-computed rotation matrices, keyed by
+# ``(id(signs1), id(signs2), group_size)``. A single model share of sign
+# vectors across all its TurboQuantWrapper instances collapses this to
+# roughly one entry per (bit_width, group_size) pair.
+#
+# **Capture-safety invariant (load-bearing)**: this cache must be
+# populated before any forward pass that might run under CUDA graph
+# capture. Cache misses trigger a ``torch.eye`` allocation plus a
+# butterfly WHT inside ``_build_rotation_matrix`` — both are capture-safe
+# via torch's caching allocator, but the extra allocations and Python-
+# side dict writes end up baked into the replayed graph structure and
+# the capture phase wall-clock. ``TurboQuantWrapper.__init__`` and
+# ``vllm_quant.TurboQuantLinearMethod.process_weights_after_loading``
+# both call ``_get_cached_rotation_matrix`` eagerly at construction /
+# post-load time so that by the time vLLM's warmup fires, every entry
+# this process needs is already in the dict. Do not remove those eager
+# calls without replacing them with an equivalent guarantee.
+#
+# **Device-migration note**: keyed on ``id(signs1)``, which changes
+# when ``nn.Module.to(device)`` replaces a registered buffer with a new
+# tensor. After a device migration the old cache entry becomes orphaned
+# (no impact on correctness — the next call rebuilds on the new device)
+# but leaks its memory footprint until process exit. Acceptable for
+# vLLM's once-per-process device placement; if a future caller hot-
+# swaps devices, migrate the eager refresh into the ``.to()`` hook.
 _rotation_matrix_cache: dict[tuple, torch.Tensor] = {}
 
 
@@ -304,6 +329,9 @@ def _get_cached_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor, grou
 
     Keyed by tensor identity (id) since sign vectors are long-lived module
     attributes. Returns W_rot such that W_rot.T applies the forward rotation.
+
+    See the module-level comment on ``_rotation_matrix_cache`` for the
+    capture-safety invariant this function participates in.
     """
     key = (id(signs1), id(signs2), group_size)
     if key not in _rotation_matrix_cache:
