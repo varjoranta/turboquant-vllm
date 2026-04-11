@@ -979,6 +979,7 @@ def _replace_linear_layers(
     # DEBUG escape hatch: set TQ_SKIP_MOE_COMPRESSION=1 to bypass Phase 2
     # entirely (for isolating Phase 1 correctness on MoE models).
     _skip_moe = os.environ.get("TQ_SKIP_MOE_COMPRESSION") == "1"
+    _moe_compressed_count = 0
 
     # --- Phase 2A: FusedMoE quant method replacement (vLLM path) ---
     #
@@ -1087,6 +1088,7 @@ def _replace_linear_layers(
             # runner's captured reference points at our new method.
             new_method = TurboQuantFusedMoEMethod(module.moe_config, moe_scratch_pool)
             module._replace_quant_method(new_method)
+            _moe_compressed_count += 1
 
     # --- Phase 2B: Non-FusedMoE 3D parameter fallback (no forward hook) ---
     for name, param in list(model.named_parameters()):
@@ -1143,6 +1145,18 @@ def _replace_linear_layers(
         # torch.cuda.empty_cache() raises AssertionError.
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    if _moe_compressed_count > 0:
+        logger.warning(
+            "TurboQuant compressed %d FusedMoE layer(s). The MoE compressed "
+            "forward path is only validated in eager mode — vLLM CUDA graph "
+            "capture produces incorrect output due to shared-scratch "
+            "write-after-read aliasing across layers. Pass --enforce-eager "
+            "when starting vllm serve, or set VLLM_ENFORCE_EAGER=1 in the "
+            "environment. Fix tracked on branch fix/moe-fused-quant-method; "
+            "proper fix needs a custom fused MoE kernel with inline dequant.",
+            _moe_compressed_count,
+        )
 
     return total
 

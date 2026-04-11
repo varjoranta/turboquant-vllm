@@ -245,26 +245,29 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13_fp32 = self._scratch_pool.w13_fp32
         w2_fp32 = self._scratch_pool.w2_fp32
 
+        # Dequantize into the shared scratch pool. ``layer.w13_weight.data``
+        # and ``layer.w2_weight.data`` were permanently re-pointed at
+        # these same scratch buffers at install time, so the base
+        # unquantized method will read the freshly dequantized values.
+        #
+        # **Known limitation**: this design requires ``--enforce-eager``.
+        # Under vLLM CUDA graph capture, all FusedMoE layers land in
+        # the same captured piece and each layer's dequant + base_method
+        # call writes to / reads from the same shared scratch address.
+        # The graph's write-after-read dependency tracking doesn't
+        # reliably serialize across layers, and the empirical result
+        # is correct eager output but gibberish under capture (tested
+        # on Qwen3-30B-A3B 2026-04-11). Cloning dequant output per
+        # layer avoids the aliasing but OOMs the captured graph's
+        # private pool (each clone gets committed, ~1.15 GB × 48
+        # layers). The proper fix is a custom fused MoE GEMM that
+        # does dequant-inside-kernel, eliminating the scratch — see
+        # moe_wna16.py as a reference implementation. Until that
+        # lands, the walker in ``_replace_linear_layers`` sets
+        # ``enforce_eager=True`` on the vLLM config when it detects
+        # any FusedMoE layer has been compressed.
         w13_compressed.decompress_into(w13_buf, fp32_scratch=w13_fp32)
         w2_compressed.decompress_into(w2_buf, fp32_scratch=w2_fp32)
-
-        # Under vLLM CUDA graph capture, all 48 FusedMoE layers land
-        # in the same captured piece, and the shared scratch pool is
-        # written+read by multiple layers' kernels. If we pass the
-        # pooled buffers directly, the graph's dependency tracking
-        # doesn't always serialize write-after-read across layers —
-        # empirical result: eager mode produces coherent output,
-        # captured mode produces gibberish. Cloning gives each layer
-        # a fresh output tensor that's only read by ONE downstream
-        # kernel (base_method.apply). The caching allocator reuses
-        # the slot across layers because each clone's lifetime ends
-        # with its fused_experts call. Net memory: one additional
-        # bf16 expert tensor live at a time, same as a per-layer
-        # scratch pool but without committing the memory.
-        w13_layer = w13_buf.clone()
-        w2_layer = w2_buf.clone()
-        layer.w13_weight.data = w13_layer
-        layer.w2_weight.data = w2_layer
 
         return layer.base_quant_method.apply(
             layer=layer,
