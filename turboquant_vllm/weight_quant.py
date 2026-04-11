@@ -976,6 +976,10 @@ def _replace_linear_layers(
                 prune_experts * 100,
             )
 
+    # DEBUG escape hatch: set TQ_SKIP_MOE_COMPRESSION=1 to bypass Phase 2
+    # entirely (for isolating Phase 1 correctness on MoE models).
+    _skip_moe = os.environ.get("TQ_SKIP_MOE_COMPRESSION") == "1"
+
     # --- Phase 2A: FusedMoE quant method replacement (vLLM path) ---
     #
     # Walk modules looking for FusedMoE instances; for each one, compress
@@ -1001,7 +1005,7 @@ def _replace_linear_layers(
     if FusedMoE is not None and TurboQuantFusedMoEScratchPool is not None:
         moe_scratch_pool = TurboQuantFusedMoEScratchPool()
 
-    if FusedMoE is not None:
+    if FusedMoE is not None and not _skip_moe:
         for name, module in list(model.named_modules()):
             if not isinstance(module, FusedMoE):
                 continue
