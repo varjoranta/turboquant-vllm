@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from turboquant_vllm.weight_quant import TurboQuantWrapper
 
 
-def _make_fake_module(weight_shape: tuple[int, ...], bias: bool = False):
+def _make_fake_module(weight_shape: tuple[int, ...], include_bias: bool = False):
     """Build a lightweight object that quacks like nn.Linear.
 
     TurboQuantWrapper.__init__ reads:
@@ -33,7 +33,7 @@ def _make_fake_module(weight_shape: tuple[int, ...], bias: bool = False):
         weight=weight,
         in_features=weight_shape[-1],
         out_features=weight_shape[-2],
-        bias=nn.Parameter(torch.randn(weight_shape[-2])) if bias else None,
+        bias=nn.Parameter(torch.randn(weight_shape[-2])) if include_bias else None,
     )
     return mod
 
