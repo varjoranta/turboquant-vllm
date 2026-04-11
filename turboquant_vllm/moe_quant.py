@@ -252,19 +252,13 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13_fp32 = self._scratch_pool.w13_fp32
         w2_fp32 = self._scratch_pool.w2_fp32
 
-        # Dequantize into the shared scratch pool. Subsequent layers
-        # will overwrite the same memory, but only after this layer's
-        # fused_experts read completes (CUDA graph node dependency
-        # tracks the read-after-write between dequant and GEMM).
+        # Dequantize into the shared scratch pool. ``layer.w13_weight.data``
+        # and ``layer.w2_weight.data`` were permanently re-pointed at
+        # these same scratch buffers at install time (see
+        # weight_quant._replace_linear_layers Phase 2A), so the base
+        # method will read from whatever we've just written here.
         w13_compressed.decompress_into(w13_buf, fp32_scratch=w13_fp32)
         w2_compressed.decompress_into(w2_buf, fp32_scratch=w2_fp32)
-
-        # Re-point the layer's .data slots at the scratch. The base
-        # UnquantizedFusedMoEMethod.apply reads `layer.w13_weight` and
-        # `layer.w2_weight` — we make those point at the freshly
-        # decompressed bf16 tensors in the shared pool.
-        layer.w13_weight.data = w13_buf
-        layer.w2_weight.data = w2_buf
 
         return layer.base_quant_method.apply(
             layer=layer,

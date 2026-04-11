@@ -1049,26 +1049,34 @@ def _replace_linear_layers(
             # FusedMoE layer's expert shapes. Doing this here, BEFORE
             # vLLM's memory profile + KV cache allocation + CUDA graph
             # capture, ensures vLLM's profile pass sees the scratch
-            # bytes and sizes the KV cache accordingly. Lazy allocation
-            # in apply() races with profile/capture and produced OOM
-            # at capture time on Qwen3-30B-A3B.
+            # bytes and sizes the KV cache accordingly.
             #
             # Four slots: w13 / w2 bf16 destinations + w13_fp32 /
-            # w2_fp32 intermediates for the CUDA dequant kernel. The
-            # fp32 intermediates are critical to pre-allocate — without
-            # pooling, they would get re-allocated inside every
-            # captured graph piece and blow the KV-cache budget.
+            # w2_fp32 intermediates for the CUDA dequant kernel.
             if moe_scratch_pool is not None:
                 w13_c = module._tq_w13_weight
                 w2_c = module._tq_w2_weight
-                moe_scratch_pool.ensure("w13", w13_c.shape, w13_c.dtype, w13_c.packed.device)
-                moe_scratch_pool.ensure("w2", w2_c.shape, w2_c.dtype, w2_c.packed.device)
+                w13_buf = moe_scratch_pool.ensure(
+                    "w13", w13_c.shape, w13_c.dtype, w13_c.packed.device
+                )
+                w2_buf = moe_scratch_pool.ensure(
+                    "w2", w2_c.shape, w2_c.dtype, w2_c.packed.device
+                )
                 moe_scratch_pool.ensure(
                     "w13_fp32", w13_c.shape, torch.float32, w13_c.packed.device
                 )
                 moe_scratch_pool.ensure(
                     "w2_fp32", w2_c.shape, torch.float32, w2_c.packed.device
                 )
+
+                # Permanently re-point every FusedMoE layer's w13_weight.data
+                # / w2_weight.data at the shared scratch buffers. ALL layers
+                # point at the SAME physical memory — fine because only one
+                # layer runs at a time, and CUDA graph replay sees stable
+                # addresses from install time onward. apply() then just
+                # writes fresh dequantized values into those addresses.
+                module.w13_weight.data = w13_buf
+                module.w2_weight.data = w2_buf
 
             # Swap the FusedMoE quant method. _replace_quant_method both
             # updates self.quant_method AND re-inits the runner so the
