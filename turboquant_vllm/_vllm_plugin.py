@@ -303,8 +303,8 @@ def _register_native_backend() -> bool:
     # Patch CudaPlatform.get_valid_backends to route tq* → CUSTOM.
     # It's a @classmethod on the class; our replacement must be wrapped in
     # classmethod() too or vLLM's call path crashes with "missing cls".
-    # Accessing the original via the class gives a bound method, so
-    # _orig_get_valid(...) below can be called without passing cls.
+    # We unwrap the current classmethod via __func__ when available and
+    # call the original function explicitly with cls below.
     try:
         import inspect
 
