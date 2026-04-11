@@ -50,7 +50,9 @@ def _is_tq_dtype(v) -> bool:
 def _is_duplicate_backend_registration_error(exc: Exception) -> bool:
     """Heuristic for vLLM duplicate backend registration errors."""
     msg = str(exc).lower()
-    return ("already" in msg and "register" in msg) or ("already exists" in msg and "backend" in msg)
+    if "backend" not in msg and "custom" not in msg:
+        return False
+    return "already registered" in msg or "already exists" in msg
 
 
 _patched = False
