@@ -197,42 +197,66 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         Runs inside ``torch.ops.vllm.moe_forward`` which is opaque to
         dynamo, so the pybind11 ``weight_dequant_3d`` call inside
         ``decompress_into`` is safe here.
-        """
-        import sys as _sys
-        import torch as _torch
 
+        **Delegation strategy**: instead of calling ``fused_experts``
+        directly with ``quant_config=None`` (which goes through an
+        easily-stale unquantized codepath), we populate the original
+        ``layer.w13_weight.data`` / ``layer.w2_weight.data`` buffers
+        with freshly-decompressed bf16 expert tensors and then call the
+        original ``UnquantizedFusedMoEMethod.apply()`` captured as
+        ``layer.base_quant_method`` during ``FusedMoE.__init__``. This
+        ensures we walk the exact same code path the unquantized BF16
+        benchmark runs — including any ``self.kernel.apply`` /
+        activation / routing specialization that ``fused_experts``
+        might not cover.
+        """
         w13_compressed = layer._tq_w13_weight
         w2_compressed = layer._tq_w2_weight
 
-        # DEBUG: fresh allocation per call (no shared scratch pool),
-        # to rule out CUDA-graph aliasing between layers. Reverts to
-        # pool-based allocation once the correctness issue is pinned.
-        w13_buf = w13_compressed.decompress()
-        w2_buf = w2_compressed.decompress()
+        # Lazily re-materialize layer.w13_weight.data / layer.w2_weight.data
+        # as shaped bf16 tensors the first time apply() runs. This reuses
+        # one allocation per layer, which is the same memory footprint as
+        # keeping the bf16 weights resident — the compression story is
+        # about **initialization** memory pressure (bf16 checkpoint fits
+        # on disk and loads then frees) more than runtime memory in this
+        # delegation design. Future optimization: move decompress into a
+        # shared scratch pool and back-patch .data to point at the pool.
+        if layer.w13_weight.data.numel() == 0:
+            layer.w13_weight.data = torch.empty(
+                w13_compressed.shape,
+                dtype=w13_compressed.dtype,
+                device=w13_compressed.packed.device,
+            )
+            layer.w2_weight.data = torch.empty(
+                w2_compressed.shape,
+                dtype=w2_compressed.dtype,
+                device=w2_compressed.packed.device,
+            )
 
-        # Log first few calls with norm + sanity stats
+        # Dequantize in place into the layer's own .data slot.
+        w13_compressed.decompress_into(layer.w13_weight.data)
+        w2_compressed.decompress_into(layer.w2_weight.data)
+
+        import sys as _sys
         if not getattr(self, "_debug_n", 0):
             self._debug_n = 0
         if self._debug_n < 4:
             _sys.stderr.write(
                 f"[TQ_APPLY #{self._debug_n}] x.shape={tuple(x.shape)} "
                 f"x.norm={x.float().norm().item():.3f} "
-                f"w13_buf.norm={w13_buf.float().norm().item():.3f} "
-                f"w13_buf.isnan={_torch.isnan(w13_buf).any().item()} "
-                f"w2_buf.norm={w2_buf.float().norm().item():.3f}\n"
+                f"w13.data.norm={layer.w13_weight.data.float().norm().item():.3f} "
+                f"w2.data.norm={layer.w2_weight.data.float().norm().item():.3f} "
+                f"base_method={type(layer.base_quant_method).__name__}\n"
             )
             _sys.stderr.flush()
             self._debug_n += 1
 
-        return fused_experts(
-            x,
-            w13_buf,
-            w2_buf,
+        # Delegate to the original UnquantizedFusedMoEMethod captured
+        # as base_quant_method during FusedMoE.__init__.
+        return layer.base_quant_method.apply(
+            layer=layer,
+            x=x,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
-            inplace=not self.moe.disable_inplace,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
-            quant_config=None,
+            shared_experts_input=shared_experts_input,
         )

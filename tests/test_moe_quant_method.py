@@ -59,9 +59,14 @@ class _FakeFusedMoE(nn.Module):
         )
         self.moe_config = _FakeMoeConfig()
         self.installed_method = None
+        # Match vLLM FusedMoE's public surface just enough for the walker's
+        # debug-logging path to do type(self.quant_method).__name__.
+        self.quant_method = types.SimpleNamespace()
 
     def _replace_quant_method(self, method):
         self.installed_method = method
+        self.quant_method = method
+        self.runner = types.SimpleNamespace(quant_method=method)
 
 
 class _FakeTurboQuantFusedMoEMethod:
