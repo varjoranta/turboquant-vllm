@@ -1067,7 +1067,17 @@ def _replace_linear_layers(
             # updates self.quant_method AND re-inits the runner so the
             # runner's captured reference points at our new method.
             new_method = TurboQuantFusedMoEMethod(module.moe_config, moe_scratch_pool)
+            import sys as _sys
+            _sys.stderr.write(
+                f"[TQ_WALKER] pre-swap {name}: quant_method={type(module.quant_method).__name__}\n"
+            )
+            _sys.stderr.flush()
             module._replace_quant_method(new_method)
+            _sys.stderr.write(
+                f"[TQ_WALKER] post-swap {name}: quant_method={type(module.quant_method).__name__} "
+                f"runner.quant_method={type(module.runner.quant_method).__name__}\n"
+            )
+            _sys.stderr.flush()
 
     # --- Phase 2B: Non-FusedMoE 3D parameter fallback (no forward hook) ---
     for name, param in list(model.named_parameters()):

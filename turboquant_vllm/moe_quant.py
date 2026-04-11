@@ -198,6 +198,10 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         dynamo, so the pybind11 ``weight_dequant_3d`` call inside
         ``decompress_into`` is safe here.
         """
+        import sys as _sys
+        _sys.stderr.write(f"[TQ_APPLY] called, x.shape={tuple(x.shape)}\n")
+        _sys.stderr.flush()
+
         w13_compressed = layer._tq_w13_weight
         w2_compressed = layer._tq_w2_weight
 
