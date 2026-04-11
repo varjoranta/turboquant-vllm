@@ -549,12 +549,16 @@ def tq_fwht_input_gemm(
     2x+ faster than dequant-GEMM because:
     - FWHT applied to input (1 vector) not weights (N rows)
     - No intermediate decompressed weight buffer
-    - FWHT cacheable across Q/K/V projections (67% cache hit rate)
 
     Args:
-        cache: Optional per-model FWHTInputCache. Defaults to the global
-               singleton. Pass a dedicated instance for multi-model or
-               multi-threaded inference to avoid stale cache hits.
+        cache: Ignored. Previously held a host-side cache keyed on
+               x.data_ptr() + content fingerprint to reuse rotated input
+               across Q/K/V projections. The fingerprint did a D2H .cpu()
+               copy, which is illegal under CUDA graph capture
+               (cudaErrorStreamCaptureUnsupported). Inductor CSEs the
+               repeated rotation calls across Q/K/V anyway when the graph
+               is compiled, so the cache is no longer worth its
+               capture-safety risk.
     """
     if not HAS_TRITON:
         raise ImportError("Triton required")
@@ -572,13 +576,7 @@ def tq_fwht_input_gemm(
     if K != padded_K:
         raise ValueError(f"K={K} not aligned with group_size={group_size}, expected {padded_K}")
 
-    input_cache = cache if cache is not None else _fwht_input_cache
-    cached = input_cache.get(x)
-    if cached is not None:
-        x_rot = cached
-    else:
-        x_rot = rotate_input(x.float(), signs1, signs2, group_size)
-        input_cache.put(x, x_rot)
+    x_rot = rotate_input(x.float(), signs1, signs2, group_size)
 
     output = torch.empty(M, N, dtype=x.dtype, device=x.device)
 
