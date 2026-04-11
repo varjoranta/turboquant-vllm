@@ -329,7 +329,14 @@ def _register_native_backend() -> bool:
                         attn_selector_config = args[idx]
                 if attn_selector_config is None:
                     candidates = [a for a in args if hasattr(a, "kv_cache_dtype")]
-                    attn_selector_config = candidates[0] if len(candidates) == 1 else None
+                    if len(candidates) == 1:
+                        logger.debug(
+                            "TurboQuant selector patch used kv_cache_dtype fallback arg detection; "
+                            "consider updating signature mapping for this vLLM version."
+                        )
+                        attn_selector_config = candidates[0]
+                    else:
+                        attn_selector_config = None
                 kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
                 if _is_tq_dtype(kv_cache_dtype):
                     from vllm.v1.attention.backends.registry import AttentionBackendEnum
