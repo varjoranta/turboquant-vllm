@@ -408,7 +408,7 @@ This package **no longer ships a `TurboQuantAttentionBackend` or patches vLLM's 
 
 What remains here is the **legacy monkey-patch path** (`patch_vllm_attention` / `TQ_KV_K_BITS=...`). This is the only place in the ecosystem today where TurboQuant KV compression works on **MLA models** (GLM-4.7-Flash, DeepSeek-V3) — #38479 is scoped to standard full-attention and uniform sliding-window models. Once upstream adds MLA support, this path will also be retired. Until then it's the production story for MLA users.
 
-Deprecated path: early versions of the README pointed users at `varjoranta/vllm-1 turboquant-integration` as a "fork with Triton kernels". That fork is obsolete and its Triton kernels produce broken output when invoked through vLLM's real integration. Don't use it. If you need the pre-upstream Triton path, use Vibhav's branch above.
+Deprecated path: early versions of the README pointed users at `varjoranta/vllm-1 turboquant-integration` as a "fork with Triton kernels". That fork has been **deleted** as of 2026-04-11 — its kernels produced broken output end-to-end when invoked through vLLM's real integration (gibberish generation + 10× slowdown vs the Python fallback, validated on both A100 sm_80 and RTX 6000 Ada sm_89). If you have an old clone, discard it. For the pre-upstream Triton path, use @vibhavagarwal5's branch above.
 
 ## Environment variables
 

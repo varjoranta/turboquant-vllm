@@ -215,10 +215,14 @@ def tq_fused_gemm(
     if not HAS_TRITON:
         raise ImportError("Triton required for fused GEMM")
 
-    # Handle 3D input (batch, seq, hidden) from transformers
+    # Handle both 2D (M, K) and 3D (B, L, K) input uniformly. vLLM 0.19
+    # fullgraph dynamo can't handle a runtime-conditional reshape here:
+    # it traces BOTH branches of `if x.dim() > 2`, and the else branch
+    # (where x is assumed 2D) crashes on the downstream `M, K = x.shape`
+    # when the actual input is 3D. Unconditional reshape is a no-op for
+    # already-2D input and gives dynamo a single straight-line trace.
     orig_shape = x.shape
-    if x.dim() > 2:
-        x = x.reshape(-1, x.shape[-1])
+    x = x.reshape(-1, x.shape[-1])
 
     M, K = x.shape
     N = norms.shape[0]
@@ -555,9 +559,10 @@ def tq_fwht_input_gemm(
     if not HAS_TRITON:
         raise ImportError("Triton required")
 
+    # Unconditional reshape for dynamo-fullgraph-compatibility — see
+    # tq_fused_gemm above for the full explanation.
     orig_shape = x.shape
-    if x.dim() > 2:
-        x = x.reshape(-1, x.shape[-1])
+    x = x.reshape(-1, x.shape[-1])
 
     M, K = x.shape
     N = norms.shape[0]
