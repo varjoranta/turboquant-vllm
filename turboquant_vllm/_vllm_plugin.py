@@ -47,6 +47,12 @@ def _is_tq_dtype(v) -> bool:
     return isinstance(v, str) and v in _TQ_DTYPE_NAMES
 
 
+def _is_duplicate_backend_registration_error(exc: Exception) -> bool:
+    """Heuristic for vLLM duplicate backend registration errors."""
+    msg = str(exc).lower()
+    return ("already" in msg and "register" in msg) or ("already exists" in msg and "backend" in msg)
+
+
 _patched = False
 _native_backend_registered = False
 
@@ -286,8 +292,11 @@ def _register_native_backend() -> bool:
         )
         logger.info("TurboQuant native backend registered as CUSTOM (pid=%d)", os.getpid())
     except Exception as e:
-        logger.warning("Failed to register TurboQuant native backend: %s", e)
-        return False
+        if _is_duplicate_backend_registration_error(e):
+            logger.info("TurboQuant native backend already registered, continuing (pid=%d)", os.getpid())
+        else:
+            logger.warning("Failed to register TurboQuant native backend: %s", e)
+            return False
 
     # Patch CudaPlatform.get_valid_backends to route tq* → CUSTOM.
     # It's a @classmethod on the class; our replacement must be wrapped in
@@ -297,18 +306,25 @@ def _register_native_backend() -> bool:
     try:
         from vllm.platforms.cuda import CudaPlatform
 
-        _orig_get_valid = CudaPlatform.get_valid_backends
+        current_get_valid = CudaPlatform.get_valid_backends
+        current_fn = getattr(current_get_valid, "__func__", current_get_valid)
+        if not getattr(current_fn, "_tq_wrapped", False):
+            _orig_get_valid = current_get_valid
 
-        def _tq_get_valid_backends(cls, device_capability, attn_selector_config, num_heads=None):
-            kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
-            if _is_tq_dtype(kv_cache_dtype):
-                from vllm.v1.attention.backends.registry import AttentionBackendEnum
+            def _tq_get_valid_backends(cls, *args, **kwargs):
+                attn_selector_config = kwargs.get("attn_selector_config")
+                if attn_selector_config is None and len(args) >= 2:
+                    attn_selector_config = args[1]
+                kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
+                if _is_tq_dtype(kv_cache_dtype):
+                    from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-                return [(AttentionBackendEnum.CUSTOM, 0)], {}
-            return _orig_get_valid(device_capability, attn_selector_config, num_heads)
+                    return [(AttentionBackendEnum.CUSTOM, 0)], {}
+                return _orig_get_valid(*args, **kwargs)
 
-        CudaPlatform.get_valid_backends = classmethod(_tq_get_valid_backends)
-        logger.debug("TurboQuant patched CudaPlatform.get_valid_backends")
+            _tq_get_valid_backends._tq_wrapped = True  # type: ignore[attr-defined]
+            CudaPlatform.get_valid_backends = classmethod(_tq_get_valid_backends)
+            logger.debug("TurboQuant patched CudaPlatform.get_valid_backends")
     except Exception as e:
         logger.warning("Could not patch CudaPlatform.get_valid_backends: %s", e)
 
