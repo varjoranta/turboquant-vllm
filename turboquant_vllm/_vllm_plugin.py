@@ -315,7 +315,9 @@ def _register_native_backend() -> bool:
         if not getattr(current_fn, "_tq_wrapped", False):
             _orig_get_valid_fn = current_fn
             try:
-                param_names = list(inspect.signature(_orig_get_valid_fn).parameters.keys())[1:]
+                param_names = list(inspect.signature(_orig_get_valid_fn).parameters.keys())
+                if param_names and param_names[0] in ("cls", "self"):
+                    param_names = param_names[1:]
             except (TypeError, ValueError):
                 param_names = []
 
@@ -326,7 +328,8 @@ def _register_native_backend() -> bool:
                     if idx < len(args):
                         attn_selector_config = args[idx]
                 if attn_selector_config is None:
-                    attn_selector_config = next((a for a in args if hasattr(a, "kv_cache_dtype")), None)
+                    candidates = [a for a in args if hasattr(a, "kv_cache_dtype")]
+                    attn_selector_config = candidates[0] if len(candidates) == 1 else None
                 kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
                 if _is_tq_dtype(kv_cache_dtype):
                     from vllm.v1.attention.backends.registry import AttentionBackendEnum
