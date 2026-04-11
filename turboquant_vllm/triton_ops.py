@@ -542,7 +542,6 @@ def tq_fwht_input_gemm(
     group_size: int = 128,
     bits: int = 4,
     bias: torch.Tensor | None = None,
-    cache: FWHTInputCache | None = None,
 ) -> torch.Tensor:
     """FWHT-on-input fused GEMM. Rotates input once, then codebook dot product.
 
@@ -550,15 +549,15 @@ def tq_fwht_input_gemm(
     - FWHT applied to input (1 vector) not weights (N rows)
     - No intermediate decompressed weight buffer
 
-    Args:
-        cache: Ignored. Previously held a host-side cache keyed on
-               x.data_ptr() + content fingerprint to reuse rotated input
-               across Q/K/V projections. The fingerprint did a D2H .cpu()
-               copy, which is illegal under CUDA graph capture
-               (cudaErrorStreamCaptureUnsupported). Inductor CSEs the
-               repeated rotation calls across Q/K/V anyway when the graph
-               is compiled, so the cache is no longer worth its
-               capture-safety risk.
+    Previously accepted an FWHTInputCache argument that reused the rotated
+    input across Q/K/V projections (67% hit rate). Removed because the
+    fingerprint check did a D2H `.cpu()` copy, which is illegal under CUDA
+    graph capture (cudaErrorStreamCaptureUnsupported). Once the function
+    is wrapped as a `torch.library.custom_op`, the body is opaque to
+    inductor so CSE across Q/K/V projections is NOT automatic — this is
+    a real ~2x regression on the FWHT path and a capture-safe replacement
+    cache (or a rotation hoisted into its own op called once per attention
+    block) is the next optimization to revisit.
     """
     if not HAS_TRITON:
         raise ImportError("Triton required")
@@ -706,7 +705,7 @@ try:
 
     def tq_fwht_input_gemm(  # type: ignore[no-redef]
         x, packed_weight, norms, signs1, signs2, centroids,
-        group_size=128, bits=4, bias=None, cache=None,  # cache kwarg ignored in op path
+        group_size=128, bits=4, bias=None,
     ):
         return torch.ops.turboquant.tq_fwht_input_gemm(
             x, packed_weight, norms, signs1, signs2, centroids,
