@@ -20,7 +20,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from turboquant_vllm.weight_quant import TurboQuantWrapper
 
 
-def _make_fake_module(weight_shape: tuple[int, ...], include_bias: bool = False):
+def _make_fake_module(
+    weight_shape: tuple[int, ...],
+    include_bias: bool = False,
+    bias_shape: tuple[int, ...] | None = None,
+):
     """Build a lightweight object that quacks like nn.Linear.
 
     TurboQuantWrapper.__init__ reads:
@@ -29,11 +33,16 @@ def _make_fake_module(weight_shape: tuple[int, ...], include_bias: bool = False)
     We construct a SimpleNamespace that provides all four.
     """
     weight = nn.Parameter(torch.randn(*weight_shape))
+    if include_bias:
+        shape = bias_shape if bias_shape is not None else (weight_shape[-2],)
+        bias = nn.Parameter(torch.randn(*shape))
+    else:
+        bias = None
     mod = SimpleNamespace(
         weight=weight,
         in_features=weight_shape[-1],
         out_features=weight_shape[-2],
-        bias=nn.Parameter(torch.randn(weight_shape[-2])) if include_bias else None,
+        bias=bias,
     )
     return mod
 
@@ -64,6 +73,20 @@ class TestWrapperNdWeight(unittest.TestCase):
         with torch.no_grad():
             y = wrapper(x)
         self.assertEqual(y.shape, (2, 4 * 256))
+
+    def test_3d_weight_with_multidim_bias_is_flattened(self):
+        """A multidimensional bias matching leading weight dims should work."""
+        mod = _make_fake_module((4, 256, 128), include_bias=True, bias_shape=(4, 256))
+        mod.bias.data = torch.arange(4 * 256, dtype=torch.float32).reshape(4, 256)
+        wrapper = TurboQuantWrapper(mod, bits=4, group_size=128)
+
+        x = torch.zeros(1, 128)
+        with torch.no_grad():
+            y = wrapper(x)
+
+        self.assertEqual(wrapper.bias.shape, (4 * 256,))
+        self.assertEqual(y.shape, (1, 4 * 256))
+        self.assertTrue(torch.allclose(y[0], wrapper.bias, atol=1e-6))
 
     def test_2d_weight_unchanged(self):
         """Normal 2-D weights must still work (no regression)."""
