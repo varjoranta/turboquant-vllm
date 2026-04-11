@@ -1042,6 +1042,27 @@ def _replace_linear_layers(
             total_compressed += w13_comp + w2_comp
             expert_layers += 2
 
+            # Eagerly allocate the shared scratch pool from the FIRST
+            # FusedMoE layer's expert shapes. Doing this here, BEFORE
+            # vLLM's memory profile + KV cache allocation + CUDA graph
+            # capture, ensures vLLM's profile pass sees the scratch
+            # bytes and sizes the KV cache accordingly. Lazy allocation
+            # in apply() races with profile/capture and produced OOM
+            # at capture time on Qwen3-30B-A3B.
+            if moe_scratch_pool is not None:
+                moe_scratch_pool.ensure(
+                    "w13",
+                    module._tq_w13_weight.shape,
+                    module._tq_w13_weight.dtype,
+                    module._tq_w13_weight.packed.device,
+                )
+                moe_scratch_pool.ensure(
+                    "w2",
+                    module._tq_w2_weight.shape,
+                    module._tq_w2_weight.dtype,
+                    module._tq_w2_weight.packed.device,
+                )
+
             # Swap the FusedMoE quant method. _replace_quant_method both
             # updates self.quant_method AND re-inits the runner so the
             # runner's captured reference points at our new method.

@@ -75,11 +75,22 @@ class _FakeTurboQuantFusedMoEMethod:
 
 
 class _FakeScratchPool:
-    """Stand-in for TurboQuantFusedMoEScratchPool."""
+    """Stand-in for TurboQuantFusedMoEScratchPool.
+
+    The walker pre-allocates scratch via ensure() during install (so
+    vLLM's memory profile sees the scratch bytes before CUDA graph
+    capture). The fake just records the call args.
+    """
 
     def __init__(self):
         self.w13 = None
         self.w2 = None
+        self.ensure_calls = []
+
+    def ensure(self, attr, shape, dtype, device):
+        self.ensure_calls.append((attr, tuple(shape), dtype, device))
+        # Return any sentinel; the walker doesn't read it back.
+        return torch.empty(0)
 
 
 def _patch_moe_walker_to_use_fakes():
