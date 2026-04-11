@@ -242,23 +242,29 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             w2_compressed.dtype,
             w2_compressed.packed.device,
         )
-
-        # Pass the pooled fp32 intermediates through to the dequant
-        # kernel. Without pooling, ``decompress_into`` would call
-        # ``torch.empty(..., dtype=fp32)`` per call, and under CUDA
-        # graph capture every one of those ephemerals gets baked into
-        # the captured graph memory footprint — for Qwen3-30B-A3B
-        # that was ~2 GB over the KV-cache budget.
         w13_fp32 = self._scratch_pool.w13_fp32
         w2_fp32 = self._scratch_pool.w2_fp32
 
-        # Dequantize into the shared scratch pool. ``layer.w13_weight.data``
-        # and ``layer.w2_weight.data`` were permanently re-pointed at
-        # these same scratch buffers at install time (see
-        # weight_quant._replace_linear_layers Phase 2A), so the base
-        # method will read from whatever we've just written here.
         w13_compressed.decompress_into(w13_buf, fp32_scratch=w13_fp32)
         w2_compressed.decompress_into(w2_buf, fp32_scratch=w2_fp32)
+
+        # Under vLLM CUDA graph capture, all 48 FusedMoE layers land
+        # in the same captured piece, and the shared scratch pool is
+        # written+read by multiple layers' kernels. If we pass the
+        # pooled buffers directly, the graph's dependency tracking
+        # doesn't always serialize write-after-read across layers —
+        # empirical result: eager mode produces coherent output,
+        # captured mode produces gibberish. Cloning gives each layer
+        # a fresh output tensor that's only read by ONE downstream
+        # kernel (base_method.apply). The caching allocator reuses
+        # the slot across layers because each clone's lifetime ends
+        # with its fused_experts call. Net memory: one additional
+        # bf16 expert tensor live at a time, same as a per-layer
+        # scratch pool but without committing the memory.
+        w13_layer = w13_buf.clone()
+        w2_layer = w2_buf.clone()
+        layer.w13_weight.data = w13_layer
+        layer.w2_weight.data = w2_layer
 
         return layer.base_quant_method.apply(
             layer=layer,
