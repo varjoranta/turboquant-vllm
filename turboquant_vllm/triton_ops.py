@@ -321,14 +321,34 @@ class FWHTInputCache:
     rotated tensor on the 2nd and 3rd call, cutting the rotation work
     by ~67% across the block.
 
-    **Capture safety**: the cache key is `(data_ptr, shape, dtype,
-    version)`, all pure host-side metadata reads. Crucially there is no
-    `.cpu()`, `.item()`, or other host-synchronizing call — those are
-    illegal inside CUDA graph capture and sank the previous iteration
-    of this cache (`cudaErrorStreamCaptureUnsupported`). `_version`
-    catches in-place mutations of a cached tensor; `data_ptr` catches
-    reallocation to a different memory slot; `shape` and `dtype` catch
-    the remaining identity-vs-equality gap.
+    **Capture safety**: the cache key is `(data_ptr, shape, dtype)`,
+    all pure host-side metadata reads. Crucially there is no `.cpu()`,
+    `.item()`, or other host-synchronizing call — those are illegal
+    inside CUDA graph capture and sank the previous iteration of this
+    cache (`cudaErrorStreamCaptureUnsupported`).
+
+    We deliberately do NOT use `tensor._version` here even though it
+    would catch in-place mutations of the cached tensor. vLLM runs its
+    forward under `torch.inference_mode()`, which produces
+    `InferenceTensor`s whose `_version` attribute raises
+    ``RuntimeError: Inference tensors do not track version counter``.
+    Reading it would crash the first forward pass.
+
+    **Staleness model**: the cache is valid as long as the caller
+    treats `x` as immutable between `put(x, ...)` and the subsequent
+    `get(x)` calls that should hit. That holds for Q/K/V because the
+    three projections are pure functions of a shared hidden state —
+    none of them writes back into `x`. Between forward passes a new
+    hidden-state tensor (different `data_ptr`) misses naturally.
+
+    **Edge case**: if torch's caching allocator frees `x` and then
+    reuses the same address for a different tensor with the same
+    `(shape, dtype)` before the next forward, `get()` returns a stale
+    rotation. This is extraordinarily rare within a single attention
+    block (the only window the cache lives in) and has no symptom in
+    practice for the Q/K/V pattern. If a future caller ever needs
+    stronger invalidation, wrap the call site rather than reintroduce
+    `_version`.
 
     **Custom op interaction**: the cache lives inside the opaque
     `torch.library.custom_op` body, so dynamo never sees it. During
@@ -337,20 +357,14 @@ class FWHTInputCache:
     kernel launches are recorded into the graph once instead of three
     times. Replay skips Python entirely, so the cache membership is
     baked into the graph structure.
-
-    **Staleness**: the cache holds exactly one entry. Between forward
-    passes a new hidden-state tensor (different `x`) misses on all
-    three key components and evicts the stale entry naturally. This
-    is simpler and safer than size-bounded eviction.
     """
 
-    __slots__ = ("_ptr", "_shape", "_dtype", "_version", "_result")
+    __slots__ = ("_ptr", "_shape", "_dtype", "_result")
 
     def __init__(self):
         self._ptr: int = -1
         self._shape: tuple = ()
         self._dtype: torch.dtype | None = None
-        self._version: int = -1
         self._result: torch.Tensor | None = None
 
     def get(self, x: torch.Tensor) -> torch.Tensor | None:
@@ -358,7 +372,6 @@ class FWHTInputCache:
             x.data_ptr() == self._ptr
             and x.shape == self._shape
             and x.dtype == self._dtype
-            and x._version == self._version
         ):
             return self._result
         return None
@@ -367,14 +380,12 @@ class FWHTInputCache:
         self._ptr = x.data_ptr()
         self._shape = x.shape
         self._dtype = x.dtype
-        self._version = x._version
         self._result = result
 
     def clear(self) -> None:
         self._ptr = -1
         self._shape = ()
         self._dtype = None
-        self._version = -1
         self._result = None
 
 

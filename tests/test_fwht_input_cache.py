@@ -66,28 +66,22 @@ class TestFWHTInputCacheMiss(unittest.TestCase):
         self.assertIsNone(cache.get(x2))
 
 
-class TestFWHTInputCacheVersion(unittest.TestCase):
-    """In-place mutation bumps ``tensor._version``; cache must miss."""
+class TestFWHTInputCacheInferenceModeSafety(unittest.TestCase):
+    """Under torch.inference_mode() the key reads must not raise.
 
-    def test_in_place_fill_invalidates(self):
-        cache = FWHTInputCache()
-        x = torch.zeros(4, 128)
-        rotated = torch.randn(4, 128)
-        cache.put(x, rotated)
+    vLLM runs its forward in inference mode, which yields
+    InferenceTensors whose `_version` attribute raises
+    `RuntimeError: Inference tensors do not track version counter.`
+    The cache must not touch any attribute that behaves this way.
+    """
 
-        self.assertIs(cache.get(x), rotated)
-        x.fill_(1.0)  # in-place mutation
-        self.assertIsNone(
-            cache.get(x),
-            "in-place mutation of cached tensor must invalidate the cache entry",
-        )
-
-    def test_in_place_add_invalidates(self):
-        cache = FWHTInputCache()
-        x = torch.randn(4, 128)
-        cache.put(x, torch.randn(4, 128))
-        x.add_(1.0)
-        self.assertIsNone(cache.get(x))
+    def test_put_and_get_inside_inference_mode(self):
+        with torch.inference_mode():
+            cache = FWHTInputCache()
+            x = torch.randn(4, 128)
+            rotated = torch.randn(4, 128)
+            cache.put(x, rotated)
+            self.assertIs(cache.get(x), rotated)
 
 
 class TestFWHTInputCacheEviction(unittest.TestCase):
@@ -139,9 +133,11 @@ class TestFWHTInputCacheNoHostSync(unittest.TestCase):
         # only the four metadata fields + the cached result.
         self.assertEqual(
             set(FWHTInputCache.__slots__),
-            {"_ptr", "_shape", "_dtype", "_version", "_result"},
+            {"_ptr", "_shape", "_dtype", "_result"},
             "FWHTInputCache __slots__ changed — if a new field was added, "
-            "verify it is still CUDA-graph-capture safe (no .cpu(), no .item())",
+            "verify it is still CUDA-graph-capture safe (no .cpu(), no .item()) "
+            "AND safe under torch.inference_mode() (no tensor._version reads — "
+            "inference tensors don't track it)",
         )
 
 
