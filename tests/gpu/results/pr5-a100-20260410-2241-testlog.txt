@@ -1,0 +1,146 @@
+=== 2026-04-10T19:35:38+00:00 TQ native backend PR #5 GPU test ===
+MODEL_LIST=Qwen/Qwen2.5-0.5B,Qwen/Qwen2.5-3B
+GPU_MEM=0.85  MAX_MODEL_LEN=2048  BLOCK_SIZE=16
+WORKDIR=/root/turboquant-vllm
+
+Activated venv: /root/verda-model-bench/.venv
+[Phase 1/8] Import sanity check
+  OK: vLLM registry interface
+  OK: vLLM FullAttentionSpec
+  OK: STR_DTYPE keys before patch: ['bfloat16', 'float', 'float16', 'float32', 'fp8', 'fp8_ds_mla', 'fp8_e4m3', 'fp8_e5m2', 'fp8_inc', 'half', 'int8']
+  OK: turboquant_vllm at /root/turboquant-vllm/turboquant_vllm/__init__.py
+[Phase 2/8] Plugin dry run + version capture
+TurboQuant patched STR_DTYPE_TO_TORCH_DTYPE with tq3/tq4/tq_k4v3 (pid=30272)
+{
+  "torch": "2.10.0+cu128",
+  "gpu": "NVIDIA A100-SXM4-80GB",
+  "gpu_mem_gb": 79.2,
+  "vllm": "0.19.0",
+  "turboquant_vllm": "/root/turboquant-vllm/turboquant_vllm/__init__.py",
+  "native_backend_registered": true,
+  "tq_dtype_names": [
+    "tq3",
+    "tq4",
+    "tq_k4v3"
+  ],
+  "str_dtype_has_tq3": true,
+  "python": "3.12.3"
+}
+
+================================================================================
+Model 1: Qwen/Qwen2.5-0.5B
+================================================================================
+[Phase 3/8] Start vllm --kv-cache-dtype auto for Qwen/Qwen2.5-0.5B
+  Launching vllm: model=Qwen/Qwen2.5-0.5B kv_cache_dtype=auto
+  OK: healthy after 34s
+  KV cache lines (auto):
+    (EngineCore pid=30449) INFO 04-10 19:36:15 [kv_cache_utils.py:829] Overriding num_gpu_blocks=0 with num_gpu_blocks_override=512
+    (EngineCore pid=30449) INFO 04-10 19:36:16 [gpu_worker.py:436] Available KV cache memory: 65.72 GiB
+    (EngineCore pid=30449) INFO 04-10 19:36:16 [gpu_worker.py:470] In v0.19, CUDA graph memory profiling will be enabled by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), which more accurately accounts for CUDA graph memory during KV cache allocation. To try it now, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase --gpu-memory-utilization from 0.8500 to 0.8535 to maintain the same effective KV cache size.
+    (EngineCore pid=30449) INFO 04-10 19:36:16 [kv_cache_utils.py:1319] GPU KV cache size: 5,742,768 tokens
+    (EngineCore pid=30449) INFO 04-10 19:36:16 [kv_cache_utils.py:1324] Maximum concurrency for 2,048 tokens per request: 2804.09x
+  AUTO capacity (estimated tokens): 5742768
+  AUTO generation: ' Paris. It is the largest city in Europe and'
+[Phase 5/8] Start vllm --kv-cache-dtype tq3 for Qwen/Qwen2.5-0.5B
+  Launching vllm: model=Qwen/Qwen2.5-0.5B kv_cache_dtype=tq3
+  OK: healthy after 37s
+[Phase 7/8] Timing check
+  STR_DTYPE patch log line: 1
+  Model loading log line:   22
+  Spec patch log line:      <missing>
+  Signature warnings:       0
+0
+/root/turboquant-vllm/tests/gpu/test_native_backend_gpu.sh: line 430: [[: 0
+0: syntax error in expression (error token is "0")
+  Timing: PASS
+  KV cache lines (tq3):
+    (EngineCore pid=30792) INFO 04-10 19:36:52 [kv_cache_utils.py:829] Overriding num_gpu_blocks=0 with num_gpu_blocks_override=512
+    (EngineCore pid=30792) INFO 04-10 19:36:54 [gpu_worker.py:436] Available KV cache memory: 65.73 GiB
+    (EngineCore pid=30792) INFO 04-10 19:36:54 [gpu_worker.py:470] In v0.19, CUDA graph memory profiling will be enabled by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), which more accurately accounts for CUDA graph memory during KV cache allocation. To try it now, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase --gpu-memory-utilization from 0.8500 to 0.8519 to maintain the same effective KV cache size.
+    (EngineCore pid=30792) INFO 04-10 19:36:54 [kv_cache_utils.py:1319] GPU KV cache size: 11,487,264 tokens
+    (EngineCore pid=30792) INFO 04-10 19:36:54 [kv_cache_utils.py:1324] Maximum concurrency for 2,048 tokens per request: 5609.02x
+  TQ3 capacity (estimated tokens): 11487264
+  TQ3 generation: ' Paris. The capital of France is Paris, the'
+[Phase 8/8] Capacity ratio: 2.0 (PASS)
+
+================================================================================
+Model 2: Qwen/Qwen2.5-3B
+================================================================================
+[Phase 3/8] Start vllm --kv-cache-dtype auto for Qwen/Qwen2.5-3B
+  Launching vllm: model=Qwen/Qwen2.5-3B kv_cache_dtype=auto
+  OK: healthy after 38s
+  KV cache lines (auto):
+    (EngineCore pid=31171) INFO 04-10 19:37:36 [kv_cache_utils.py:829] Overriding num_gpu_blocks=0 with num_gpu_blocks_override=512
+    (EngineCore pid=31171) INFO 04-10 19:37:37 [gpu_worker.py:436] Available KV cache memory: 60.85 GiB
+    (EngineCore pid=31171) INFO 04-10 19:37:37 [gpu_worker.py:470] In v0.19, CUDA graph memory profiling will be enabled by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), which more accurately accounts for CUDA graph memory during KV cache allocation. To try it now, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase --gpu-memory-utilization from 0.8500 to 0.8556 to maintain the same effective KV cache size.
+    (EngineCore pid=31171) INFO 04-10 19:37:37 [kv_cache_utils.py:1319] GPU KV cache size: 1,772,288 tokens
+    (EngineCore pid=31171) INFO 04-10 19:37:37 [kv_cache_utils.py:1324] Maximum concurrency for 2,048 tokens per request: 865.38x
+  AUTO capacity (estimated tokens): 1772288
+  AUTO generation: ' Paris. The capital of the United States is Washington'
+[Phase 5/8] Start vllm --kv-cache-dtype tq3 for Qwen/Qwen2.5-3B
+  Launching vllm: model=Qwen/Qwen2.5-3B kv_cache_dtype=tq3
+  OK: healthy after 40s
+[Phase 7/8] Timing check
+  STR_DTYPE patch log line: 1
+  Model loading log line:   22
+  Spec patch log line:      <missing>
+  Signature warnings:       0
+0
+/root/turboquant-vllm/tests/gpu/test_native_backend_gpu.sh: line 430: [[: 0
+0: syntax error in expression (error token is "0")
+  Timing: PASS
+  KV cache lines (tq3):
+    (EngineCore pid=31521) INFO 04-10 19:38:19 [kv_cache_utils.py:829] Overriding num_gpu_blocks=0 with num_gpu_blocks_override=512
+    (EngineCore pid=31521) INFO 04-10 19:38:20 [gpu_worker.py:436] Available KV cache memory: 60.85 GiB
+    (EngineCore pid=31521) INFO 04-10 19:38:20 [gpu_worker.py:470] In v0.19, CUDA graph memory profiling will be enabled by default (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1), which more accurately accounts for CUDA graph memory during KV cache allocation. To try it now, set VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1 and increase --gpu-memory-utilization from 0.8500 to 0.8548 to maintain the same effective KV cache size.
+    (EngineCore pid=31521) INFO 04-10 19:38:20 [kv_cache_utils.py:1319] GPU KV cache size: 3,545,040 tokens
+    (EngineCore pid=31521) INFO 04-10 19:38:20 [kv_cache_utils.py:1324] Maximum concurrency for 2,048 tokens per request: 1730.98x
+  TQ3 capacity (estimated tokens): 3545040
+  TQ3 generation: ' Paris. Paris is the the France. Paris is'
+[Phase 8/8] Capacity ratio: 2.0 (PASS)
+
+================================================================================
+=== ALL PHASES PASS ===
+================================================================================
+=== TQ native backend PR #5 GPU test ===
+Started: 2026-04-10T19:35:38+00:00
+Host: pr5-gpu-test
+Models: Qwen/Qwen2.5-0.5B,Qwen/Qwen2.5-3B
+
+STATUS=IN_PROGRESS
+VLLM_VERSION=0.19.0
+TORCH_VERSION=2.10.0+cu128
+TURBOQUANT_VLLM_PATH=/root/turboquant-vllm/turboquant_vllm/__init__.py
+GPU_NAME=NVIDIA A100-SXM4-80GB
+GPU_MEM_GB=79.2
+PYTHON_VERSION=3.12.3
+STR_DTYPE_PATCHED=True
+
+# Model 1
+MODEL_1=Qwen/Qwen2.5-0.5B
+MODEL_1_AUTO_TOKENS=5742768
+MODEL_1_TQ3_TOKENS=11487264
+MODEL_1_RATIO=2.0
+MODEL_1_RATIO_STATUS=PASS
+MODEL_1_TIMING_STATUS=PASS
+MODEL_1_SIG_WARN_COUNT=0
+0
+MODEL_1_AUTO_GEN= Paris. It is the largest city in Europe and 
+MODEL_1_TQ3_GEN= Paris. The capital of France is Paris, the 
+
+# Model 2
+MODEL_2=Qwen/Qwen2.5-3B
+MODEL_2_AUTO_TOKENS=1772288
+MODEL_2_TQ3_TOKENS=3545040
+MODEL_2_RATIO=2.0
+MODEL_2_RATIO_STATUS=PASS
+MODEL_2_TIMING_STATUS=PASS
+MODEL_2_SIG_WARN_COUNT=0
+0
+MODEL_2_AUTO_GEN= Paris. The capital of the United States is Washington 
+MODEL_2_TQ3_GEN= Paris. Paris is the the France. Paris is 
+
+=== FINAL ===
+STATUS=PASS
+REASON=all models passed
+Finished: 2026-04-10T19:38:36+00:00

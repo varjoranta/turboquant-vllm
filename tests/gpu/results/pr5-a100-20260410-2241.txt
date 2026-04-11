@@ -1,0 +1,42 @@
+=== TQ native backend PR #5 GPU test ===
+Started: 2026-04-10T19:35:38+00:00
+Host: pr5-gpu-test
+Models: Qwen/Qwen2.5-0.5B,Qwen/Qwen2.5-3B
+
+STATUS=IN_PROGRESS
+VLLM_VERSION=0.19.0
+TORCH_VERSION=2.10.0+cu128
+TURBOQUANT_VLLM_PATH=/root/turboquant-vllm/turboquant_vllm/__init__.py
+GPU_NAME=NVIDIA A100-SXM4-80GB
+GPU_MEM_GB=79.2
+PYTHON_VERSION=3.12.3
+STR_DTYPE_PATCHED=True
+
+# Model 1
+MODEL_1=Qwen/Qwen2.5-0.5B
+MODEL_1_AUTO_TOKENS=5742768
+MODEL_1_TQ3_TOKENS=11487264
+MODEL_1_RATIO=2.0
+MODEL_1_RATIO_STATUS=PASS
+MODEL_1_TIMING_STATUS=PASS
+MODEL_1_SIG_WARN_COUNT=0
+0
+MODEL_1_AUTO_GEN= Paris. It is the largest city in Europe and 
+MODEL_1_TQ3_GEN= Paris. The capital of France is Paris, the 
+
+# Model 2
+MODEL_2=Qwen/Qwen2.5-3B
+MODEL_2_AUTO_TOKENS=1772288
+MODEL_2_TQ3_TOKENS=3545040
+MODEL_2_RATIO=2.0
+MODEL_2_RATIO_STATUS=PASS
+MODEL_2_TIMING_STATUS=PASS
+MODEL_2_SIG_WARN_COUNT=0
+0
+MODEL_2_AUTO_GEN= Paris. The capital of the United States is Washington 
+MODEL_2_TQ3_GEN= Paris. Paris is the the France. Paris is 
+
+=== FINAL ===
+STATUS=PASS
+REASON=all models passed
+Finished: 2026-04-10T19:38:36+00:00

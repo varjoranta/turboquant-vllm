@@ -1,25 +1,35 @@
 # turboquant-vllm
 
-TurboQuant+ compression for vLLM. Three features from one algorithm:
+TurboQuant+ compression for vLLM. What this package ships today:
 
-- **Weight compression** (4.3-4.6x) via 3-bit TQ3. Any BF16 checkpoint, compressed in 9 seconds, zero calibration. Faster than uncompressed serving.
-- **KV cache compression** (3.7x) for more concurrent conversations on the same GPU
-- **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models
+- **Weight compression** (4.3-4.6x) via 3-bit TQ3. Any BF16 checkpoint, compressed in 9 seconds, zero calibration. Faster than uncompressed serving. **Unique to this plugin.**
+- **Native TQ3 checkpoints** for small-GPU deployments (L40S, RTX 6000 Ada). MoE expert regrouping handled automatically.
+- **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models.
+- **AWQ export** from TQ-compressed weights — ~2 min instead of hours of AWQ calibration.
+- **Legacy KV cache compression** (monkey-patch, MLA-only) for GLM-4.7/DeepSeek-V3 users on stock vLLM until upstream KV compression supports MLA.
 
-Gemma 4 26B: ~52 GB checkpoint → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost. **+33% throughput** over BF16 at 16 concurrent requests (364 vs 275 tok/s on H100).
+> **KV cache compression for GQA/MHA models (Qwen, Llama, Mistral, Gemma) is being upstreamed to vLLM directly in [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)** by @vibhavagarwal5 — under mgoin's review, close to merging. Once it lands, use `--kv-cache-dtype turboquant_3bit_nc` (or `k8v4`, `4bit_nc`, `k3v4_nc`) on stock vLLM with no plugin required. This package's role going forward is weight quantization + MLA KV compression + the supporting tooling, not the standard KV-cache path.
 
-GLM-4.7-Flash 355B MoE: 62.4 GB → **14.7 GB** (4.2x). Native TQ3 checkpoint with MoE expert regrouping, 13.3 GB GPU memory. Tested on A100 80GB.
-
-Qwen3-30B: 61 GB → **13 GB** (4.6x). On MLA models, TQ+ KV cache works where vLLM's FP8 is broken.
+## Quick start
 
 ```python
-from turboquant_vllm import enable_weight_quantization, patch_vllm_attention
-
-enable_weight_quantization(bits=3)                          # 52 GB → 12 GB in 9 seconds
-patch_vllm_attention(k_bits=4, v_bits=3, norm_correction=True)  # 3.7x KV compression
-
-# Then start vLLM as usual
+# Weight compression — unique to this plugin
+from turboquant_vllm import enable_weight_quantization
+enable_weight_quantization(bits=3)  # 52 GB → 12 GB in 9 seconds
+# then: vllm serve google/gemma-4-26B-A4B-it
 ```
+
+```python
+# MLA KV cache compression via legacy monkey-patch (GLM-4.7, DeepSeek-V3)
+from turboquant_vllm import patch_vllm_attention
+patch_vllm_attention(k_bits=4, v_bits=3, norm_correction=True)
+```
+
+Headline numbers:
+
+- **Gemma 4 26B**: ~52 GB BF16 → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost. **+33% throughput** over BF16 at 16 concurrent requests (364 vs 275 tok/s on H100).
+- **GLM-4.7-Flash 355B MoE**: 62.4 GB → **14.7 GB** (4.2x). Native TQ3 checkpoint with MoE expert regrouping, 13.3 GB GPU memory. Tested on A100 80GB.
+- **Qwen3-30B**: 61 GB → **13 GB** (4.6x).
 
 ## Why this exists
 
@@ -64,18 +74,20 @@ GLM-4.7 355B: native TQ3 checkpoint verified (14.7 GB, 4.2x compression). Full q
 
 ### Tested models and known issues
 
-| Model family | Attention | KV cache TQ | Notes |
-|---|---|---|---|
-| Qwen3 (0.6B-235B) | GQA | Works | Tested extensively, including 235B AWQ |
-| Qwen3-8B | GQA | Works | Native vLLM backend confirmed on A100 |
-| GLM-4.7-Flash 355B | MLA | Works | TQ+ handles MLA correctly (FP8 does not). Native TQ3 checkpoint tested. |
-| DeepSeek-V3 | MLA | Works | Via MLACommonImpl patch |
-| Qwen3.5 (hybrid) | GatedDeltaNet + GQA | Untested | Hybrid architecture, may need layer-specific handling |
-| gpt-oss-20b | Alternating full/sliding window + sinks | Not yet | Returns empty output. Sliding window + attention sinks need pass-through support |
+| Model family | Attention | Weight quant | Legacy KV monkey-patch | Notes |
+|---|---|---|---|---|
+| Qwen3 (0.6B-235B) | GQA | Works | Works | Use upstream [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) for KV cache compression once merged |
+| Gemma 4 26B | GQA | Works (4.79/5) | Works | Flagship benchmark model |
+| GLM-4.7-Flash 355B | **MLA** | Works (native TQ3 ckpt) | **Works** | **Only place TurboQuant KV works on MLA today** — #38479 does not cover MLA |
+| DeepSeek-V3 | **MLA** | Pending (larger disk) | Works | Same: MLA requires the legacy monkey-patch path |
+| Qwen3.5-35B-A3B | MoE + GatedDeltaNet + GQA | Works (as of varjoranta/turboquant-vllm#15) | Untested | Hybrid architecture; weight quant validated via @gaby's fixes |
+| gpt-oss-20b | Alternating full/sliding window + sinks | Works | Not yet | Sliding window + attention sinks need pass-through support in the KV path |
 
-Standard GQA/MHA models work. MLA models work via the monkey-patch library. Models with non-standard attention (sliding window, attention sinks, hybrid recurrent) are not yet supported in the native backend.
+**Where to get KV cache compression:**
 
-**GPU compatibility:** Tested on A100 (SM80), RTX 6000 Ada (SM89), H100 (SM90). RTX PRO 6000 Blackwell (SM120) lacks FlashAttention-4 hardware support, which the native TQ backend currently depends on for prefill.
+- **GQA/MHA models** (Qwen, Llama, Mistral, Gemma): use upstream [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479), or Vibhav's branch while the PR is under review. This plugin's old `--kv-cache-dtype tq3` path has been removed.
+- **MLA models** (GLM-4.7, DeepSeek-V3): use this plugin's `TQ_KV_K_BITS=4` monkey-patch path. It is the only option today. Will be retired once upstream adds MLA support.
+- **Hybrid models** (Qwen3.5, gpt-oss): neither path is fully supported yet. Weight quantization still works.
 
 ## Install
 
@@ -115,7 +127,7 @@ patch_vllm_attention(k_bits=4, v_bits=3, norm_correction=True,
 
 Phase 2 features: **norm correction** fixes magnitude shrinkage at low bit widths. **Sink tokens** keep the first 4 positions at FP16 (attention sinks get universal attention). **Boundary layers** give the first/last 5 layers K=8-bit precision (they carry more signal through the residual stream). Validated on Gemma 4 26B: token-for-token identical output to FP16 baseline at temperature=0.
 
-> **Note on norm_correction + CUDA**: the CUDA KV store kernel does not yet apply norm correction. If you pass `norm_correction=True` the library automatically falls back to the PyTorch path and logs a warning. To use the CUDA kernel, set `norm_correction=False` (or rely on the default native-backend `--kv-cache-dtype tq3` which uses its own store path).
+> **Note on norm_correction + CUDA**: the CUDA KV store kernel does not yet apply norm correction. If you pass `norm_correction=True` the library automatically falls back to the PyTorch path and logs a warning. To use the CUDA kernel, set `norm_correction=False`.
 
 The patch covers both standard FlashAttention (Qwen3, Llama, Mistral) and MLA attention (GLM-4.7-Flash, DeepSeek-V3) via `MLACommonImpl`.
 
@@ -150,7 +162,7 @@ If CUDA compilation fails, the system automatically falls back to PyTorch ops (s
 
 ## The CUDA kernels
 
-**KV cache kernels** in `csrc/turbo_quant.cu`:
+**KV cache kernels** in `csrc/turbo_quant.cu` — used by the legacy monkey-patch path (`patch_vllm_attention`) and the standalone `KVCacheCompressorTorch`. Not used by the new upstream TurboQuant path in [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479).
 
 | Kernel | Purpose | Key operation |
 |--------|---------|---------------|
@@ -159,7 +171,7 @@ If CUDA compilation fails, the system automatically falls back to PyTorch ops (s
 | `qjl_quantize_residual_kernel` | K cache QJL | PolarQuant residual → 128×128 projection → pack sign bits |
 | `qjl_dequantize_and_add_kernel` | K cache QJL | Reconstruct QJL contribution, add to PolarQuant output |
 
-**Weight dequant kernel** in `csrc/tq_weight_dequant.cu`:
+**Weight dequant kernel** in `csrc/tq_weight_dequant.cu` — used by the weight quantization path (unique to this plugin):
 
 | Kernel | Purpose | Key operation |
 |--------|---------|---------------|
@@ -197,14 +209,18 @@ At 32K context with 32 layers, 32 KV heads, head_dim=128 (typical for Qwen3-235B
 
 71% reduction in KV cache access time. Models with fewer KV heads (GQA) have proportionally smaller caches, but the compression ratio holds.
 
-## Compatibility
+## Compatibility (legacy monkey-patch KV path)
 
-| Model family | Attention type | TQ+ support | FP8 KV safe? |
+The `patch_vllm_attention` / `TQ_KV_K_BITS=...` path applies to:
+
+| Model family | Attention type | Monkey-patch support | Upstream FP8 KV safe? |
 |-------------|---------------|-------------|--------------|
-| Qwen3, Llama, Mistral | FlashAttention (GQA/MHA) | **Yes** | Yes |
-| GLM-4.7-Flash, DeepSeek-V3 | Multi-head Latent Attention (MLA) | **Yes** | **No** (broken) |
+| Qwen3, Llama, Mistral, Gemma | GQA / MHA | **Use upstream [#38479](https://github.com/vllm-project/vllm/pull/38479) instead** | Yes |
+| GLM-4.7-Flash, DeepSeek-V3 | **MLA** | **Yes — this is the only option** | **No** (broken) |
 
-MLA models store a compressed latent vector (`kv_c_normed`) plus positional encoding (`k_pe`) instead of standard K/V. The patch compresses `kv_c_normed` with PolarQuant MSE-only and passes `k_pe` through uncompressed. Validated on GLM-4.7-Flash across 20 scenarios.
+MLA models store a compressed latent vector (`kv_c_normed`) plus positional encoding (`k_pe`) instead of standard K/V. The monkey-patch compresses `kv_c_normed` with PolarQuant MSE-only and passes `k_pe` through uncompressed. Validated on GLM-4.7-Flash across 20 scenarios (benchmark table above: TQ+ turbo3 4.63 vs FP16 baseline 4.61).
+
+vLLM's upstream FP8 KV cache **is broken on MLA models**: on GLM-4.7-Flash it scores 1.07/5 because the FLASHMLA backend applies FP8 without proper per-tensor scaling and quantization error compounds with context length. TurboQuant's per-vector PolarQuant normalization avoids this. Until upstream fixes MLA FP8 or #38479 adds MLA support, the legacy monkey-patch path in this plugin remains the only way to compress KV cache on MLA models.
 
 ## Weight compression
 
@@ -348,91 +364,70 @@ Same math, same CUDA kernels. Weight compression reduces the hardware you need. 
 
 Contributions and testing on different models welcome. Write-up: [varjosoft.com/weight-compression.html](https://varjosoft.com/weight-compression.html)
 
-## Native backend: fork vs plugin
+## KV cache compression: upstream is the path forward
 
-Two ways to get `--kv-cache-dtype tq3` without monkey-patching — pick whichever matches your deployment constraints.
+TurboQuant KV cache compression for GQA/MHA models (Qwen, Llama, Mistral, Gemma) is being upstreamed to vLLM directly via [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) by @vibhavagarwal5. As of 2026-04-11 the PR is OPEN, MERGEABLE, tagged `ready`, and under active review by maintainer @mgoin ("I think this is looking quite solid! Enabling CI as I look more carefully"). Merge is close.
 
-### Option A — Plugin, stock vLLM
-
-```bash
-pip install turboquant-plus-vllm
-vllm serve Qwen/Qwen2.5-3B --kv-cache-dtype tq3
-```
-
-No fork, no custom image. 2× KV cache capacity (see GPU validation table below). Hot path currently falls back to PyTorch store/decode (~10% below baseline throughput until the Triton kernels are vendored).
-
-### Option B — vLLM fork with Triton kernels built in
+Once #38479 lands, the recommended path is:
 
 ```bash
-pip install git+https://github.com/varjoranta/vllm-1.git@turboquant-integration
-vllm serve Qwen/Qwen3-8B --kv-cache-dtype tq3
+pip install vllm  # version with #38479 merged
+vllm serve Qwen/Qwen3-4B --kv-cache-dtype turboquant_3bit_nc
 ```
 
-Same capacity win, plus the fused Triton store/decode kernels for throughput parity with the baseline. Includes FP8 value storage for quality preservation and asymmetric K/V support (`--kv-cache-dtype tq_k4v3`). Based on [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) with quality fixes.
+Four presets land with the PR:
 
-Fork: [varjoranta/vllm-1 `turboquant-integration`](https://github.com/varjoranta/vllm-1/tree/turboquant-integration)
+| Preset | Key | Value | Slot bytes | Compression | GSM8K | NIAH |
+|---|---|---|---|---|---|---|
+| `turboquant_k8v4` | FP8 | 4-bit uniform | 196 | **2.6x** | 0.860 | 100% |
+| `turboquant_4bit_nc` | 4-bit MSE + NC | 4-bit uniform + NC | 136 | **3.8x** | 0.830 | 100% |
+| `turboquant_k3v4_nc` | 3-bit MSE + NC | 4-bit uniform + NC | 120 | **4.3x** | 0.790 | 100% |
+| `turboquant_3bit_nc` | 3-bit MSE + NC | 3-bit uniform + NC | 104 | **4.9x** | 0.785 | 100% |
 
-**This library** (monkey-patch approach) remains useful for MLA models (GLM-4.7, DeepSeek-V3) via the `TQ_KV_K_BITS` env var, weight quantization, and models not yet supported by the native backend.
+Baseline GSM8K: 0.880, NIAH: 100%. Quality measured on Qwen/Qwen3-4B with 5-shot GSM8K (200q) and NIAH (512-32K, 77 probes). Full results in the PR body.
 
-### Plugin-side native backend: stock vLLM, no fork required
+**Throughput trade-off** (Qwen3-4B, from the PR body): decode-heavy workloads run at 35-43% of baseline tok/s, long-prefill workloads at 72-87% of baseline. You're trading ~half your decode throughput for 2.6-4.9× KV capacity, which is valuable when KV is the memory bottleneck (long context, high concurrency) but not a free lunch.
 
-`turboquant_vllm` ships a plugin-side `TurboQuantAttentionBackend` (`turboquant_vllm/native_backend.py`) that registers itself via vLLM's `register_backend(AttentionBackendEnum.CUSTOM, ...)` so stock vLLM installs can activate it with `--kv-cache-dtype tq3/tq4/tq_k4v3` — no fork required.
+Until #38479 lands, install Vibhav's branch directly if you need the fast path:
 
 ```bash
-pip install turboquant-plus-vllm
-vllm serve Qwen/Qwen2.5-3B --kv-cache-dtype tq3   # 2× KV cache capacity
+pip install git+https://github.com/vibhavagarwal5/vllm.git@feature/turboquant-kv-cache
 ```
 
-**GPU-validated on A100 80GB, vLLM 0.19.0** (PR #5). Observed capacity ratio vs `--kv-cache-dtype auto`:
+### This plugin's KV cache story
 
-| Model | head_dim | `auto` tokens | `tq3` tokens | ratio |
-|---|---|---|---|---|
-| Qwen/Qwen2.5-0.5B | 64 | 5,742,768 | 11,487,264 | **2.0×** |
-| Qwen/Qwen2.5-3B | 128 | 1,772,288 | 3,545,040 | **2.0×** |
+This package **no longer ships a `TurboQuantAttentionBackend` or patches vLLM's KV cache allocator**. Earlier versions did, but:
 
-Both models served real completions under both dtypes. The 2.0× ratio — rather than the theoretical 3.9× — reflects vLLM's power-of-two slot padding: TQ3's real 178-byte slot gets rounded to 256 bytes, losing ~44% of the theoretical gain. Reclaiming the rest requires an upstream vLLM change to accept non-power-of-two slot sizes.
+1. The kernel work those paths depended on was incomplete — the vendored path produced broken output end-to-end and ran slower than the Python fallback (documented locally in `tests/gpu/results/vendor-triton-a100-20260410.txt`).
+2. Upstream #38479 is a complete, tested, maintainer-reviewed implementation of the same idea and uses a revised preset schema (`turboquant_*`) that's incompatible with the old `tq3/tq4/tq_k4v3` names.
+3. Maintaining a parallel plugin-side implementation in this package would duplicate effort without adding value.
 
-**Current limitation**: the hot path still runs the Python store/decode fallback. The fused Triton kernels live in the vLLM fork (`vllm/v1/attention/ops/triton_tq_{store,decode}.py`) and will be vendored into this package in a follow-up branch (`feat/vendor-triton-kv-kernels`). Throughput is roughly 10% below `--kv-cache-dtype auto` baseline until those kernels land; the capacity gain is already real.
+What remains here is the **legacy monkey-patch path** (`patch_vllm_attention` / `TQ_KV_K_BITS=...`). This is the only place in the ecosystem today where TurboQuant KV compression works on **MLA models** (GLM-4.7-Flash, DeepSeek-V3) — #38479 is scoped to standard full-attention and uniform sliding-window models. Once upstream adds MLA support, this path will also be retired. Until then it's the production story for MLA users.
 
-**Which path to use:**
-- Plugin-side (this package + stock vLLM): portability and `pip install`, 2× capacity, -10% decode throughput. Suitable for non-MLA models and evaluation.
-- Fork (`varjoranta/vllm-1`): both capacity AND peak throughput. Suitable for production.
-- Monkey-patch (`TQ_KV_K_BITS` env var): MLA models (GLM-4.7, DeepSeek-V3) where the native backend is not yet supported.
+Deprecated path: early versions of the README pointed users at `varjoranta/vllm-1 turboquant-integration` as a "fork with Triton kernels". That fork is obsolete and its Triton kernels produce broken output when invoked through vLLM's real integration. Don't use it. If you need the pre-upstream Triton path, use Vibhav's branch above.
 
 ## Environment variables
 
-These env vars are read at plugin activation / config load time. Most users should leave them alone:
+These env vars activate the plugin's optional paths. Most users should leave them unset.
 
 | Variable | Default | Effect |
 |---|---|---|
-| `TQ_KV_K_BITS` | unset | Activates monkey-patch KV compression with this many bits for K. Setting it triggers the legacy monkey-patch path instead of (or alongside) the native backend. |
+| `TQ_WEIGHT_BITS` | unset | Activate runtime weight quantization with this many bits (3 or 4). Unique to this plugin. |
+| `TQ_WEIGHT_GROUP_SIZE` | `128` | Group size for weight quantization. |
+| `TQ_KV_K_BITS` | unset | Activate legacy monkey-patch KV compression with this many bits for K. **Primarily for MLA models** (GLM-4.7, DeepSeek-V3); for non-MLA models, use upstream [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479). |
 | `TQ_KV_V_BITS` | same as K | Bits for V in monkey-patch mode. |
 | `TQ_KV_ROTATION` | `wht` | Rotation used by the monkey-patch path: `wht` (Walsh-Hadamard) or `planar` (2D Givens). |
 | `TQ_KV_NORM_CORRECTION` | `1` | Enable Phase-2 norm correction for monkey-patch compression. Set `0` to disable. |
-| `TQ_WEIGHT_BITS` | unset | Activates weight quantization in the plugin with this many bits. |
-| `TQ_WEIGHT_GROUP_SIZE` | `128` | Group size for weight quantization. |
-| `TQ_VALUE_BITS` | `8` | V-cache storage bits in the native backend's `TurboQuantConfig`. Default 8 = FP8 (near-lossless). Set to 4 or 2 for more aggressive compression. Overridden by `--kv-cache-dtype tq_k4v3` which forces V=3. |
-| `TQ_NO_QJL` | `1` | Skip QJL residual correction (recommended). Set `0` to re-enable QJL — it's known to hurt quality at every bit width and is kept only for research reproduction. |
-| `TQ_PYTHON_STORE` | `0` | Force the Python store path in the native backend even if Triton kernels are available. |
-| `TQ_PYTHON_DECODE` | `0` | Force the Python decode path in the native backend. |
-| `TQ_STREAM_OVERLAP` | `0` | Launch the KV store on a secondary CUDA stream. Disabled by default — it degrades TTFT under concurrent load. |
 
 ## Running tests
 
-Tests live in `tests/`. The CPU suite runs in <2 s and has no vLLM dependency. Use the `[dev]` extra to get pytest:
+The CPU suite runs in ~5 s and has no vLLM dependency. Use the `[dev]` extra to get pytest:
 
 ```bash
-# From the repo root
-uv run --extra dev python3 -m pytest tests/ --ignore=tests/gpu -q
-
-# Or run individual files directly
-uv run python3 tests/test_native_backend_local.py
-uv run python3 tests/test_vllm_patch_compressor.py
-uv run python3 tests/test_checkpoint_local_path.py
-uv run python3 tests/test_cuda_norm_correction_fallback.py
+uv run --extra dev python -m pytest tests/ -q
 ```
 
-GPU tests live in `tests/gpu/` and are meant to run on a remote instance via the `tests/gpu/run_on_verda.sh` launcher. See `tests/gpu/test_native_backend_gpu.sh` for the test script itself. Don't run GPU tests over an interactive SSH session — the launcher uses `nohup` + `disown` so the test survives connection drops.
+CI runs the same suite across Python 3.11/3.12/3.13 plus ruff check + format via pre-commit on every PR (`.github/workflows/tests.yml`, `.github/workflows/pre-commit.yml`). A passing CI matrix is required before merge.
 
 ## Serverless deployment
 

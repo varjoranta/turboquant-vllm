@@ -1,0 +1,112 @@
+# Vendored Triton kernel GPU validation — NEGATIVE RESULT
+# Branch: feat/vendor-triton-kv-kernels (never merged)
+# Date:   2026-04-10
+# Outcome: vendored kernels broken, PR aborted
+
+## Test 1: RTX 6000 Ada Generation 48GB (sm_89, FIN-03, $0.83/hr)
+
+GPU_NAME=NVIDIA RTX 6000 Ada Generation
+GPU_MEM_GB=47.4
+VLLM_VERSION=0.19.0
+TORCH_VERSION=2.10.0+cu128
+
+# Model 1: Qwen/Qwen2.5-0.5B (head_dim=64)
+MODEL_1_AUTO_TOKENS=3375104
+MODEL_1_TQ3_TOKENS=6751904
+MODEL_1_RATIO=2.001                 # capacity PASS
+MODEL_1_AUTO_TPS=502.12
+MODEL_1_TQ3_TPS=47.96                # 10.5x SLOWER than auto
+MODEL_1_TPS_RATIO=0.096
+MODEL_1_TRITON_STORE=1               # loaded
+MODEL_1_TRITON_DECODE=1              # loaded
+MODEL_1_AUTO_GEN= Paris. It is the largest city in Europe and
+MODEL_1_TQ3_GEN= Paris!!!!!!!!!      # gibberish
+
+# Model 2: Qwen/Qwen2.5-3B (head_dim=128)
+MODEL_2_AUTO_TOKENS=983072
+MODEL_2_TQ3_START=FAIL
+# Engine core error: torch.AcceleratorError: CUDA error: an illegal memory
+# access was encountered.
+
+## Test 2: A100 SXM4 80GB (sm_80, FIN-01, $1.29/hr)
+
+GPU_NAME=NVIDIA A100-SXM4-80GB
+GPU_MEM_GB=79.2
+VLLM_VERSION=0.19.0
+TORCH_VERSION=2.10.0+cu128
+
+# Model 1: Qwen/Qwen2.5-0.5B
+MODEL_1_AUTO_TOKENS=5742768
+MODEL_1_TQ3_TOKENS=11487264
+MODEL_1_RATIO=2.0                    # capacity PASS
+MODEL_1_AUTO_TPS=409.2
+MODEL_1_TQ3_TPS=39.56                # 10.3x SLOWER than auto
+MODEL_1_TPS_RATIO=0.097
+MODEL_1_TRITON_STORE=1               # loaded
+MODEL_1_TRITON_DECODE=1              # loaded
+MODEL_1_AUTO_GEN= Paris. It is the largest city in Europe and
+MODEL_1_TQ3_GEN= Paris!!!!!!!!!      # gibberish — IDENTICAL to sm_89
+
+## Conclusion
+
+Vendored Triton kernels from varjoranta/vllm-1 `turboquant-integration`
+branch are broken in two ways when invoked via vLLM 0.19's native backend
+dispatch:
+
+1. CORRECTNESS: Output is gibberish (`Paris!!!!!!!!!`). The Python fallback
+   path produces valid output on the same models (`Paris. The capital of
+   France is Paris, the` — validated in PR #5 on A100 80GB).
+
+2. PERFORMANCE: TQ3 throughput is ~0.10x auto baseline — the Triton path
+   is 10x SLOWER than the Python fallback. This is the opposite of the
+   expected outcome.
+
+3. ARCHITECTURE-INDEPENDENT: The same broken output appears on both sm_80
+   (A100) and sm_89 (RTX 6000 Ada). The `tl.float8e4b15` compat fix is
+   already present in both vendored files.
+
+The fork's kernel files are byte-identical to the vendored copies (diff
+checked locally — only docstrings, stdlib logging swap, and dead CUDA-path
+deletions differ). My vendoring did NOT introduce the bug.
+
+Most likely root cause: the fork's Triton kernels were only tested in
+isolation (unit tests with synthetic tensors), never via the full
+`--kv-cache-dtype tq3` → native_backend → triton launcher integration
+path. They have a correctness bug in how they're called from the backend
+under vLLM's real cache allocation layout.
+
+## What was kept vs discarded
+
+Kept:
+- tests/gpu/test_native_backend_gpu.sh: throughput measurement +
+  Triton-path detection (valuable regardless of this PR's outcome)
+- turboquant_vllm/native_backend.py: _TRITON_STORE_SOURCE /
+  _TRITON_DECODE_SOURCE tracking + stderr markers at module load
+  (diagnostic improvement, costs nothing if the vendored kernels are
+  missing)
+
+Discarded:
+- turboquant_vllm/ops/triton_tq_store.py (vendored, broken)
+- turboquant_vllm/ops/triton_tq_decode.py (vendored, broken)
+- turboquant_vllm/ops/__init__.py
+- pyproject.toml ops/** per-file-ignores + format exclude
+
+## Budget
+- RTX 6000 Ada: ~$0.20 (10 min wall)
+- A100 80GB:    ~$0.40 (18 min wall)
+- Total:        ~$0.60 (~€0.55)
+- Budget cap:   €5
+
+## Follow-up for next attempt
+
+Anyone retrying this vendoring should:
+1. First reproduce the fork's own unit tests of the Triton kernels in
+   isolation — confirm they work with synthetic tensors.
+2. Then instrument the native_backend dispatch to dump the exact tensor
+   shapes/strides/dtypes being passed to the kernels, and compare to
+   what the fork's unit tests use.
+3. Look for the divergence. Likely candidates: slot layout (fork may
+   assume a different padded_slot byte layout), head_dim vs
+   effective_head_size confusion, or the centroids/midpoints ordering.
+4. Alternative path: re-use vibhavagarwal5's stock vLLM PR #38479
+   kernels if/when those land, rather than the fork's kernels.
