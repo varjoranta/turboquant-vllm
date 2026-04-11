@@ -36,6 +36,33 @@ _tq_fused_gemm_fn = None
 _tq_fwht_input_fn = None
 
 
+def _ensure_triton_backends() -> bool:
+    """Lazy-load Triton kernel functions on first use.
+
+    Called from ``TurboQuantWrapper.__init__``, which runs once per layer
+    during model loading — before any ``forward`` is traced. Must NOT be
+    called from inside ``forward`` because vLLM 0.19 compiles forward in
+    fullgraph mode and rejects any call to a ``@torch._dynamo.disable``'d
+    function with "Skip calling `torch.compiler.disable()`d function".
+
+    Returns True if both Triton kernels loaded; False otherwise.
+    """
+    global _triton_available, _tq_fused_gemm_fn, _tq_fwht_input_fn
+    if _triton_available is not None:
+        return _triton_available
+    try:
+        from turboquant_vllm.triton_ops import tq_fused_gemm, tq_fwht_input_gemm
+
+        _tq_fused_gemm_fn = tq_fused_gemm
+        _tq_fwht_input_fn = tq_fwht_input_gemm
+        _triton_available = True
+        logger.info("Triton kernels available (FWHT-on-input + dequant-GEMM)")
+    except (ImportError, Exception):
+        _triton_available = False
+        logger.info("Triton not available, using CUDA/PyTorch fallback")
+    return _triton_available
+
+
 def _resolve_module(root, dotted_path: str):
     """Navigate a module tree by dotted path, returning the final attribute."""
     obj = root
@@ -52,7 +79,11 @@ def _resolve_parent_and_attr(root, dotted_path: str):
 
 
 def _get_cuda_module():
-    """Lazy-load the CUDA weight dequant kernel."""
+    """Lazy-load the CUDA weight dequant kernel.
+
+    Must be called from ``TurboQuantWrapper.__init__`` (pre-compile), not
+    ``forward`` (which vLLM 0.19 compiles in fullgraph mode).
+    """
     global _cuda_mod, _cuda_available
     if _cuda_available is not None:
         return _cuda_mod if _cuda_available else None
@@ -195,6 +226,14 @@ class TurboQuantWrapper(nn.Module):
         self.out_features = original.out_features
         self._has_learned_rotation = rotation is not None
 
+        # Probe Triton + CUDA backends during construction, NOT in forward().
+        # vLLM 0.19 AOT-compiles forward() in fullgraph mode, which forbids
+        # both logger calls and graph breaks from @torch._dynamo.disable.
+        # Doing the probes here populates the module globals before any
+        # forward is traced; forward then reads them as simple constants.
+        _ensure_triton_backends()
+        _get_cuda_module()
+
         weight = original.weight.data  # (out_features, in_features)
         # Flatten to 2D when weight has extra leading dimensions (e.g. vLLM
         # parallel linears or MoE expert tensors passed directly).
@@ -297,21 +336,10 @@ class TurboQuantWrapper(nn.Module):
         return wrapper
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        global _triton_available, _tq_fused_gemm_fn, _tq_fwht_input_fn
-
-        # Lazy init Triton paths
-        if _triton_available is None:
-            try:
-                from turboquant_vllm.triton_ops import tq_fused_gemm, tq_fwht_input_gemm
-
-                _tq_fused_gemm_fn = tq_fused_gemm
-                _tq_fwht_input_fn = tq_fwht_input_gemm
-                _triton_available = True
-                logger.info("Triton kernels available (FWHT-on-input + dequant-GEMM)")
-            except (ImportError, Exception):
-                _triton_available = False
-                logger.info("Triton not available, using CUDA/PyTorch fallback")
-
+        # Probes have already run in __init__; read the populated globals
+        # directly so this function is pure-compute and vLLM 0.19's
+        # torch.dynamo fullgraph compile doesn't see any helpers with
+        # logger calls or @torch._dynamo.disable decorators.
         if _triton_available and x.is_cuda:
             quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
             args = (x, self.packed_weight, self.norms, quantizer.signs1, quantizer.signs2, quantizer.centroids)
@@ -330,7 +358,7 @@ class TurboQuantWrapper(nn.Module):
                 except (ValueError, RuntimeError):
                     pass
 
-        cuda_mod = _get_cuda_module()
+        cuda_mod = _cuda_mod if _cuda_available else None
 
         if cuda_mod is not None:
             output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32

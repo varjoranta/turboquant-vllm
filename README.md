@@ -27,7 +27,7 @@ patch_vllm_attention(k_bits=4, v_bits=3, norm_correction=True)
 
 Headline numbers:
 
-- **Gemma 4 26B**: ~52 GB BF16 → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost. **+33% throughput** over BF16 at 16 concurrent requests (364 vs 275 tok/s on H100).
+- **Gemma 4 26B**: ~52 GB BF16 → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost. Honest BF16 baseline on current vLLM 0.19 (measured 2026-04-11 on A100 80GB): see the throughput table below.
 - **GLM-4.7-Flash 355B MoE**: 62.4 GB → **14.7 GB** (4.2x). Native TQ3 checkpoint with MoE expert regrouping, 13.3 GB GPU memory. Tested on A100 80GB.
 - **Qwen3-30B**: 61 GB → **13 GB** (4.6x).
 
@@ -263,16 +263,20 @@ Gemma 4 TQ3 quality: **4.79/5** on 20 multi-turn conversation scenarios (scored 
 
 GLM-4.7-Flash is a 355B MoE model (64 experts, 4 active). The native TQ3 checkpoint handles per-expert weight regrouping and gate_proj+up_proj → gate_up_proj fusion automatically.
 
-### Throughput (H100 80GB, vLLM 0.19.0, Gemma 4 26B)
+### Throughput (A100 80GB, vLLM 0.19.0, Gemma 4 26B, 2026-04-11)
 
-| Concurrency | BF16 tok/s | TQ3 Weight | TQ3 W+KV (K4/V3) | vs BF16 |
-|:-----------:|:----------:|:----------:|:-----------------:|:-------:|
-| 1 | 27.4 | 28.3 | 28.2 | +3% |
-| 4 | 103.3 | 103.4 | 102.9 | 0% |
-| 8 | 183.5 | 190.4 | 185.5 | +4% |
-| 16 | 274.5 | **357.2** | **364.2** | **+33%** |
+Measured via `vllm bench serve` with `dataset-name=random --random-input-len 512 --random-output-len 128 --num-prompts 32 --ignore-eos` at each concurrency level. Model: `google/gemma-4-26B-A4B-it` bfloat16, `--max-model-len 2048 --gpu-memory-utilization 0.85`.
 
-TQ3 is faster at every concurrency level. The gap widens under load because smaller weights need less HBM bandwidth, leaving more room for batching.
+| Concurrency | Output tok/s | Req/s | Median TTFT | Median ITL |
+|:-----------:|:------------:|:-----:|:-----------:|:----------:|
+| 1 | **101.4** | 0.79 | 97 ms | 9.1 ms |
+| 4 | **290.5** | 2.27 | 67 ms | 13.4 ms |
+| 8 | **501.6** | 3.92 | 96 ms | 15.4 ms |
+| 16 | **816.1** | 6.38 | 151 ms | 18.8 ms |
+
+Peak GPU memory: 70.5 GB (weights + KV cache + activations; the 52 GB weight footprint is the dominant term).
+
+**Honest note on the TQ3 throughput column.** Earlier README versions claimed "+33% TQ3 vs BF16 at 16 concurrent (364 vs 275 tok/s on H100)" from a much older vLLM. That comparison is stale — both numbers are wrong for current vLLM 0.19 (BF16 alone is measured at 816 tok/s on A100 here, ~3× the old BF16 claim), and re-benchmarking TQ3 on current vLLM hit a fullgraph-compile incompatibility in `TurboQuantWrapper.forward()` that needs a deeper plugin fix (tracked as a follow-up). Rather than ship a number we can't reproduce, **the TQ3 throughput column is intentionally absent until it can be measured honestly**. The *memory footprint* win (12 GB vs 52 GB of weights) is math-deterministic and still holds.
 
 3-bit sub-byte packing: 8 indices per 3 bytes. Norm correction: stores `original_norm / reconstruction_norm` ratio per group to fix 5-10% magnitude shrinkage at 3-bit.
 
