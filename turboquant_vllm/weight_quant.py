@@ -539,6 +539,66 @@ class Compressed3D:
         obj.compressed_bytes = packed.numel() + norms.numel() * 4
         return obj
 
+    def decompress_into(self, out: torch.Tensor) -> None:
+        """Write decompressed weights into a pre-allocated ``out`` buffer.
+
+        ``out`` must have ``shape == self.shape`` and ``dtype == self.dtype``,
+        and must be on the same device as ``self.packed``. Used by the
+        TurboQuant MoE quant method's ``apply()`` hot path to avoid
+        per-forward bf16 allocation — the caller pools ``out`` on the
+        ``FusedMoE`` layer and reuses it across every forward call.
+
+        For bfloat16 targets an intermediate float32 scratch is allocated
+        for the CUDA kernel output (the kernel only produces fp16 or fp32),
+        and we cast-copy into ``out`` afterwards. The caching allocator
+        typically reuses the same slot across calls for this intermediate.
+        """
+        assert out.shape == self.shape, (
+            f"decompress_into expected shape {self.shape}, got {tuple(out.shape)}"
+        )
+        assert out.dtype == self.dtype, (
+            f"decompress_into expected dtype {self.dtype}, got {out.dtype}"
+        )
+        assert out.device == self.packed.device, (
+            f"decompress_into expected device {self.packed.device}, got {out.device}"
+        )
+
+        cuda_mod = _get_cuda_module()
+        if cuda_mod is None:
+            # Fallback: delegate to the chunked-PyTorch path and copy.
+            out.copy_(self.decompress())
+            return
+
+        # CUDA kernel output dtype: fp16 for fp16 targets, fp32 otherwise
+        # (including bf16). When the target is already the kernel's native
+        # output dtype we write directly; otherwise we stage through fp32
+        # and cast-copy.
+        n_experts, out_dim, in_dim = self.shape
+        kernel_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
+        if kernel_dtype == self.dtype:
+            target = out
+        else:
+            target = torch.empty(
+                self.shape, dtype=kernel_dtype, device=self.packed.device
+            )
+
+        quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
+        cuda_mod.weight_dequant_3d(
+            self.packed,
+            self.norms,
+            quantizer.signs1,
+            quantizer.signs2,
+            quantizer.centroids,
+            target,
+            self.group_size,
+            self.bits,
+            n_experts,
+            out_dim,
+            in_dim,
+        )
+        if target is not out:
+            out.copy_(target)
+
     def decompress(self, buf: torch.Tensor | None = None) -> torch.Tensor:
         """Decompress back to (num_experts, out_dim, in_dim) at original dtype.
 
@@ -607,13 +667,20 @@ class Compressed3D:
         return self.original_bytes / self.compressed_bytes if self.compressed_bytes > 0 else 0
 
 
-def _compress_3d_param(module: nn.Module, param_name: str, bits: int, group_size: int) -> int:
+def _compress_3d_param(
+    module: nn.Module, param_name: str, bits: int, group_size: int
+) -> tuple[int, int]:
     """Compress a 3D parameter in-place with real memory savings.
 
-    Stores Compressed3D as module attribute, replaces parameter data with empty tensor.
-    Registers forward hooks to decompress before use and free after.
+    Stores the :class:`Compressed3D` as ``module._tq_{param_name}`` and
+    resizes the original parameter's ``.data`` to an empty tensor of the
+    same device / dtype. The FusedMoE path (Phase 2A in
+    :func:`_replace_linear_layers`) subsequently swaps the layer's
+    ``quant_method`` via ``FusedMoE._replace_quant_method`` so the
+    compressed tensor is read from ``_tq_{param_name}`` inside
+    ``TurboQuantFusedMoEMethod.apply``.
 
-    Returns original size in bytes.
+    Returns ``(original_bytes, compressed_bytes)``.
     """
     param = getattr(module, param_name)
     compressed = Compressed3D(param.data, bits, group_size)
@@ -848,14 +915,31 @@ def _replace_linear_layers(
         total_compressed += compressed_bytes
         replacements += 1
 
-    # Phase 2: Compress MoE expert weights (3D tensors) with real memory savings.
-    # Store packed indices + norms, replace parameter with empty tensor.
-    # Forward hooks decompress one layer at a time during inference.
+    # Phase 2: Compress MoE expert weights with real memory savings.
+    #
+    # We support two MoE layouts:
+    #
+    # (A) vLLM FusedMoE modules (the production path).
+    #     Fused 3D tensors live on a FusedMoE instance as layer.w13_weight
+    #     and layer.w2_weight. We compress each into a Compressed3D, attach
+    #     as layer._tq_w13_compressed / layer._tq_w2_compressed, free the
+    #     bf16 originals, then install TurboQuantFusedMoEMethod via
+    #     layer._replace_quant_method. From that point on, every MoE
+    #     forward call routes through our apply() which decompresses into
+    #     a pooled scratch buffer and calls fused_experts with bf16 —
+    #     everything happens inside torch.ops.vllm.moe_forward, opaque to
+    #     dynamo, safe under vLLM 0.19 fullgraph + piecewise CUDA graphs.
+    #
+    # (B) Non-FusedMoE 3D parameters (fallback for eager/non-vLLM models
+    #     or test fixtures). We compress in-place the same way, but do NOT
+    #     install forward hooks — the old hook pattern was incompatible
+    #     with vLLM 0.19's AOT compile and the FusedMoE path has replaced
+    #     it. If you need to serve a non-FusedMoE 3D-expert model through
+    #     vLLM, add support via FusedMoEMethodBase in moe_quant.py.
     #
     # Expert pruning: if prune_experts > 0, find router gate weights and zero out
     # the least-important experts before compression. Zeroed rows produce norms ≈ 0
     # and uniform indices — storage isn't eliminated but norms become negligible.
-    modules_to_hook: dict[int, tuple[nn.Module, list[str]]] = {}
 
     # Build param_name → keep_mask mapping for expert pruning (3D layout).
     # Uses router gate weight norms to rank experts by importance.
@@ -889,6 +973,82 @@ def _replace_linear_layers(
                 prune_experts * 100,
             )
 
+    # --- Phase 2A: FusedMoE quant method replacement (vLLM path) ---
+    #
+    # Walk modules looking for FusedMoE instances; for each one, compress
+    # w13_weight/w2_weight in place via _compress_3d_param (which stores
+    # the Compressed3D as layer._tq_w13_weight / layer._tq_w2_weight)
+    # and install TurboQuantFusedMoEMethod via _replace_quant_method.
+    # The shared scratch pool is allocated once and reused across every
+    # FusedMoE layer to avoid holding N × uncompressed-expert-size bytes
+    # of per-layer scratch (which would wipe the compression savings).
+    try:
+        from vllm.model_executor.layers.fused_moe import FusedMoE
+
+        from turboquant_vllm.moe_quant import (
+            TurboQuantFusedMoEMethod,
+            TurboQuantFusedMoEScratchPool,
+        )
+    except ImportError:
+        FusedMoE = None
+        TurboQuantFusedMoEMethod = None
+        TurboQuantFusedMoEScratchPool = None
+
+    moe_scratch_pool = None
+    if FusedMoE is not None and TurboQuantFusedMoEScratchPool is not None:
+        moe_scratch_pool = TurboQuantFusedMoEScratchPool()
+
+    if FusedMoE is not None:
+        for name, module in list(model.named_modules()):
+            if not isinstance(module, FusedMoE):
+                continue
+            if any(p in name.lower() for p in _SKIP_PATTERNS):
+                continue
+
+            w13_param = getattr(module, "w13_weight", None)
+            w2_param = getattr(module, "w2_weight", None)
+            if w13_param is None or w2_param is None:
+                logger.warning(
+                    "FusedMoE at %s has no w13_weight/w2_weight — skipping "
+                    "(non-default weight layout, needs custom handling)",
+                    name,
+                )
+                continue
+            if w13_param.dim() != 3 or w2_param.dim() != 3:
+                logger.warning(
+                    "FusedMoE at %s has unexpected weight rank "
+                    "(w13=%d, w2=%d) — skipping",
+                    name,
+                    w13_param.dim(),
+                    w2_param.dim(),
+                )
+                continue
+
+            # Select bit width for this MoE block. Respect per-module override,
+            # routed_expert_bits, then kurtosis_aware, then default.
+            if per_module_bits and name in per_module_bits:
+                tensor_bits = per_module_bits[name]
+            elif routed_expert_bits is not None:
+                tensor_bits = routed_expert_bits
+            else:
+                tensor_bits = _select_bits(w13_param.data, bits, kurtosis_aware)
+
+            # Compress both tensors in place via the shared helper.
+            # _compress_3d_param stores Compressed3D as _tq_{param_name}
+            # and resets param.data to an empty tensor.
+            w13_orig, w13_comp = _compress_3d_param(module, "w13_weight", tensor_bits, group_size)
+            w2_orig, w2_comp = _compress_3d_param(module, "w2_weight", tensor_bits, group_size)
+            total_original += w13_orig + w2_orig
+            total_compressed += w13_comp + w2_comp
+            expert_layers += 2
+
+            # Swap the FusedMoE quant method. _replace_quant_method both
+            # updates self.quant_method AND re-inits the runner so the
+            # runner's captured reference points at our new method.
+            new_method = TurboQuantFusedMoEMethod(module.moe_config, moe_scratch_pool)
+            module._replace_quant_method(new_method)
+
+    # --- Phase 2B: Non-FusedMoE 3D parameter fallback (no forward hook) ---
     for name, param in list(model.named_parameters()):
         if param.dim() != 3:
             continue
@@ -898,6 +1058,13 @@ def _replace_linear_layers(
             continue
 
         owner, param_name = _resolve_parent_and_attr(model, name)
+
+        # Skip params that live inside a FusedMoE we already handled
+        # in Phase 2A. _compress_3d_param resets param.data to an empty
+        # tensor, so those params now have numel 0 and would fail the
+        # downstream pipeline anyway.
+        if FusedMoE is not None and isinstance(owner, FusedMoE):
+            continue
 
         # Apply expert pruning in-place if mask available
         if prune_experts > 0 and name in param_to_mask:
@@ -914,16 +1081,6 @@ def _replace_linear_layers(
         total_original += orig_bytes
         total_compressed += comp_bytes
         expert_layers += 1
-
-        # Track modules that need hooks (group by module identity)
-        mod_id = id(owner)
-        if mod_id not in modules_to_hook:
-            modules_to_hook[mod_id] = (owner, [])
-        modules_to_hook[mod_id][1].append(param_name)
-
-    # Register hooks once per module (not per parameter)
-    for mod_id, (owner, param_names) in modules_to_hook.items():
-        _register_moe_hooks(owner, param_names)
 
     total = replacements + expert_layers
     if total > 0:
