@@ -429,7 +429,11 @@ class TestPluginRegistration(unittest.TestCase):
 
             plugin._native_backend_registered = False
             result = plugin._register_native_backend()
-            selector_cfg = type("SelectorCfg", (), {"kv_cache_dtype": "tq3"})()
+
+            class SelectorCfg:
+                kv_cache_dtype = "tq3"
+
+            selector_cfg = SelectorCfg()
             backends, _ = FakeCudaPlatform.get_valid_backends(None, selector_cfg, None)
 
         self.assertTrue(result)
