@@ -46,6 +46,7 @@ logger = init_logger(__name__)
 
 
 try:
+    from vllm.model_executor.custom_op import CustomOp
     from vllm.model_executor.layers.fused_moe import fused_experts
     from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
         FusedMoEMethodBase,
@@ -53,9 +54,21 @@ try:
 
     _HAS_FUSED_MOE = True
 except ImportError:
-    # Dev/CI machines without vLLM still need to import this module for
-    # CPU tests that monkey-patch the FusedMoE surface.
-    FusedMoEMethodBase = object  # type: ignore[misc,assignment]
+    # Dev/CI machines without vLLM still need to import this module
+    # for CPU tests that monkey-patch the FusedMoE surface. Stub both
+    # bases to a single placeholder so the multi-inheritance class
+    # declaration below doesn't trip Python's "duplicate base class"
+    # check (otherwise both would resolve to ``object``).
+    class _StubFusedMoEMethodBase:
+        def __init__(self, moe_config):
+            self.moe = moe_config
+
+    class _StubCustomOp:
+        def __init__(self):
+            pass
+
+    FusedMoEMethodBase = _StubFusedMoEMethodBase  # type: ignore[misc,assignment]
+    CustomOp = _StubCustomOp  # type: ignore[misc,assignment]
     fused_experts = None  # type: ignore[assignment]
     _HAS_FUSED_MOE = False
 
@@ -101,7 +114,7 @@ class TurboQuantFusedMoEScratchPool:
         return buf
 
 
-class TurboQuantFusedMoEMethod(FusedMoEMethodBase):
+class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """FusedMoE quant method that dequantizes TQ3-packed experts inside apply.
 
     The compressed expert weights are attached to the layer by the runtime
@@ -109,6 +122,15 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase):
     this method is installed via ``layer._replace_quant_method``. We read
     them from the layer at forward time, dequantize into the shared
     scratch pool, and hand the result to ``fused_experts``.
+
+    **Why the multi-inheritance**: ``FusedMoE._replace_quant_method`` sets
+    ``self.quant_method = mk`` (``layer.py:604``). Because ``FusedMoE`` is
+    an ``nn.Module`` and ``quant_method`` was registered as a child module
+    by the original ``UnquantizedFusedMoEMethod`` (which itself inherits
+    from ``CustomOp`` -> ``nn.Module``), torch's ``Module.__setattr__``
+    enforces that the new value also be an ``nn.Module``. Inheriting from
+    ``CustomOp`` gives us the ``nn.Module`` MRO via the same path the
+    in-tree quant methods use.
     """
 
     def __init__(self, moe_config, scratch_pool: TurboQuantFusedMoEScratchPool):
@@ -117,7 +139,10 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase):
                 "TurboQuantFusedMoEMethod requires vllm.model_executor.layers."
                 "fused_moe — import failed at module load."
             )
-        super().__init__(moe_config)
+        # Both bases must be initialized: FusedMoEMethodBase needs
+        # moe_config; CustomOp needs to set up its nn.Module state.
+        FusedMoEMethodBase.__init__(self, moe_config)
+        CustomOp.__init__(self)
         self._scratch_pool = scratch_pool
 
     # ------------------------------------------------------------------
