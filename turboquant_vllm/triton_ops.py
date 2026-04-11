@@ -361,8 +361,9 @@ class FWHTInputCache:
         del result
 
 
-# Default cache instance. For multi-model setups, pass a per-model
-# FWHTInputCache to tq_fwht_input_gemm(..., cache=my_cache) instead.
+# Kept for backward-compat with eager-mode callers that hold a direct
+# reference. Not wired into tq_fwht_input_gemm anymore — see that
+# function's docstring for why.
 _fwht_input_cache = FWHTInputCache()
 
 
