@@ -215,10 +215,14 @@ def tq_fused_gemm(
     if not HAS_TRITON:
         raise ImportError("Triton required for fused GEMM")
 
-    # Handle 3D input (batch, seq, hidden) from transformers
+    # Handle both 2D (M, K) and 3D (B, L, K) input uniformly. vLLM 0.19
+    # fullgraph dynamo can't handle a runtime-conditional reshape here:
+    # it traces BOTH branches of `if x.dim() > 2`, and the else branch
+    # (where x is assumed 2D) crashes on the downstream `M, K = x.shape`
+    # when the actual input is 3D. Unconditional reshape is a no-op for
+    # already-2D input and gives dynamo a single straight-line trace.
     orig_shape = x.shape
-    if x.dim() > 2:
-        x = x.reshape(-1, x.shape[-1])
+    x = x.reshape(-1, x.shape[-1])
 
     M, K = x.shape
     N = norms.shape[0]
@@ -357,8 +361,9 @@ class FWHTInputCache:
         del result
 
 
-# Default cache instance. For multi-model setups, pass a per-model
-# FWHTInputCache to tq_fwht_input_gemm(..., cache=my_cache) instead.
+# Kept for backward-compat with eager-mode callers that hold a direct
+# reference. Not wired into tq_fwht_input_gemm anymore — see that
+# function's docstring for why.
 _fwht_input_cache = FWHTInputCache()
 
 
@@ -538,26 +543,30 @@ def tq_fwht_input_gemm(
     group_size: int = 128,
     bits: int = 4,
     bias: torch.Tensor | None = None,
-    cache: FWHTInputCache | None = None,
 ) -> torch.Tensor:
     """FWHT-on-input fused GEMM. Rotates input once, then codebook dot product.
 
     2x+ faster than dequant-GEMM because:
     - FWHT applied to input (1 vector) not weights (N rows)
     - No intermediate decompressed weight buffer
-    - FWHT cacheable across Q/K/V projections (67% cache hit rate)
 
-    Args:
-        cache: Optional per-model FWHTInputCache. Defaults to the global
-               singleton. Pass a dedicated instance for multi-model or
-               multi-threaded inference to avoid stale cache hits.
+    Previously accepted an FWHTInputCache argument that reused the rotated
+    input across Q/K/V projections (67% hit rate). Removed because the
+    fingerprint check did a D2H `.cpu()` copy, which is illegal under CUDA
+    graph capture (cudaErrorStreamCaptureUnsupported). Once the function
+    is wrapped as a `torch.library.custom_op`, the body is opaque to
+    inductor so CSE across Q/K/V projections is NOT automatic — this is
+    a real ~2x regression on the FWHT path and a capture-safe replacement
+    cache (or a rotation hoisted into its own op called once per attention
+    block) is the next optimization to revisit.
     """
     if not HAS_TRITON:
         raise ImportError("Triton required")
 
+    # Unconditional reshape for dynamo-fullgraph-compatibility — see
+    # tq_fused_gemm above for the full explanation.
     orig_shape = x.shape
-    if x.dim() > 2:
-        x = x.reshape(-1, x.shape[-1])
+    x = x.reshape(-1, x.shape[-1])
 
     M, K = x.shape
     N = norms.shape[0]
@@ -567,13 +576,7 @@ def tq_fwht_input_gemm(
     if K != padded_K:
         raise ValueError(f"K={K} not aligned with group_size={group_size}, expected {padded_K}")
 
-    input_cache = cache if cache is not None else _fwht_input_cache
-    cached = input_cache.get(x)
-    if cached is not None:
-        x_rot = cached
-    else:
-        x_rot = rotate_input(x.float(), signs1, signs2, group_size)
-        input_cache.put(x, x_rot)
+    x_rot = rotate_input(x.float(), signs1, signs2, group_size)
 
     output = torch.empty(M, N, dtype=x.dtype, device=x.device)
 
@@ -610,6 +613,111 @@ def tq_fwht_input_gemm(
         output = output.reshape(*orig_shape[:-1], N)
 
     return output
+
+
+# vLLM 0.19 fullgraph-AOT-compiles TurboQuantWrapper.forward. The launcher
+# functions above contain Python-side bookkeeping (id()-keyed rotation
+# matrix cache, FWHTInputCache with x.data_ptr() / untyped_storage()
+# checks, Triton kernel launches) that dynamo cannot trace. `allow_in_graph`
+# is not enough here because dynamo still runs the wrapped function on
+# FakeTensors during trace for shape inference, and Triton's kernel
+# launcher calls .data_ptr() on the fakes — PyTorch itself directs us to
+# the right fix in the resulting error message:
+#
+#   "Cannot access data pointer of Tensor (e.g. FakeTensor, ...). If
+#    you're using torch.compile/export/fx, it is likely that we are
+#    erroneously tracing into a custom kernel. To fix this, please wrap
+#    the custom kernel into an opaque custom op."
+#
+# So we register both launchers as `torch.library.custom_op` with a
+# FakeTensor (meta) implementation that returns an empty output of the
+# correct shape/dtype. At trace time, dynamo uses the fake impl and never
+# sees inside the real function. At runtime the real Python body runs as
+# usual, including all its Triton kernel launches and host-side caches.
+#
+# We keep the original functions bound to module-level names so tests and
+# eager-mode callers still see the same callables, but we rebind them to
+# the custom-op wrappers after registration. Old imports by reference
+# (`from ... import tq_fused_gemm`) done after module load pick up the
+# wrapper automatically.
+try:
+    _tq_fused_gemm_impl = tq_fused_gemm
+    _tq_fwht_input_gemm_impl = tq_fwht_input_gemm
+
+    @torch.library.custom_op(
+        "turboquant::tq_fused_gemm", mutates_args=(), device_types=("cuda",)
+    )
+    def _tq_fused_gemm_op(
+        x: torch.Tensor,
+        packed_weight: torch.Tensor,
+        norms: torch.Tensor,
+        signs1: torch.Tensor,
+        signs2: torch.Tensor,
+        centroids: torch.Tensor,
+        group_size: int,
+        bits: int,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _tq_fused_gemm_impl(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size=group_size, bits=bits, bias=bias,
+        )
+
+    @_tq_fused_gemm_op.register_fake
+    def _(x, packed_weight, norms, signs1, signs2, centroids, group_size, bits, bias):
+        N = norms.shape[0]
+        return x.new_empty((*x.shape[:-1], N))
+
+    @torch.library.custom_op(
+        "turboquant::tq_fwht_input_gemm", mutates_args=(), device_types=("cuda",)
+    )
+    def _tq_fwht_input_gemm_op(
+        x: torch.Tensor,
+        packed_weight: torch.Tensor,
+        norms: torch.Tensor,
+        signs1: torch.Tensor,
+        signs2: torch.Tensor,
+        centroids: torch.Tensor,
+        group_size: int,
+        bits: int,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _tq_fwht_input_gemm_impl(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size=group_size, bits=bits, bias=bias,
+        )
+
+    @_tq_fwht_input_gemm_op.register_fake
+    def _(x, packed_weight, norms, signs1, signs2, centroids, group_size, bits, bias):
+        N = norms.shape[0]
+        return x.new_empty((*x.shape[:-1], N))
+
+    # Public callables that dynamo treats as opaque ops. Keyword args are
+    # not supported across the custom_op boundary (schema is positional),
+    # so we wrap to restore the original keyword-friendly call signature.
+    def tq_fused_gemm(  # type: ignore[no-redef]
+        x, packed_weight, norms, signs1, signs2, centroids,
+        group_size=128, bits=4, bias=None,
+    ):
+        return torch.ops.turboquant.tq_fused_gemm(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size, bits, bias,
+        )
+
+    def tq_fwht_input_gemm(  # type: ignore[no-redef]
+        x, packed_weight, norms, signs1, signs2, centroids,
+        group_size=128, bits=4, bias=None,
+    ):
+        return torch.ops.turboquant.tq_fwht_input_gemm(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size, bits, bias,
+        )
+
+except (AttributeError, RuntimeError):
+    # torch < 2.4 or torch.library.custom_op unavailable — fall through to
+    # the plain Python functions. Eager mode still works; fullgraph compile
+    # will re-surface the underlying tracing error.
+    pass
 
 
 # ── PlanarQuant Triton kernels (2D Givens rotation) ─────────────────

@@ -226,13 +226,33 @@ class TurboQuantWrapper(nn.Module):
         self.out_features = original.out_features
         self._has_learned_rotation = rotation is not None
 
+        # vLLM's Linear subclasses return either `output` or a
+        # `(output, output_bias)` tuple depending on the `return_bias`
+        # flag. Downstream model code (e.g. Qwen2/Gemma4 qkv projection
+        # handling) does `qkv, _ = self.qkv_proj(x)`, which crashes
+        # under vLLM 0.19 fullgraph dynamo as "Can't unpack a tensor
+        # of 2048 rows into a tuple of 2 elements" if we return only
+        # a tensor. Mirror the original's return_bias flag — default
+        # to False when wrapping a plain nn.Linear (returns a plain
+        # tensor) vs True when wrapping a vLLM Linear subclass.
+        self.return_bias = getattr(original, "return_bias", False)
+
         # Probe Triton + CUDA backends during construction, NOT in forward().
-        # vLLM 0.19 AOT-compiles forward() in fullgraph mode, which forbids
-        # both logger calls and graph breaks from @torch._dynamo.disable.
-        # Doing the probes here populates the module globals before any
-        # forward is traced; forward then reads them as simple constants.
+        # vLLM 0.19 AOT-compiles forward() in fullgraph mode and can't trace
+        # logger calls or @torch._dynamo.disable helpers. Doing the probes
+        # here populates the module globals before any forward is traced.
         _ensure_triton_backends()
         _get_cuda_module()
+
+        # Cache the PolarQuant rotation tensors (signs1, signs2, centroids)
+        # as buffers on the wrapper. forward() will read them directly as
+        # tensor attributes rather than calling _get_quantizer() — that
+        # helper does a dict lookup and Python object construction that
+        # vLLM 0.19's fullgraph dynamo compile cannot trace.
+        _pq = _get_quantizer(group_size, bits, str(original.weight.device))
+        self.register_buffer("tq_signs1", _pq.signs1)
+        self.register_buffer("tq_signs2", _pq.signs2)
+        self.register_buffer("tq_centroids", _pq.centroids)
 
         weight = original.weight.data  # (out_features, in_features)
         # Flatten to 2D when weight has extra leading dimensions (e.g. vLLM
@@ -335,14 +355,26 @@ class TurboQuantWrapper(nn.Module):
 
         return wrapper
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Probes have already run in __init__; read the populated globals
-        # directly so this function is pure-compute and vLLM 0.19's
-        # torch.dynamo fullgraph compile doesn't see any helpers with
-        # logger calls or @torch._dynamo.disable decorators.
+    def forward(self, x: torch.Tensor):
+        # Trivial dispatch that dynamo can specialize on x.is_cuda when
+        # vLLM 0.19 fullgraph-compiles the CUDA forward path. The CPU
+        # branch is still physically present for pytest / dev machines
+        # without a CUDA extension.
+        output = self._forward_gpu(x) if x.is_cuda else self._forward_cpu(x)
+        # Match vLLM Linear's return_bias contract. See __init__.
+        if self.return_bias:
+            return output, None
+        return output
+
+    def _forward_gpu(self, x: torch.Tensor) -> torch.Tensor:
+        """Fullgraph-dynamo-clean forward for GPU (Triton or CUDA backends).
+
+        Must NOT contain logger calls, calls to @torch._dynamo.disable'd
+        helpers, or method calls on non-tensor Python objects that do dict
+        lookups / string conversions. vLLM 0.19 AOT-compiles this path.
+        """
         if _triton_available and x.is_cuda:
-            quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
-            args = (x, self.packed_weight, self.norms, quantizer.signs1, quantizer.signs2, quantizer.centroids)
+            args = (x, self.packed_weight, self.norms, self.tq_signs1, self.tq_signs2, self.tq_centroids)
             kwargs = dict(group_size=self.group_size, bits=self.bits, bias=self.bias)
 
             # FWHT-on-input wins for large output dims (saves N inverse rotations).
@@ -353,44 +385,48 @@ class TurboQuantWrapper(nn.Module):
             try:
                 return primary(*args, **kwargs)
             except (ValueError, RuntimeError):
-                try:
-                    return fallback(*args, **kwargs)
-                except (ValueError, RuntimeError):
-                    pass
+                return fallback(*args, **kwargs)
 
-        cuda_mod = _cuda_mod if _cuda_available else None
-
-        if cuda_mod is not None:
-            output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
-            w_deq = torch.empty(self.out_features, self.in_features, dtype=output_dtype, device=x.device)
-
-            quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
-            cuda_mod.weight_dequant(
-                self.packed_weight,
-                self.norms,
-                quantizer.signs1,
-                quantizer.signs2,
-                quantizer.centroids,
-                w_deq,
-                self.group_size,
-                self.bits,
-                self.out_features,
-                self.in_features,
-            )
-        else:
-            indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
-            norms_flat = self.norms.reshape(-1)
-
-            quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
-            w_groups = quantizer.dequantize(indices, norms_flat)
-
-            w_deq = w_groups.reshape(self.out_features, self.padded_in)[:, : self.in_features]
-            w_deq = w_deq.to(x.dtype)
+        # CUDA C++ extension path — called via the compiled .so, which
+        # dynamo treats as opaque. Built once at plugin init by build.py.
+        output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
+        w_deq = torch.empty(self.out_features, self.in_features, dtype=output_dtype, device=x.device)
+        _cuda_mod.weight_dequant(
+            self.packed_weight,
+            self.norms,
+            self.tq_signs1,
+            self.tq_signs2,
+            self.tq_centroids,
+            w_deq,
+            self.group_size,
+            self.bits,
+            self.out_features,
+            self.in_features,
+        )
 
         if w_deq.dtype != x.dtype:
             w_deq = w_deq.to(x.dtype)
         output = torch.matmul(x, w_deq.t())
-        del w_deq  # free decompressed weight immediately
+        if self.bias is not None:
+            output = output + self.bias
+        return output
+
+    def _forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        """CPU fallback using the PolarQuant reference implementation.
+
+        Used on systems without Triton and without a built CUDA extension
+        (typically developer machines, tests, and CI). Not dynamo-friendly
+        because _fast_wht_batch has a data-dependent while loop and
+        PolarQuantTorch.dequantize is a method call — but that's fine
+        because this path only runs in eager mode.
+        """
+        indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
+        norms_flat = self.norms.reshape(-1)
+        quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
+        w_groups = quantizer.dequantize(indices, norms_flat)
+        w_deq = w_groups.reshape(self.out_features, self.padded_in)[:, : self.in_features]
+        w_deq = w_deq.to(x.dtype)
+        output = torch.matmul(x, w_deq.t())
         if self.bias is not None:
             output = output + self.bias
         return output
