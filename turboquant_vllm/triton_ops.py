@@ -617,6 +617,24 @@ def tq_fwht_input_gemm(
     return output
 
 
+# vLLM 0.19 fullgraph-AOT-compiles TurboQuantWrapper.forward. The launcher
+# functions below contain Python-side bookkeeping (dict lookups keyed on
+# id(), tensor .data_ptr() cache checks, Triton kernel launches, runtime
+# shape padding) that dynamo cannot trace. allow_in_graph tells dynamo to
+# treat each call as an opaque leaf: the function runs at graph execution
+# time as-is, tensors flow through normally, and dynamo does not look
+# inside. Triton kernels are therefore launched at runtime, bypassing
+# dynamo's tracer entirely. This is the standard wrap-a-triton-kernel
+# pattern for fullgraph compile.
+try:
+    import torch._dynamo
+
+    tq_fused_gemm = torch._dynamo.allow_in_graph(tq_fused_gemm)
+    tq_fwht_input_gemm = torch._dynamo.allow_in_graph(tq_fwht_input_gemm)
+except ImportError:
+    pass
+
+
 # ── PlanarQuant Triton kernels (2D Givens rotation) ─────────────────
 # Based on RotorQuant/PlanarQuant by scrya-com/ParaMind2025.
 # 4 FMAs per pair, fully parallel, O(d) — replaces O(d log d) WHT.
