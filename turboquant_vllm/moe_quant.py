@@ -199,27 +199,30 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         ``decompress_into`` is safe here.
         """
         import sys as _sys
-        _sys.stderr.write(f"[TQ_APPLY] called, x.shape={tuple(x.shape)}\n")
-        _sys.stderr.flush()
+        import torch as _torch
 
         w13_compressed = layer._tq_w13_weight
         w2_compressed = layer._tq_w2_weight
 
-        w13_buf = self._scratch_pool.ensure(
-            "w13",
-            w13_compressed.shape,
-            w13_compressed.dtype,
-            w13_compressed.packed.device,
-        )
-        w2_buf = self._scratch_pool.ensure(
-            "w2",
-            w2_compressed.shape,
-            w2_compressed.dtype,
-            w2_compressed.packed.device,
-        )
+        # DEBUG: fresh allocation per call (no shared scratch pool),
+        # to rule out CUDA-graph aliasing between layers. Reverts to
+        # pool-based allocation once the correctness issue is pinned.
+        w13_buf = w13_compressed.decompress()
+        w2_buf = w2_compressed.decompress()
 
-        w13_compressed.decompress_into(w13_buf)
-        w2_compressed.decompress_into(w2_buf)
+        # Log first few calls with norm + sanity stats
+        if not getattr(self, "_debug_n", 0):
+            self._debug_n = 0
+        if self._debug_n < 4:
+            _sys.stderr.write(
+                f"[TQ_APPLY #{self._debug_n}] x.shape={tuple(x.shape)} "
+                f"x.norm={x.float().norm().item():.3f} "
+                f"w13_buf.norm={w13_buf.float().norm().item():.3f} "
+                f"w13_buf.isnan={_torch.isnan(w13_buf).any().item()} "
+                f"w2_buf.norm={w2_buf.float().norm().item():.3f}\n"
+            )
+            _sys.stderr.flush()
+            self._debug_n += 1
 
         return fused_experts(
             x,
