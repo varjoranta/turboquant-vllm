@@ -74,25 +74,38 @@ except ImportError:
 
 
 class TurboQuantFusedMoEScratchPool:
-    """Single pair of bf16 scratch buffers shared across all FusedMoE layers.
+    """Shared scratch buffers for all FusedMoE layers.
 
-    Only one MoE layer runs at a time during a forward pass, so a single
-    pair of ``(w13, w2)`` scratch buffers is enough for the entire model.
-    Allocating per-layer scratch is the easy mistake: for a 48-layer MoE
-    that ends up holding the uncompressed expert weights in bf16 on the
-    side, defeating the entire point of compression.
+    Only one MoE layer runs at a time during forward, so a single set
+    of scratch buffers is enough regardless of layer count. Per-layer
+    scratch is the easy mistake: for a 48-layer MoE that ends up
+    holding the uncompressed expert weights on the side, defeating the
+    compression entirely.
+
+    The pool holds five slots:
+
+    - ``w13`` / ``w2`` — bf16 destination for the dequantized expert
+      tensors, passed to ``fused_experts`` / the base unquantized
+      kernel.
+    - ``w13_fp32`` / ``w2_fp32`` — fp32 intermediate for the CUDA
+      dequant kernel (which only produces fp16 or fp32). Without
+      pooling, ``decompress_into`` would allocate these per-call,
+      which under CUDA graph capture bakes ~3 GB of ephemeral memory
+      into each captured piecewise graph and easily blows the KV-cache
+      budget on Qwen3-30B-A3B.
 
     All FusedMoE layers in a given model are assumed to share the same
-    expert-weight shapes (same ``num_experts``, same ``hidden_size``,
-    same ``intermediate_size_per_partition``). Layers with mismatched
-    shapes trigger an assertion, not silent corruption.
+    expert-weight shapes. Mismatched shapes trigger an assertion, not
+    silent corruption.
     """
 
-    __slots__ = ("w13", "w2")
+    __slots__ = ("w13", "w2", "w13_fp32", "w2_fp32")
 
     def __init__(self):
         self.w13: torch.Tensor | None = None
         self.w2: torch.Tensor | None = None
+        self.w13_fp32: torch.Tensor | None = None
+        self.w2_fp32: torch.Tensor | None = None
 
     def ensure(
         self,
@@ -230,12 +243,21 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             w2_compressed.packed.device,
         )
 
+        # Pass the pooled fp32 intermediates through to the dequant
+        # kernel. Without pooling, ``decompress_into`` would call
+        # ``torch.empty(..., dtype=fp32)`` per call, and under CUDA
+        # graph capture every one of those ephemerals gets baked into
+        # the captured graph memory footprint — for Qwen3-30B-A3B
+        # that was ~2 GB over the KV-cache budget.
+        w13_fp32 = self._scratch_pool.w13_fp32
+        w2_fp32 = self._scratch_pool.w2_fp32
+
         # Dequantize into the shared scratch pool. Subsequent layers
         # will overwrite the same memory, but only after this layer's
         # fused_experts read completes (CUDA graph node dependency
         # tracks the read-after-write between dequant and GEMM).
-        w13_compressed.decompress_into(w13_buf)
-        w2_compressed.decompress_into(w2_buf)
+        w13_compressed.decompress_into(w13_buf, fp32_scratch=w13_fp32)
+        w2_compressed.decompress_into(w2_buf, fp32_scratch=w2_fp32)
 
         # Re-point the layer's .data slots at the scratch. The base
         # UnquantizedFusedMoEMethod.apply reads `layer.w13_weight` and

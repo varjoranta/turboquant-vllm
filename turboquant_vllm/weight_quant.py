@@ -539,19 +539,22 @@ class Compressed3D:
         obj.compressed_bytes = packed.numel() + norms.numel() * 4
         return obj
 
-    def decompress_into(self, out: torch.Tensor) -> None:
+    def decompress_into(
+        self, out: torch.Tensor, fp32_scratch: torch.Tensor | None = None
+    ) -> None:
         """Write decompressed weights into a pre-allocated ``out`` buffer.
 
         ``out`` must have ``shape == self.shape`` and ``dtype == self.dtype``,
         and must be on the same device as ``self.packed``. Used by the
         TurboQuant MoE quant method's ``apply()`` hot path to avoid
-        per-forward bf16 allocation — the caller pools ``out`` on the
-        ``FusedMoE`` layer and reuses it across every forward call.
+        per-forward bf16 allocation.
 
-        For bfloat16 targets an intermediate float32 scratch is allocated
-        for the CUDA kernel output (the kernel only produces fp16 or fp32),
-        and we cast-copy into ``out`` afterwards. The caching allocator
-        typically reuses the same slot across calls for this intermediate.
+        For bfloat16 targets the CUDA kernel's output dtype is float32,
+        so we need an intermediate fp32 buffer. The caller can pass a
+        pre-allocated ``fp32_scratch`` to avoid the per-call allocation
+        (critical under CUDA graph capture, where each ephemeral
+        allocation is baked into the replayed graph). If None, a fresh
+        fp32 buffer is allocated per call.
         """
         assert out.shape == self.shape, (
             f"decompress_into expected shape {self.shape}, got {tuple(out.shape)}"
@@ -565,18 +568,18 @@ class Compressed3D:
 
         cuda_mod = _get_cuda_module()
         if cuda_mod is None:
-            # Fallback: delegate to the chunked-PyTorch path and copy.
             out.copy_(self.decompress())
             return
 
-        # CUDA kernel output dtype: fp16 for fp16 targets, fp32 otherwise
-        # (including bf16). When the target is already the kernel's native
-        # output dtype we write directly; otherwise we stage through fp32
-        # and cast-copy.
         n_experts, out_dim, in_dim = self.shape
         kernel_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
         if kernel_dtype == self.dtype:
             target = out
+        elif fp32_scratch is not None:
+            assert fp32_scratch.shape == self.shape
+            assert fp32_scratch.dtype == kernel_dtype
+            assert fp32_scratch.device == self.packed.device
+            target = fp32_scratch
         else:
             target = torch.empty(
                 self.shape, dtype=kernel_dtype, device=self.packed.device
@@ -1049,18 +1052,22 @@ def _replace_linear_layers(
             # bytes and sizes the KV cache accordingly. Lazy allocation
             # in apply() races with profile/capture and produced OOM
             # at capture time on Qwen3-30B-A3B.
+            #
+            # Four slots: w13 / w2 bf16 destinations + w13_fp32 /
+            # w2_fp32 intermediates for the CUDA dequant kernel. The
+            # fp32 intermediates are critical to pre-allocate — without
+            # pooling, they would get re-allocated inside every
+            # captured graph piece and blow the KV-cache budget.
             if moe_scratch_pool is not None:
+                w13_c = module._tq_w13_weight
+                w2_c = module._tq_w2_weight
+                moe_scratch_pool.ensure("w13", w13_c.shape, w13_c.dtype, w13_c.packed.device)
+                moe_scratch_pool.ensure("w2", w2_c.shape, w2_c.dtype, w2_c.packed.device)
                 moe_scratch_pool.ensure(
-                    "w13",
-                    module._tq_w13_weight.shape,
-                    module._tq_w13_weight.dtype,
-                    module._tq_w13_weight.packed.device,
+                    "w13_fp32", w13_c.shape, torch.float32, w13_c.packed.device
                 )
                 moe_scratch_pool.ensure(
-                    "w2",
-                    module._tq_w2_weight.shape,
-                    module._tq_w2_weight.dtype,
-                    module._tq_w2_weight.packed.device,
+                    "w2_fp32", w2_c.shape, torch.float32, w2_c.packed.device
                 )
 
             # Swap the FusedMoE quant method. _replace_quant_method both
