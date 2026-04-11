@@ -198,47 +198,52 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         dynamo, so the pybind11 ``weight_dequant_3d`` call inside
         ``decompress_into`` is safe here.
 
-        **Delegation strategy**: instead of calling ``fused_experts``
-        directly with ``quant_config=None`` (which goes through an
-        easily-stale unquantized codepath), we populate the original
-        ``layer.w13_weight.data`` / ``layer.w2_weight.data`` buffers
-        with freshly-decompressed bf16 expert tensors and then call the
-        original ``UnquantizedFusedMoEMethod.apply()`` captured as
+        **Delegation strategy**: populate ``layer.w13_weight.data`` /
+        ``layer.w2_weight.data`` with decompressed bf16 scratch views
+        pointing at the shared scratch pool, then delegate to the
+        original ``UnquantizedFusedMoEMethod`` captured as
         ``layer.base_quant_method`` during ``FusedMoE.__init__``. This
-        ensures we walk the exact same code path the unquantized BF16
-        benchmark runs — including any ``self.kernel.apply`` /
-        activation / routing specialization that ``fused_experts``
-        might not cover.
+        walks the exact same code path the unquantized BF16 benchmark
+        runs — including ``self.kernel.apply``, activation, and
+        routing specialization — which avoids having to reimplement
+        any of it here.
+
+        The scratch pool allocates ONE pair of bf16 buffers shared by
+        all FusedMoE layers (only one layer runs at a time during
+        forward, so one pair is sufficient). We re-point
+        ``layer.w13_weight.data`` / ``layer.w2_weight.data`` at the
+        scratch buffers before each delegation call.
         """
         w13_compressed = layer._tq_w13_weight
         w2_compressed = layer._tq_w2_weight
 
-        # Lazily re-materialize layer.w13_weight.data / layer.w2_weight.data
-        # as shaped bf16 tensors the first time apply() runs. This reuses
-        # one allocation per layer, which is the same memory footprint as
-        # keeping the bf16 weights resident — the compression story is
-        # about **initialization** memory pressure (bf16 checkpoint fits
-        # on disk and loads then frees) more than runtime memory in this
-        # delegation design. Future optimization: move decompress into a
-        # shared scratch pool and back-patch .data to point at the pool.
-        if layer.w13_weight.data.numel() == 0:
-            layer.w13_weight.data = torch.empty(
-                w13_compressed.shape,
-                dtype=w13_compressed.dtype,
-                device=w13_compressed.packed.device,
-            )
-            layer.w2_weight.data = torch.empty(
-                w2_compressed.shape,
-                dtype=w2_compressed.dtype,
-                device=w2_compressed.packed.device,
-            )
+        w13_buf = self._scratch_pool.ensure(
+            "w13",
+            w13_compressed.shape,
+            w13_compressed.dtype,
+            w13_compressed.packed.device,
+        )
+        w2_buf = self._scratch_pool.ensure(
+            "w2",
+            w2_compressed.shape,
+            w2_compressed.dtype,
+            w2_compressed.packed.device,
+        )
 
-        # Dequantize in place into the layer's own .data slot.
-        w13_compressed.decompress_into(layer.w13_weight.data)
-        w2_compressed.decompress_into(layer.w2_weight.data)
+        # Dequantize into the shared scratch pool. Subsequent layers
+        # will overwrite the same memory, but only after this layer's
+        # fused_experts read completes (CUDA graph node dependency
+        # tracks the read-after-write between dequant and GEMM).
+        w13_compressed.decompress_into(w13_buf)
+        w2_compressed.decompress_into(w2_buf)
 
-        # Delegate to the original UnquantizedFusedMoEMethod captured
-        # as base_quant_method during FusedMoE.__init__.
+        # Re-point the layer's .data slots at the scratch. The base
+        # UnquantizedFusedMoEMethod.apply reads `layer.w13_weight` and
+        # `layer.w2_weight` — we make those point at the freshly
+        # decompressed bf16 tensors in the shared pool.
+        layer.w13_weight.data = w13_buf
+        layer.w2_weight.data = w2_buf
+
         return layer.base_quant_method.apply(
             layer=layer,
             x=x,
