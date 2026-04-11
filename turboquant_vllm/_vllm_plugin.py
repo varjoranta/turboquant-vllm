@@ -306,23 +306,33 @@ def _register_native_backend() -> bool:
     # Accessing the original via the class gives a bound method, so
     # _orig_get_valid(...) below can be called without passing cls.
     try:
+        import inspect
+
         from vllm.platforms.cuda import CudaPlatform
 
         current_get_valid = CudaPlatform.get_valid_backends
         current_fn = getattr(current_get_valid, "__func__", current_get_valid)
         if not getattr(current_fn, "_tq_wrapped", False):
-            _orig_get_valid = current_get_valid
+            _orig_get_valid_fn = current_fn
+            try:
+                param_names = list(inspect.signature(_orig_get_valid_fn).parameters.keys())[1:]
+            except (TypeError, ValueError):
+                param_names = []
 
             def _tq_get_valid_backends(cls, *args, **kwargs):
                 attn_selector_config = kwargs.get("attn_selector_config")
-                if attn_selector_config is None and len(args) >= 2:
-                    attn_selector_config = args[1]
+                if attn_selector_config is None and "attn_selector_config" in param_names:
+                    idx = param_names.index("attn_selector_config")
+                    if idx < len(args):
+                        attn_selector_config = args[idx]
+                if attn_selector_config is None:
+                    attn_selector_config = next((a for a in args if hasattr(a, "kv_cache_dtype")), None)
                 kv_cache_dtype = getattr(attn_selector_config, "kv_cache_dtype", None)
                 if _is_tq_dtype(kv_cache_dtype):
                     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
                     return [(AttentionBackendEnum.CUSTOM, 0)], {}
-                return _orig_get_valid(*args, **kwargs)
+                return _orig_get_valid_fn(cls, *args, **kwargs)
 
             _tq_get_valid_backends._tq_wrapped = True  # type: ignore[attr-defined]
             CudaPlatform.get_valid_backends = classmethod(_tq_get_valid_backends)
