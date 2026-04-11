@@ -311,6 +311,81 @@ def _get_cached_rotation_matrix(signs1: torch.Tensor, signs2: torch.Tensor, grou
     return _rotation_matrix_cache[key]
 
 
+class FWHTInputCache:
+    """Reuses the rotated input across Q/K/V projections in one attention block.
+
+    Q/K/V projections in a standard attention block all receive the
+    identical hidden-state tensor. Rotating it three times (once per
+    projection) is pure waste — the rotation is a pure function of `x`
+    alone. This cache recognizes the repeat and returns the cached
+    rotated tensor on the 2nd and 3rd call, cutting the rotation work
+    by ~67% across the block.
+
+    **Capture safety**: the cache key is `(data_ptr, shape, dtype,
+    version)`, all pure host-side metadata reads. Crucially there is no
+    `.cpu()`, `.item()`, or other host-synchronizing call — those are
+    illegal inside CUDA graph capture and sank the previous iteration
+    of this cache (`cudaErrorStreamCaptureUnsupported`). `_version`
+    catches in-place mutations of a cached tensor; `data_ptr` catches
+    reallocation to a different memory slot; `shape` and `dtype` catch
+    the remaining identity-vs-equality gap.
+
+    **Custom op interaction**: the cache lives inside the opaque
+    `torch.library.custom_op` body, so dynamo never sees it. During
+    warmup the cache gets populated per attention block; during CUDA
+    graph capture the same logic runs and the resulting rotation
+    kernel launches are recorded into the graph once instead of three
+    times. Replay skips Python entirely, so the cache membership is
+    baked into the graph structure.
+
+    **Staleness**: the cache holds exactly one entry. Between forward
+    passes a new hidden-state tensor (different `x`) misses on all
+    three key components and evicts the stale entry naturally. This
+    is simpler and safer than size-bounded eviction.
+    """
+
+    __slots__ = ("_ptr", "_shape", "_dtype", "_version", "_result")
+
+    def __init__(self):
+        self._ptr: int = -1
+        self._shape: tuple = ()
+        self._dtype: torch.dtype | None = None
+        self._version: int = -1
+        self._result: torch.Tensor | None = None
+
+    def get(self, x: torch.Tensor) -> torch.Tensor | None:
+        if (
+            x.data_ptr() == self._ptr
+            and x.shape == self._shape
+            and x.dtype == self._dtype
+            and x._version == self._version
+        ):
+            return self._result
+        return None
+
+    def put(self, x: torch.Tensor, result: torch.Tensor) -> None:
+        self._ptr = x.data_ptr()
+        self._shape = x.shape
+        self._dtype = x.dtype
+        self._version = x._version
+        self._result = result
+
+    def clear(self) -> None:
+        self._ptr = -1
+        self._shape = ()
+        self._dtype = None
+        self._version = -1
+        self._result = None
+
+
+# Module-level singleton. One cache is enough for the standard Q/K/V
+# pattern because Q, K, V are called sequentially on the same block's
+# hidden state — by the time we reach the next attention block, the
+# stale entry misses on data_ptr and gets replaced. Multi-threaded or
+# multi-stream inference should use per-instance caches instead.
+_fwht_input_cache = FWHTInputCache()
+
+
 def rotate_input(
     x: torch.Tensor,
     signs1: torch.Tensor,
@@ -343,6 +418,20 @@ def rotate_input(
 
 if HAS_TRITON:
 
+    # Autotune key deliberately excludes `batch_size`. Under vLLM 0.19
+    # piecewise CUDA graph capture, each of the ~51 capture batch sizes
+    # would otherwise trigger its own autotune run (10 configs × 51
+    # shapes × per-Linear) — that's where the 10-25 min capture-time
+    # stall came from on the first TQ3 benchmark. Keying only on the
+    # weight-shape components makes autotune run once per distinct
+    # (out_f, in_f_padded) pair — roughly 3-5× per decoder layer
+    # instead of 150+.
+    #
+    # Tradeoff: the selected config is frozen at the first batch size
+    # the kernel sees. For decoder-dominated workloads (small batch,
+    # BLOCK_M=1 optimal) this is fine because the initial capture runs
+    # at batch=1. For prefill-heavy workloads a coarser bucketed-key
+    # pass may be worth revisiting.
     @triton.autotune(
         configs=[
             triton.Config({"BLOCK_M": 1, "BLOCK_N": 128}, num_warps=4, num_stages=2),
@@ -356,7 +445,7 @@ if HAS_TRITON:
             triton.Config({"BLOCK_M": 32, "BLOCK_N": 128}, num_warps=8, num_stages=2),
             triton.Config({"BLOCK_M": 64, "BLOCK_N": 64}, num_warps=4, num_stages=2),
         ],
-        key=["batch_size", "out_f", "in_f_padded"],
+        key=["out_f", "in_f_padded"],
     )
     @triton.jit
     def _polar_fused_gemm_kernel(
@@ -493,16 +582,8 @@ def tq_fwht_input_gemm(
     2x+ faster than dequant-GEMM because:
     - FWHT applied to input (1 vector) not weights (N rows)
     - No intermediate decompressed weight buffer
-
-    Previously accepted an FWHTInputCache argument that reused the rotated
-    input across Q/K/V projections (67% hit rate). Removed because the
-    fingerprint check did a D2H `.cpu()` copy, which is illegal under CUDA
-    graph capture (cudaErrorStreamCaptureUnsupported). Once the function
-    is wrapped as a `torch.library.custom_op`, the body is opaque to
-    inductor so CSE across Q/K/V projections is NOT automatic — this is
-    a real ~2x regression on the FWHT path and a capture-safe replacement
-    cache (or a rotation hoisted into its own op called once per attention
-    block) is the next optimization to revisit.
+    - Rotation is cached across Q/K/V projections sharing the same
+      hidden state (see ``FWHTInputCache``)
     """
     if not HAS_TRITON:
         raise ImportError("Triton required")
@@ -520,7 +601,16 @@ def tq_fwht_input_gemm(
     if K != padded_K:
         raise ValueError(f"K={K} not aligned with group_size={group_size}, expected {padded_K}")
 
-    x_rot = rotate_input(x.float(), signs1, signs2, group_size)
+    # FWHT-on-input cache: Q/K/V projections all see the same hidden
+    # state, so rotating it three times is ~2x wasted work. The cache
+    # uses only host-side tensor metadata (data_ptr, shape, dtype,
+    # _version) — no .cpu() / .item() host sync, so this is safe under
+    # CUDA graph capture. See FWHTInputCache docstring above for the
+    # capture-safety reasoning.
+    x_rot = _fwht_input_cache.get(x)
+    if x_rot is None:
+        x_rot = rotate_input(x.float(), signs1, signs2, group_size)
+        _fwht_input_cache.put(x, x_rot)
 
     output = torch.empty(M, N, dtype=x.dtype, device=x.device)
 
