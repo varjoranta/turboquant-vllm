@@ -618,20 +618,107 @@ def tq_fwht_input_gemm(
 
 
 # vLLM 0.19 fullgraph-AOT-compiles TurboQuantWrapper.forward. The launcher
-# functions below contain Python-side bookkeeping (dict lookups keyed on
-# id(), tensor .data_ptr() cache checks, Triton kernel launches, runtime
-# shape padding) that dynamo cannot trace. allow_in_graph tells dynamo to
-# treat each call as an opaque leaf: the function runs at graph execution
-# time as-is, tensors flow through normally, and dynamo does not look
-# inside. Triton kernels are therefore launched at runtime, bypassing
-# dynamo's tracer entirely. This is the standard wrap-a-triton-kernel
-# pattern for fullgraph compile.
+# functions above contain Python-side bookkeeping (id()-keyed rotation
+# matrix cache, FWHTInputCache with x.data_ptr() / untyped_storage()
+# checks, Triton kernel launches) that dynamo cannot trace. `allow_in_graph`
+# is not enough here because dynamo still runs the wrapped function on
+# FakeTensors during trace for shape inference, and Triton's kernel
+# launcher calls .data_ptr() on the fakes — PyTorch itself directs us to
+# the right fix in the resulting error message:
+#
+#   "Cannot access data pointer of Tensor (e.g. FakeTensor, ...). If
+#    you're using torch.compile/export/fx, it is likely that we are
+#    erroneously tracing into a custom kernel. To fix this, please wrap
+#    the custom kernel into an opaque custom op."
+#
+# So we register both launchers as `torch.library.custom_op` with a
+# FakeTensor (meta) implementation that returns an empty output of the
+# correct shape/dtype. At trace time, dynamo uses the fake impl and never
+# sees inside the real function. At runtime the real Python body runs as
+# usual, including all its Triton kernel launches and host-side caches.
+#
+# We keep the original functions bound to module-level names so tests and
+# eager-mode callers still see the same callables, but we rebind them to
+# the custom-op wrappers after registration. Old imports by reference
+# (`from ... import tq_fused_gemm`) done after module load pick up the
+# wrapper automatically.
 try:
-    import torch._dynamo
+    _tq_fused_gemm_impl = tq_fused_gemm
+    _tq_fwht_input_gemm_impl = tq_fwht_input_gemm
 
-    tq_fused_gemm = torch._dynamo.allow_in_graph(tq_fused_gemm)
-    tq_fwht_input_gemm = torch._dynamo.allow_in_graph(tq_fwht_input_gemm)
-except ImportError:
+    @torch.library.custom_op(
+        "turboquant::tq_fused_gemm", mutates_args=(), device_types=("cuda",)
+    )
+    def _tq_fused_gemm_op(
+        x: torch.Tensor,
+        packed_weight: torch.Tensor,
+        norms: torch.Tensor,
+        signs1: torch.Tensor,
+        signs2: torch.Tensor,
+        centroids: torch.Tensor,
+        group_size: int,
+        bits: int,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _tq_fused_gemm_impl(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size=group_size, bits=bits, bias=bias,
+        )
+
+    @_tq_fused_gemm_op.register_fake
+    def _(x, packed_weight, norms, signs1, signs2, centroids, group_size, bits, bias):
+        N = norms.shape[0]
+        return x.new_empty((*x.shape[:-1], N))
+
+    @torch.library.custom_op(
+        "turboquant::tq_fwht_input_gemm", mutates_args=(), device_types=("cuda",)
+    )
+    def _tq_fwht_input_gemm_op(
+        x: torch.Tensor,
+        packed_weight: torch.Tensor,
+        norms: torch.Tensor,
+        signs1: torch.Tensor,
+        signs2: torch.Tensor,
+        centroids: torch.Tensor,
+        group_size: int,
+        bits: int,
+        bias: torch.Tensor | None,
+    ) -> torch.Tensor:
+        return _tq_fwht_input_gemm_impl(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size=group_size, bits=bits, bias=bias,
+        )
+
+    @_tq_fwht_input_gemm_op.register_fake
+    def _(x, packed_weight, norms, signs1, signs2, centroids, group_size, bits, bias):
+        N = norms.shape[0]
+        return x.new_empty((*x.shape[:-1], N))
+
+    # Public callables that dynamo treats as opaque ops. Keyword args are
+    # not supported across the custom_op boundary (schema is positional),
+    # so we wrap to restore the original keyword-friendly call signature.
+    def tq_fused_gemm(  # type: ignore[no-redef]
+        x, packed_weight, norms, signs1, signs2, centroids,
+        group_size=128, bits=4, bias=None,
+    ):
+        return torch.ops.turboquant.tq_fused_gemm(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size, bits, bias,
+        )
+
+    def tq_fwht_input_gemm(  # type: ignore[no-redef]
+        x, packed_weight, norms, signs1, signs2, centroids,
+        group_size=128, bits=4, bias=None, cache=None,  # cache kwarg ignored in op path
+    ):
+        return torch.ops.turboquant.tq_fwht_input_gemm(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size, bits, bias,
+        )
+
+except (AttributeError, RuntimeError):
+    # torch < 2.4 or torch.library.custom_op unavailable — fall through to
+    # the plain Python functions. Eager mode still works; fullgraph compile
+    # will re-surface the underlying tracing error.
     pass
 
 
