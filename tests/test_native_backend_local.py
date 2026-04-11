@@ -392,6 +392,50 @@ class TestPluginRegistration(unittest.TestCase):
         self.assertIn("TurboQuantAttentionBackend", path)
         self.assertIn("turboquant_vllm.native_backend", path)
 
+    def test_register_backend_duplicate_error_is_treated_as_success(self):
+        """Duplicate CUSTOM registration should still patch selector and return True."""
+        fake_custom = object()
+
+        class FakeEnum:
+            CUSTOM = fake_custom
+
+        def fake_register_backend(_backend, _class_path):
+            raise RuntimeError("CUSTOM backend already registered")
+
+        class FakeCudaPlatform:
+            @classmethod
+            def get_valid_backends(cls, *_args, **_kwargs):
+                return [("BASELINE", 0)], {}
+
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "vllm": mock.MagicMock(),
+                "vllm.v1": mock.MagicMock(),
+                "vllm.v1.attention": mock.MagicMock(),
+                "vllm.v1.attention.backends": mock.MagicMock(),
+                "vllm.v1.attention.backends.registry": mock.MagicMock(
+                    AttentionBackendEnum=FakeEnum,
+                    register_backend=fake_register_backend,
+                ),
+                "vllm.platforms": mock.MagicMock(),
+                "vllm.platforms.cuda": mock.MagicMock(CudaPlatform=FakeCudaPlatform),
+            },
+        ):
+            import importlib
+            import turboquant_vllm._vllm_plugin as plugin
+
+            importlib.reload(plugin)
+
+            plugin._native_backend_registered = False
+            result = plugin._register_native_backend()
+
+        selector_cfg = type("SelectorCfg", (), {"kv_cache_dtype": "tq3"})()
+        backends, _ = FakeCudaPlatform.get_valid_backends(None, selector_cfg, None)
+
+        self.assertTrue(result)
+        self.assertEqual(backends, [(fake_custom, 0)])
+
     def test_init_tq_buffers_layer_idx_extraction(self):
         """Layer index parsed from prefix correctly."""
         import re
