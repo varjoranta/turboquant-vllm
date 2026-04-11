@@ -278,22 +278,26 @@ Peak GPU memory: 70.5 GB (weights + KV cache + activations; the 52 GB weight foo
 
 **TQ3 throughput status on current vLLM 0.19.** The fullgraph compile incompatibility flagged in earlier README versions is now fixed on branch `fix/dynamo-clean-forward-path`: the two Triton launchers are registered as `torch.library.custom_op` with `register_fake` meta impls, the FWHT-on-input cache (which did a host-sync `.cpu()` fingerprint and broke CUDA graph capture) is removed, and `TurboQuantWrapper.forward()` is split into a dynamo-clean GPU path and an eager CPU fallback. TQ3 weights + TQ3 forward now serve under vLLM 0.19 with piecewise CUDA graphs enabled.
 
-The throughput picture is less rosy than the memory story. Measured on the same A100 80GB cloud with an 8B dense reference (`Qwen/Qwen3-8B`, same bench script, `input=512 output=128 num_prompts=32 ignore_eos`):
+The throughput picture is less rosy than the memory story. Measured on A100 80GB with an 8B dense reference (`Qwen/Qwen3-8B`, `input=512 output=128 num_prompts=32 ignore_eos`):
 
 | Qwen3-8B A100 80GB | BF16 out tok/s | TQ3 out tok/s | TQ3/BF16 | BF16 model mem | TQ3 model mem |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| c=1 | 84.1 | 6.5 | 0.08× | 15.3 GiB | **4.97 GiB** (3.07×) |
-| c=4 | 329.6 | 27.9 | 0.08× | 15.3 GiB | 4.97 GiB |
-| c=8 | 276.2 | 49.5 | 0.18× | 15.3 GiB | 4.97 GiB |
-| c=16 | 1210.7 | 110.0 | 0.09× | 15.3 GiB | 4.97 GiB |
+| c=1 | 84.1 | 6.3 | 0.07× | 15.3 GiB | **4.97 GiB** (3.07×) |
+| c=4 | 329.6 | 25.0 | 0.08× | 15.3 GiB | 4.97 GiB |
+| c=8 | 276.2 | 46.2 | 0.17× | 15.3 GiB | 4.97 GiB |
+| c=16 | 1210.7 | 98.8 | 0.08× | 15.3 GiB | 4.97 GiB |
 
-The **3.07× live weight-memory compression** is real and matches the math. The **TQ3 decode throughput is currently ~8–18% of BF16** on vLLM 0.19 — a significant regression from the pre-0.19 path. Three known causes, each actionable:
+The **3.07× live weight-memory compression** is real and matches the math. The **TQ3 decode throughput is ~7–17% of BF16** on vLLM 0.19 — a real performance gap that landed with the dynamo-fullgraph rewrite and is **not recoverable from host-side orchestration alone**. The bottleneck is the Triton compressed-GEMM kernel itself: loading 3-bit codes, centroid lookup, rotation, FMA — all materially slower than cuBLAS BF16 on modern hardware. Recovery needs kernel-level work (better autotune configs, possibly a hybrid cuBLAS-GEMM + Triton-dequant path, or fusion into attention/MLP).
 
-1. **Lost FWHT-on-input cache**: removed to make the launcher CUDA-graph-capture-safe. Previously reused the rotated input across Q/K/V projections (~67% hit rate); now re-rotates 3× per attention block. `torch.library.custom_op` bodies are opaque to inductor's CSE, so the compiler cannot recover the saving. A capture-safe replacement cache (key on `data_ptr()` + `version_counter`, no D2H fingerprint) is the obvious next step.
-2. **Triton autotune runs per-shape during CUDA graph capture**: the first capture of each new batch-size takes 20–30 s (autotune cost) and the resulting config is frozen into the recorded graph. Pre-warming Triton autotune once during model init with representative shapes avoids both the capture-time stall and the locked-in suboptimal config.
-3. **Piecewise graph splitting at custom-op boundaries**: vLLM's `splitting_ops` list does not include our custom ops, so each TurboQuant linear likely forces a piecewise graph break. Registering the ops in the splitting list (or, better, keeping them inside a captured region) recovers per-layer scheduling efficiency.
+**Startup time, however, has been brought back to sane**. The first TQ3 benchmarks had a 10–25 minute "first capture" stall caused by Triton's `@autotune` re-running for every one of vLLM's ~51 CUDA-graph capture batch sizes. Dropping `batch_size` from the autotune key on `_polar_fused_gemm_kernel` (keyed only on `out_f`, `in_f_padded` now) fixes that:
 
-Until those land, TQ3 is a **memory win, not a speed win**, on current vLLM 0.19. This plugin still unblocks 52 GB → 12 GB loading scenarios (Gemma 4 26B on L40S 48GB, GLM-4.7-Flash 355B MoE on A100 80GB) where BF16 simply does not fit, and the quality/PPL results below are unchanged.
+| Startup (A100 80GB) | Before fix | After fix | Speedup |
+|:---|:---:|:---:|:---:|
+| Qwen2.5-0.5B TQ3 — total | 310 s | 217 s | 1.4× |
+| Qwen2.5-0.5B TQ3 — CUDA graph capture phase alone | ~250 s | ~16 s | **~16×** |
+| Qwen3-8B TQ3 — total | 1060 s | 382 s | **2.8×** |
+
+Until a faster compressed-GEMM kernel lands, TQ3 is a **memory win, not a speed win**, on current vLLM 0.19. This plugin still unblocks 52 GB → 12 GB loading scenarios (Gemma 4 26B on L40S 48GB, GLM-4.7-Flash 355B MoE on A100 80GB) where BF16 simply does not fit, and the quality/PPL results below are unchanged.
 
 3-bit sub-byte packing: 8 indices per 3 bytes. Norm correction: stores `original_norm / reconstruction_norm` ratio per group to fix 5-10% magnitude shrinkage at 3-bit.
 
