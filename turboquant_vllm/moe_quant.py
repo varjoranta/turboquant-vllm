@@ -114,6 +114,17 @@ class TurboQuantFusedMoEScratchPool:
         return buf
 
 
+# vLLM's CustomOp registry uses the decorator name as a key for
+# enable/disable tracking via compilation_config.disabled_custom_ops.
+# We need to register so CustomOp.__init__ can read self.__class__.name.
+if _HAS_FUSED_MOE:
+    _register_custom_op = CustomOp.register("turboquant_fused_moe")
+else:
+    def _register_custom_op(cls):
+        return cls
+
+
+@_register_custom_op
 class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
     """FusedMoE quant method that dequantizes TQ3-packed experts inside apply.
 
