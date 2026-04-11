@@ -237,20 +237,6 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         w13_compressed.decompress_into(layer.w13_weight.data)
         w2_compressed.decompress_into(layer.w2_weight.data)
 
-        import sys as _sys
-        if not getattr(self, "_debug_n", 0):
-            self._debug_n = 0
-        if self._debug_n < 4:
-            _sys.stderr.write(
-                f"[TQ_APPLY #{self._debug_n}] x.shape={tuple(x.shape)} "
-                f"x.norm={x.float().norm().item():.3f} "
-                f"w13.data.norm={layer.w13_weight.data.float().norm().item():.3f} "
-                f"w2.data.norm={layer.w2_weight.data.float().norm().item():.3f} "
-                f"base_method={type(layer.base_quant_method).__name__}\n"
-            )
-            _sys.stderr.flush()
-            self._debug_n += 1
-
         # Delegate to the original UnquantizedFusedMoEMethod captured
         # as base_quant_method during FusedMoE.__init__.
         return layer.base_quant_method.apply(
