@@ -238,7 +238,16 @@ class TurboQuantWrapper(nn.Module):
         self.register_buffer("norms", norms)
 
         if original.bias is not None:
-            self.bias = nn.Parameter(original.bias.data.clone())
+            bias_data = original.bias.data
+            if bias_data.ndim > 1:
+                bias_data = bias_data.reshape(-1)
+            if bias_data.numel() != self.out_features:
+                msg = (
+                    "Bias size does not match flattened out_features: "
+                    f"bias.numel()={bias_data.numel()} vs out_features={self.out_features}"
+                )
+                raise ValueError(msg)
+            self.bias = nn.Parameter(bias_data.clone())
         else:
             self.bias = None
 
