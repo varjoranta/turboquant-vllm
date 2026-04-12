@@ -182,6 +182,12 @@ def packed_group_bytes(bits: int, group_size: int) -> int:
     return group_size
 
 
+def padded_size(dim: int, group_size: int) -> tuple[int, int]:
+    """Return ``(padded_dim, n_groups)`` for group quantization."""
+    padded = ((dim + group_size - 1) // group_size) * group_size
+    return padded, padded // group_size
+
+
 def unpack_indices(packed: torch.Tensor, bits: int, dim: int) -> torch.Tensor:
     """Unpack uint8 packed indices back to int64."""
     if bits == 4:
@@ -288,9 +294,7 @@ class TurboQuantWrapper(nn.Module):
             self.out_features = weight.shape[0]
         out_dim, in_dim = weight.shape
 
-        # Pad in_features to multiple of group_size
-        self.padded_in = ((in_dim + group_size - 1) // group_size) * group_size
-        self.n_groups = self.padded_in // group_size
+        self.padded_in, self.n_groups = padded_size(in_dim, group_size)
 
         if self.padded_in > in_dim:
             padded = torch.zeros(out_dim, self.padded_in, dtype=weight.dtype, device=weight.device)
@@ -367,8 +371,7 @@ class TurboQuantWrapper(nn.Module):
         wrapper.in_features = in_features
         wrapper.out_features = out_features
         wrapper._has_learned_rotation = False
-        wrapper.padded_in = ((in_features + group_size - 1) // group_size) * group_size
-        wrapper.n_groups = wrapper.padded_in // group_size
+        wrapper.padded_in, wrapper.n_groups = padded_size(in_features, group_size)
 
         wrapper.register_buffer("packed_weight", packed_weight)
         wrapper.register_buffer("norms", norms)
@@ -500,8 +503,7 @@ class Compressed3D:
         self.bits = bits
         self.group_size = group_size
         self.in_dim = in_dim
-        self.padded_in = ((in_dim + group_size - 1) // group_size) * group_size
-        self.n_groups = self.padded_in // group_size
+        self.padded_in, self.n_groups = padded_size(in_dim, group_size)
 
         flat = data.reshape(-1, in_dim)
         if self.padded_in > in_dim:
@@ -542,8 +544,7 @@ class Compressed3D:
         obj.bits = bits
         obj.group_size = group_size
         obj.in_dim = in_dim
-        obj.padded_in = ((in_dim + group_size - 1) // group_size) * group_size
-        obj.n_groups = obj.padded_in // group_size
+        obj.padded_in, obj.n_groups = padded_size(in_dim, group_size)
         obj.packed = packed
         obj.norms = norms
         obj.original_bytes = n_experts * out_dim * in_dim * 2  # FP16
@@ -1265,7 +1266,7 @@ def save_compressed_checkpoint(
         weight = module.weight.data.float()
         out_dim, in_dim = weight.shape
 
-        padded_in = ((in_dim + group_size - 1) // group_size) * group_size
+        padded_in, _ = padded_size(in_dim, group_size)
         if padded_in > in_dim:
             padded = torch.zeros(out_dim, padded_in, dtype=weight.dtype)
             padded[:, :in_dim] = weight

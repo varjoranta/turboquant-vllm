@@ -170,8 +170,8 @@ def register():
             from fractions import Fraction
             from turboquant_vllm.weight_quant import packed_group_bytes as _pgb
 
-            padded_in = ((input_size_per_partition + self.group_size - 1) // self.group_size) * self.group_size
-            n_groups = padded_in // self.group_size
+            from turboquant_vllm.weight_quant import padded_size
+            padded_in, n_groups = padded_size(input_size_per_partition, self.group_size)
             packed_cols = n_groups * _pgb(self.bits, self.group_size)
             pack_ratio = Fraction(padded_in, packed_cols)
 
@@ -274,7 +274,7 @@ def register():
             indices = unpack_indices(layer.tq_packed.data, bits, group_size)
             norms_flat = layer.tq_norms.data.reshape(-1)
             w_groups = quantizer.dequantize(indices, norms_flat)
-            padded_in = ((in_features + group_size - 1) // group_size) * group_size
+            padded_in, _ = padded_size(in_features, group_size)
             w_deq = w_groups.reshape(out_features, padded_in)[:, :in_features]
             w_deq = w_deq.to(x.dtype)
 
@@ -293,7 +293,7 @@ def register():
     from vllm.model_executor.utils import set_weight_attrs
 
     # Imports used by both linear and MoE loaders, resolved once.
-    from turboquant_vllm.weight_quant import Compressed3D, packed_group_bytes
+    from turboquant_vllm.weight_quant import Compressed3D, packed_group_bytes, padded_size
     from vllm.model_executor.layers.fused_moe import fused_experts
 
     class TurboQuantFusedMoELoadMethod(FusedMoEMethodBase):
@@ -306,12 +306,15 @@ def register():
         """
 
         def __init__(self, moe_config, bits: int, group_size: int):
+            import threading
+
             super().__init__(moe_config)
             self.bits = bits
             self.group_size = group_size
             self._scratch_pool = None
             self._w13_comp = None
             self._w2_comp = None
+            self._init_lock = threading.Lock()
 
         def create_weights(
             self,
@@ -331,13 +334,12 @@ def register():
             w2_in = intermediate_size_per_partition
 
             def _packed_shape(n_exp, out_dim, in_dim):
-                padded = ((in_dim + gs - 1) // gs) * gs
-                n_groups = padded // gs
+                _, n_groups = padded_size(in_dim, gs)
                 return (n_exp * out_dim, n_groups * packed_group_bytes(bits, gs))
 
             def _norms_shape(n_exp, out_dim, in_dim):
-                padded = ((in_dim + gs - 1) // gs) * gs
-                return (n_exp * out_dim, padded // gs)
+                _, n_groups = padded_size(in_dim, gs)
+                return (n_exp * out_dim, n_groups)
 
             weight_loader = extra_weight_attrs.get("weight_loader")
 
@@ -386,6 +388,12 @@ def register():
             """Lazily allocate scratch and build Compressed3D on first forward."""
             if self._scratch_pool is not None:
                 return
+            with self._init_lock:
+                if self._scratch_pool is not None:
+                    return
+                self._init_scratch(layer)
+
+        def _init_scratch(self, layer: nn.Module):
             device = layer.w13_tq_packed.device
             dtype = self._params_dtype
             w13_s, w2_s = self._w13_shape, self._w2_shape
