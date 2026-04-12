@@ -299,10 +299,14 @@ def register():
     class TurboQuantFusedMoELoadMethod(FusedMoEMethodBase):
         """Load TQ3-packed MoE expert weights from a native TQ3 checkpoint.
 
-        Registers packed uint8 + float32 norms parameters.  On first
-        forward, builds cached ``Compressed3D`` objects and allocates a
-        shared scratch pool.  ``apply()`` decompresses into the scratch
-        and delegates to ``fused_experts`` — same kernel as unquantized.
+        The checkpoint stores per-expert 2D packed tensors (matching the
+        original HF naming, e.g. ``experts.0.gate_proj.weight.tq_packed``).
+        vLLM's model-specific ``load_weights`` maps these to our registered
+        fused 3D packed parameters via ``expert_params_mapping``, calling
+        the weight_loader with ``(param, loaded_weight, name, shard_id,
+        expert_id)``.  The custom weight_loader assembles per-expert packed
+        data into the correct slot of the fused parameter — no bf16
+        intermediate.
         """
 
         def __init__(self, moe_config, bits: int, group_size: int):
@@ -327,8 +331,11 @@ def register():
         ):
             bits = self.bits
             gs = self.group_size
+            is_act_and_mul = self.moe.is_act_and_mul
 
-            w13_out = 2 * intermediate_size_per_partition
+            # Fused w13: (num_experts, 2*intermediate, hidden) for gate+up
+            # w2:        (num_experts, hidden, intermediate)
+            w13_out = (2 if is_act_and_mul else 1) * intermediate_size_per_partition
             w13_in = hidden_size
             w2_out = hidden_size
             w2_in = intermediate_size_per_partition
@@ -341,22 +348,75 @@ def register():
                 _, n_groups = padded_size(in_dim, gs)
                 return (n_exp * out_dim, n_groups)
 
-            weight_loader = extra_weight_attrs.get("weight_loader")
+            orig_weight_loader = extra_weight_attrs.get("weight_loader")
 
+            # --- Per-expert packed weight_loader ---
+            # vLLM calls this once per (expert, shard) with the per-expert
+            # packed tensor from the checkpoint.  We assemble it into the
+            # fused 3D packed array at the right row offset.
+            def tq_expert_weight_loader(
+                param: nn.Parameter,
+                loaded_weight: torch.Tensor,
+                weight_name: str,
+                shard_id: str = "",
+                expert_id: int = 0,
+                return_success: bool = False,
+            ) -> bool | None:
+                # Map global → local expert id
+                local_id = layer._map_global_expert_id_to_local_expert_id(expert_id)
+                if local_id == -1:
+                    return False if return_success else None
+
+                # Determine row range in the fused 2D packed array.
+                # The packed array is (num_experts * out_dim, packed_cols),
+                # stored in expert-major order.
+                if shard_id in ("w1", "w3"):
+                    # w13: gate (w1) in first half, up (w3) in second half
+                    per_expert_out = w13_out
+                    half = per_expert_out // 2 if is_act_and_mul else per_expert_out
+                    base = local_id * per_expert_out
+                    if shard_id == "w1":
+                        row_start = base
+                    else:
+                        row_start = base + half
+                    row_end = row_start + half
+                elif shard_id == "w2":
+                    row_start = local_id * w2_out
+                    row_end = row_start + w2_out
+                else:
+                    return False if return_success else None
+
+                # TP sharding: the loaded_weight may need narrowing along
+                # the output dim for w13, or input dim for w2.
+                # For per-expert loading, vLLM handles TP *before* calling
+                # our weight_loader (the expert_params_mapping already
+                # selects local experts).  The loaded per-expert tensor
+                # is the full shard for this TP rank.
+                n_rows = row_end - row_start
+                if loaded_weight.shape[0] != n_rows:
+                    # TP-sharded: take this rank's slice
+                    tp_rank = getattr(layer, "tp_rank", 0)
+                    start = n_rows * tp_rank
+                    loaded_weight = loaded_weight.narrow(0, start, n_rows)
+
+                param.data[row_start:row_end, :loaded_weight.shape[1]] = loaded_weight
+                return True if return_success else None
+
+            # Register fused packed parameters
             w13_packed = nn.Parameter(
-                torch.empty(*_packed_shape(num_experts, w13_out, w13_in), dtype=torch.uint8),
+                torch.zeros(*_packed_shape(num_experts, w13_out, w13_in), dtype=torch.uint8),
                 requires_grad=False,
             )
             w2_packed = nn.Parameter(
-                torch.empty(*_packed_shape(num_experts, w2_out, w2_in), dtype=torch.uint8),
+                torch.zeros(*_packed_shape(num_experts, w2_out, w2_in), dtype=torch.uint8),
                 requires_grad=False,
             )
             w13_norms = nn.Parameter(
-                torch.empty(*_norms_shape(num_experts, w13_out, w13_in), dtype=torch.float32),
+                torch.zeros(*_norms_shape(num_experts, w13_out, w13_in), dtype=torch.float32),
                 requires_grad=False,
             )
             w2_norms = nn.Parameter(
-                torch.empty(*_norms_shape(num_experts, w2_out, w2_in), dtype=torch.float32),
+                torch.zeros(*_norms_shape(num_experts, w2_out, w2_in), dtype=torch.float32),
                 requires_grad=False,
             )
 
@@ -365,21 +425,19 @@ def register():
             layer.register_parameter("w2_tq_packed", w2_packed)
             layer.register_parameter("w2_tq_norms", w2_norms)
             for p in (w13_packed, w13_norms, w2_packed, w2_norms):
-                set_weight_attrs(p, {"weight_loader": weight_loader})
+                set_weight_attrs(p, {"weight_loader": tq_expert_weight_loader})
 
-            # Store shapes for scratch allocation; use self for bits/gs.
             self._w13_shape = (num_experts, w13_out, w13_in)
             self._w2_shape = (num_experts, w2_out, w2_in)
             self._params_dtype = params_dtype
 
-            # Placeholder bf16 weights — allocated as zero-size to avoid
-            # wasting GPU memory.  Re-pointed at scratch on first forward.
+            # bf16 weight placeholders — zero-size, re-pointed at scratch
+            # on first forward.  No weight_loader: these should NOT receive
+            # checkpoint data (the packed params handle that).
             w13_weight = nn.Parameter(torch.empty(0, dtype=params_dtype), requires_grad=False)
             w2_weight = nn.Parameter(torch.empty(0, dtype=params_dtype), requires_grad=False)
             layer.register_parameter("w13_weight", w13_weight)
             layer.register_parameter("w2_weight", w2_weight)
-            set_weight_attrs(w13_weight, extra_weight_attrs)
-            set_weight_attrs(w2_weight, extra_weight_attrs)
 
         def get_fused_moe_quant_config(self, layer: nn.Module):
             return None
