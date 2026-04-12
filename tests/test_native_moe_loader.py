@@ -47,16 +47,19 @@ class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
     """Compressed3D.from_packed must produce identical decompression
     as compressing from raw data."""
 
+    @staticmethod
+    def _device():
+        return "cuda" if torch.cuda.is_available() else "cpu"
+
     def test_roundtrip_matches(self):
         """Compress → decompress vs from_packed → decompress."""
-        data = torch.randn(4, 256, 128, dtype=torch.float32)
+        dev = self._device()
+        data = torch.randn(4, 256, 128, dtype=torch.float32, device=dev)
         bits, gs = 3, 128
 
-        # Path A: compress from raw
         comp_a = Compressed3D(data, bits=bits, group_size=gs)
         ref = comp_a.decompress()
 
-        # Path B: from_packed (simulates loading from checkpoint)
         comp_b = Compressed3D.from_packed(
             comp_a.packed, comp_a.norms, data.shape, data.dtype, bits, gs
         )
@@ -70,7 +73,8 @@ class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
 
     def test_from_packed_into_buffer(self):
         """from_packed + decompress_into matches decompress."""
-        data = torch.randn(2, 128, 128, dtype=torch.float32)
+        dev = self._device()
+        data = torch.randn(2, 128, 128, dtype=torch.float32, device=dev)
         bits, gs = 3, 128
 
         comp = Compressed3D(data, bits=bits, group_size=gs)
@@ -88,7 +92,8 @@ class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
         )
 
     def test_4bit_roundtrip(self):
-        data = torch.randn(2, 64, 128, dtype=torch.float32)
+        dev = self._device()
+        data = torch.randn(2, 64, 128, dtype=torch.float32, device=dev)
         bits, gs = 4, 128
         comp = Compressed3D(data, bits=bits, group_size=gs)
         ref = comp.decompress()
