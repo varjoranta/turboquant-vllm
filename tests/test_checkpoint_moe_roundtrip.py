@@ -194,6 +194,27 @@ class TestCheckpointMoERoundTrip(unittest.TestCase):
         self.assertIn("model.embed_tokens.weight", loaded)
         self.assertEqual(loaded["model.embed_tokens.weight"].dtype, torch.float16)
 
+    def test_no_quantization_config_in_config_json(self):
+        """config.json must NOT have quantization_config — it breaks CUDA graph capture."""
+        ckpt_dir, _, _ = self._create_fake_checkpoint()
+        output_dir = os.path.join(self.tmpdir, "tq3_output_noqc")
+
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        save_tq3_checkpoint(
+            model_id=ckpt_dir,
+            output_dir=output_dir,
+            bits=self.bits,
+            group_size=self.group_size,
+        )
+
+        with open(os.path.join(output_dir, "config.json")) as f:
+            config = json.load(f)
+        self.assertIsNone(
+            config.get("quantization_config"),
+            "config.json must not have quantization_config (breaks CUDA graph capture)",
+        )
+
     def test_tq_config_written(self):
         """tq_config.json must be written with correct metadata."""
         ckpt_dir, _, _ = self._create_fake_checkpoint()

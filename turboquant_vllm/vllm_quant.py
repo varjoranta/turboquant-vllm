@@ -114,9 +114,6 @@ def register():
                 pass
             return None
 
-    # Patch the weight loader to decompress TQ3 weights during loading
-    # Old: model.layers.0.self_attn.q_proj.weight.tq_packed
-    # New: model.layers.0.self_attn.q_proj.tq_packed
     _patch_weight_name_remapping()
 
     logger.info("TurboQuant quantization config registered with vLLM")
@@ -145,14 +142,23 @@ def _patch_weight_name_remapping():
     _original_get_all_weights = DefaultModelLoader.get_all_weights
 
     def _decompress_get_all_weights(self, model_config, model):
-        # Check if this is a TQ checkpoint
-        quant_cfg = getattr(model_config.hf_config, "quantization_config", None)
-        if not quant_cfg or quant_cfg.get("quant_method") != "turboquant":
+        # Detect TQ3 checkpoint via tq_config.json (not quantization_config
+        # in config.json — that would trigger vLLM's quant code path and
+        # break CUDA graph capture).
+        import os as _os
+
+        tq_config_path = _os.path.join(model_config.model, "tq_config.json")
+        if not _os.path.isfile(tq_config_path):
             yield from _original_get_all_weights(self, model_config, model)
             return
 
-        bits = quant_cfg.get("bits", 3)
-        group_size = quant_cfg.get("group_size", 128)
+        import json as _json
+
+        with open(tq_config_path) as f:
+            tq_cfg = _json.load(f)
+        bits = tq_cfg.get("bits", 3)
+        group_size = tq_cfg.get("group_size", 128)
+        logger.info("TQ3 native checkpoint detected (bits=%d, group_size=%d), decompressing on load", bits, group_size)
 
         # Collect packed/norms pairs, decompress, yield as bf16.
         # Tensors arrive in checkpoint order — packed and norms for the

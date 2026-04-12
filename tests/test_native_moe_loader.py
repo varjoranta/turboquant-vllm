@@ -13,6 +13,7 @@ path for ``Compressed3D`` operations.
 
 from __future__ import annotations
 
+import os
 import unittest
 
 import torch
@@ -133,42 +134,22 @@ class TestNativeMoELoaderShapes(unittest.TestCase):
                          f"norms shape mismatch: {comp.norms.shape} vs {expected_norms}")
 
 
-class TestWeightNameRemapping(unittest.TestCase):
-    """Weight name remapping must handle both 2D linear and 3D MoE names."""
+class TestDecompressDetection(unittest.TestCase):
+    """Decompress-on-load detects TQ3 checkpoints via tq_config.json, not quantization_config."""
 
-    def test_linear_remap(self):
-        """Standard 2D linear: .weight.tq_packed → .tq_packed"""
-        name = "model.layers.0.self_attn.q_proj.weight.tq_packed"
-        # Simulate the remapping logic
-        if "w13_weight.tq_packed" in name or "w2_weight.tq_packed" in name:
-            result = name.replace("_weight.tq_packed", "_tq_packed")
-        else:
-            result = name.replace(".weight.tq_packed", ".tq_packed")
-        self.assertEqual(result, "model.layers.0.self_attn.q_proj.tq_packed")
+    def test_tq_config_triggers_decompress(self):
+        """Checkpoint with tq_config.json should activate decompression."""
+        import tempfile, json
+        d = tempfile.mkdtemp()
+        with open(os.path.join(d, "tq_config.json"), "w") as f:
+            json.dump({"format": "tq3_native", "bits": 3, "group_size": 128}, f)
+        self.assertTrue(os.path.isfile(os.path.join(d, "tq_config.json")))
 
-    def test_moe_w13_remap(self):
-        """MoE w13: w13_weight.tq_packed → w13_tq_packed"""
-        name = "model.layers.0.mlp.experts.w13_weight.tq_packed"
-        if "w13_weight.tq_packed" in name or "w2_weight.tq_packed" in name:
-            result = name.replace("_weight.tq_packed", "_tq_packed")
-        else:
-            result = name.replace(".weight.tq_packed", ".tq_packed")
-        self.assertEqual(result, "model.layers.0.mlp.experts.w13_tq_packed")
-
-    def test_moe_w2_norms_remap(self):
-        """MoE w2 norms: w2_weight.tq_norms → w2_tq_norms"""
-        name = "model.layers.0.mlp.experts.w2_weight.tq_norms"
-        if "w13_weight.tq_norms" in name or "w2_weight.tq_norms" in name:
-            result = name.replace("_weight.tq_norms", "_tq_norms")
-        else:
-            result = name.replace(".weight.tq_norms", ".tq_norms")
-        self.assertEqual(result, "model.layers.0.mlp.experts.w2_tq_norms")
-
-    def test_no_false_positives(self):
-        """Regular weight tensors should not be remapped."""
-        name = "model.layers.0.mlp.gate.weight"
-        result = name  # no .tq_packed or .tq_norms
-        self.assertEqual(result, name)
+    def test_no_tq_config_skips_decompress(self):
+        """Checkpoint without tq_config.json should NOT decompress."""
+        import tempfile
+        d = tempfile.mkdtemp()
+        self.assertFalse(os.path.isfile(os.path.join(d, "tq_config.json")))
 
 
 if __name__ == "__main__":

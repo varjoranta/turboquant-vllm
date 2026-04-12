@@ -102,15 +102,13 @@ def save_tq3_checkpoint(
         logger.info("Downloading config and tokenizer for %s...", model_id)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
-    # Inject quantization_config so vLLM auto-detects the format
-    if not hasattr(config, "quantization_config") or config.quantization_config is None:
-        config.quantization_config = {
-            "quant_method": "turboquant",
-            "bits": bits,
-            "group_size": group_size,
-        }
-        if sensitive_bits is not None:
-            config.quantization_config["sensitive_bits"] = sensitive_bits
+    # Do NOT inject quantization_config into config.json — vLLM
+    # treats models with quantization_config differently during
+    # compilation and CUDA graph capture.  Instead, tq_config.json
+    # (written at the end of this function) is the sole marker.
+    # The decompress-on-load hook in vllm_quant.py detects it.
+    if hasattr(config, "quantization_config"):
+        config.quantization_config = None
     config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
 
