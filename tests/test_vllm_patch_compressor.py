@@ -29,6 +29,9 @@ class TestGetCompressor(unittest.TestCase):
         vllm_patch._boundary_layers = 5
         vllm_patch._total_layers = 32
         vllm_patch._use_cuda = False
+        vllm_patch._layer_compressor.clear()
+        vllm_patch._layer_indices.clear()
+        vllm_patch._layer_token_counts.clear()
         self.vllm_patch = vllm_patch
 
     def test_returns_without_keyerror(self):
@@ -76,6 +79,118 @@ class TestGetCompressor(unittest.TestCase):
         self.assertIsInstance(keys[0], tuple)
         self.assertEqual(len(keys[0]), 2)
         self.assertEqual(keys[0], (128, 4))
+
+
+class TestFrozenCompressor(unittest.TestCase):
+    """Regression: compressor assigned to a layer must be frozen on first use.
+
+    Historical bug: _get_compressor was called on every cache update, re-deriving
+    boundary status from the current _total_layers. During early forward passes,
+    _total_layers is small (auto-registration hasn't seen all layers yet), so a
+    layer could be classified as boundary (K=8-bit). Once all layers register,
+    the same layer falls outside the boundary range (K=4-bit). Without freezing,
+    decompress would use a different compressor/codebook than compress, producing
+    garbage. The fix: _layer_compressor caches the compressor per layer_id on
+    first use and never re-derives.
+    """
+
+    def setUp(self):
+        from turboquant_vllm import vllm_patch
+
+        vllm_patch._compressors.clear()
+        vllm_patch._k_bits = 4
+        vllm_patch._v_bits = 4
+        vllm_patch._norm_correction = False
+        vllm_patch._use_qjl = False
+        vllm_patch._rotation = "wht"
+        vllm_patch._boundary_layers = 5
+        vllm_patch._total_layers = 0
+        vllm_patch._use_cuda = False
+        vllm_patch._layer_compressor.clear()
+        vllm_patch._layer_indices.clear()
+        vllm_patch._layer_token_counts.clear()
+        vllm_patch._cache.clear()
+        vllm_patch._sink_tokens = 0  # disable sink to simplify test
+        vllm_patch._fp16_heads = set()
+        self.vllm_patch = vllm_patch
+
+    def test_compressor_frozen_across_total_layers_growth(self):
+        """Layer that starts as boundary must keep its compressor after _total_layers grows."""
+        vp = self.vllm_patch
+        device = torch.device("cpu")
+
+        # Use boundary_layers=2 so the math is clean:
+        #   _total_layers=6, idx=4: boundary (4 >= 6-2=4) → K=8
+        #   _total_layers=28, idx=4: NOT boundary (4 >= 2 and 4 < 26) → K=4
+        vp._boundary_layers = 2
+        vp._total_layers = 6
+        vp._layer_indices[9999] = 4  # layer_id=9999 → layer_idx=4
+
+        first_compressor = vp._get_compressor(dim=128, device=device, layer_idx=4)
+        vp._layer_compressor[9999] = first_compressor
+        self.assertEqual(first_compressor.k_bits, 8, "boundary layer should get K=8-bit")
+
+        # Now _total_layers grows to 28 (all layers registered).
+        # Layer index 4 is NO LONGER boundary (not in first 2, not in last 2 of 28).
+        vp._total_layers = 28
+
+        # If we naively re-derive, we'd get a 4-bit compressor:
+        naive = vp._get_compressor(dim=128, device=device, layer_idx=4)
+        self.assertEqual(naive.k_bits, 4, "re-derived should be 4-bit (non-boundary at 28 layers)")
+
+        # But the frozen lookup must return the ORIGINAL 8-bit compressor.
+        frozen = vp._layer_compressor[9999]
+        self.assertIs(frozen, first_compressor, "frozen compressor must be the same instance")
+        self.assertEqual(frozen.k_bits, 8, "frozen compressor must keep K=8-bit")
+
+    def test_make_patched_cache_update_freezes_compressor(self):
+        """_make_patched_cache_update must freeze compressor on first call per layer."""
+        vp = self.vllm_patch
+
+        # Build a minimal mock layer and kv_cache
+        class FakeLayer:
+            pass
+
+        layer = FakeLayer()
+        layer_id = id(layer)
+
+        # Register layer as index 4 with small _total_layers (boundary).
+        # boundary_layers=2, total=6: idx=4 >= 6-2=4 → boundary (K=8)
+        vp._boundary_layers = 2
+        vp._total_layers = 6
+        vp._layer_indices[layer_id] = 4
+
+        head_dim = 64
+        key = torch.randn(1, 1, head_dim)  # (tokens, heads, dim)
+        value = torch.randn(1, 1, head_dim)
+        # kv_cache: (2, blocks, block_size, heads, dim)
+        kv_cache = torch.zeros(2, 4, 16, 1, head_dim)
+        slot_mapping = torch.tensor([0], dtype=torch.int64)
+
+        original_called = [False]
+
+        def fake_original(self_, layer_, key_, value_, kv_cache_, slot_mapping_):
+            original_called[0] = True
+
+        patched_fn = vp._make_patched_cache_update(fake_original)
+
+        # First call — should freeze compressor as boundary (K=8)
+        patched_fn(None, layer, key, value, kv_cache, slot_mapping)
+        self.assertTrue(original_called[0])
+        self.assertIn(layer_id, vp._layer_compressor)
+        first_comp = vp._layer_compressor[layer_id]
+        self.assertEqual(first_comp.k_bits, 8)
+
+        # Grow _total_layers — layer 4 is no longer boundary
+        vp._total_layers = 28
+
+        # Second call — must reuse frozen compressor
+        original_called[0] = False
+        patched_fn(None, layer, key, value, kv_cache, slot_mapping)
+        self.assertTrue(original_called[0])
+        self.assertIs(
+            vp._layer_compressor[layer_id], first_comp, "compressor must stay frozen after _total_layers changes"
+        )
 
 
 class TestIterSlots(unittest.TestCase):

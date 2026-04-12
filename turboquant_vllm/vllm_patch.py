@@ -45,7 +45,9 @@ _fp16_heads: set[int] = set()  # head indices to keep at FP16 (sink heads)
 _rotation = "wht"  # 'wht' or 'planar'
 _layer_token_counts: dict[int, int] = {}  # layer_id → tokens seen
 _layer_indices: dict[int, int] = {}  # layer_id → layer index (0-based)
-_layer_compressor: dict = {}  # layer_id → frozen compressor (set on first use, never changes)
+_layer_compressor: dict[
+    int, KVCacheCompressorTorch
+] = {}  # layer_id → frozen compressor (set on first use, never changes)
 
 
 def _try_cuda_init() -> bool:
