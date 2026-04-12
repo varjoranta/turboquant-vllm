@@ -45,6 +45,7 @@ _fp16_heads: set[int] = set()  # head indices to keep at FP16 (sink heads)
 _rotation = "wht"  # 'wht' or 'planar'
 _layer_token_counts: dict[int, int] = {}  # layer_id → tokens seen
 _layer_indices: dict[int, int] = {}  # layer_id → layer index (0-based)
+_layer_compressor: dict = {}  # layer_id → frozen compressor (set on first use, never changes)
 
 
 def _try_cuda_init() -> bool:
@@ -156,9 +157,12 @@ def _make_patched_cache_update(original_fn):
         head_dim = key.shape[-1]
         num_kv_heads = key.shape[1] if key.dim() == 3 else 1
 
-        # Get layer index for layer-adaptive compression
-        li = _layer_indices.get(layer_id, -1)
-        compressor = _get_compressor(head_dim, key.device, layer_idx=li)
+        # Freeze compressor on first use so decompress always uses same codebook.
+        # Re-deriving later would use updated _total_layers, changing boundary tier.
+        if layer_id not in _layer_compressor:
+            li = _layer_indices.get(layer_id, -1)
+            _layer_compressor[layer_id] = _get_compressor(head_dim, key.device, layer_idx=li)
+        compressor = _layer_compressor[layer_id]
 
         key_cache, _ = kv_cache.unbind(0)
         block_size = key_cache.shape[1]
@@ -188,16 +192,17 @@ def _make_patched_forward(original_fn):
     """Wrap forward to decompress K/V from TurboQuant+ before attention."""
 
     @wraps(original_fn)
-    def patched(self, layer, query, key, value, kv_cache, attn_metadata, output=None):
+    def patched(self, layer, query, key, value, kv_cache, attn_metadata, output=None, **kwargs):
         if kv_cache is None:
-            return original_fn(self, layer, query, key, value, kv_cache, attn_metadata, output)
+            return original_fn(self, layer, query, key, value, kv_cache, attn_metadata, output, **kwargs)
 
         store = _cache.get(id(layer))
         if not store:
-            return original_fn(self, layer, query, key, value, kv_cache, attn_metadata, output)
+            return original_fn(self, layer, query, key, value, kv_cache, attn_metadata, output, **kwargs)
 
-        li = _layer_indices.get(id(layer), -1)
-        compressor = _get_compressor(query.shape[-1], query.device, layer_idx=li)
+        compressor = _layer_compressor.get(id(layer))
+        if compressor is None:
+            return original_fn(self, layer, query, key, value, kv_cache, attn_metadata, output, **kwargs)
         key_cache, value_cache = kv_cache.unbind(0)
 
         for (block_idx, offset, head_idx), compressed in store.items():
@@ -208,7 +213,7 @@ def _make_patched_forward(original_fn):
             key_cache[block_idx, offset, head_idx] = compressor.decompress_k(ck).squeeze(0).to(key_cache.dtype)
             value_cache[block_idx, offset, head_idx] = compressor.decompress_v(cv).squeeze(0).to(value_cache.dtype)
 
-        return original_fn(self, layer, query, key, value, kv_cache, attn_metadata, output)
+        return original_fn(self, layer, query, key, value, kv_cache, attn_metadata, output, **kwargs)
 
     return patched
 

@@ -101,6 +101,7 @@ def register():
         v_bits = int(os.environ.get("TQ_KV_V_BITS", str(k_bits)))
         norm_correction = os.environ.get("TQ_KV_NORM_CORRECTION", "1") == "1"
         rotation = os.environ.get("TQ_KV_ROTATION", "wht")
+        boundary_layers = int(os.environ.get("TQ_KV_BOUNDARY_LAYERS", "5"))
         try:
             from turboquant_vllm.vllm_patch import patch_vllm_attention
 
@@ -109,6 +110,7 @@ def register():
                 v_bits=v_bits,
                 norm_correction=norm_correction,
                 rotation=rotation,
+                boundary_layers=boundary_layers,
             )
             logger.info(
                 "TurboQuant K%d/V%d KV monkey-patch registered (pid=%d). "
