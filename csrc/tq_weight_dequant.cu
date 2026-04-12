@@ -11,6 +11,7 @@
 // One thread block per (row, group). Block size = group_size threads.
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
 #include <type_traits>
 
@@ -167,20 +168,32 @@ void tq_weight_dequant(
     else if (bits == 2) packed_group_bytes = group_size / 4;
     else packed_group_bytes = group_size;
 
-    // Only re-upload constant memory when config changes
+    // Use PyTorch's current CUDA stream so kernel launches are captured
+    // by CUDA graphs (vLLM piecewise capture, torch.compile reduce-overhead).
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
+        packed_weight.device().index()).stream();
+
+    // Only re-upload constant memory when config changes.
+    // Use cudaMemcpyToSymbolAsync so the copy is graph-capturable.
     const float* cptr = centroids.data_ptr<float>();
     const float* s1ptr = signs1.data_ptr<float>();
     const float* s2ptr = signs2.data_ptr<float>();
     if (cptr != s_last_centroids) {
-        cudaMemcpyToSymbol(c_centroids, cptr, (1 << bits) * sizeof(float));
+        cudaMemcpyToSymbolAsync(c_centroids, cptr,
+                                (1 << bits) * sizeof(float),
+                                0, cudaMemcpyDeviceToDevice, stream);
         s_last_centroids = cptr;
     }
     if (s1ptr != s_last_signs1) {
-        cudaMemcpyToSymbol(c_signs1, s1ptr, group_size * sizeof(float));
+        cudaMemcpyToSymbolAsync(c_signs1, s1ptr,
+                                group_size * sizeof(float),
+                                0, cudaMemcpyDeviceToDevice, stream);
         s_last_signs1 = s1ptr;
     }
     if (s2ptr != s_last_signs2) {
-        cudaMemcpyToSymbol(c_signs2, s2ptr, group_size * sizeof(float));
+        cudaMemcpyToSymbolAsync(c_signs2, s2ptr,
+                                group_size * sizeof(float),
+                                0, cudaMemcpyDeviceToDevice, stream);
         s_last_signs2 = s2ptr;
     }
 
@@ -190,15 +203,16 @@ void tq_weight_dequant(
 
     bool use_fp16 = (output.scalar_type() == at::ScalarType::Half);
 
-    // Dispatch by output type, group_size, and bits
+    // Dispatch by output type, group_size, and bits.
+    // Stream argument ensures kernels land on PyTorch's current stream.
     #define DISPATCH(GS, B)                                                    \
         if (use_fp16)                                                          \
-            tq_weight_dequant_kernel<__half, GS, B><<<grid, block, smem_bytes>>>( \
+            tq_weight_dequant_kernel<__half, GS, B><<<grid, block, smem_bytes, stream>>>( \
                 packed_weight.data_ptr<uint8_t>(), norms.data_ptr<float>(),    \
                 reinterpret_cast<__half*>(output.data_ptr()),                  \
                 n_groups, (int)in_dim, packed_group_bytes);                    \
         else                                                                   \
-            tq_weight_dequant_kernel<float, GS, B><<<grid, block, smem_bytes>>>( \
+            tq_weight_dequant_kernel<float, GS, B><<<grid, block, smem_bytes, stream>>>( \
                 packed_weight.data_ptr<uint8_t>(), norms.data_ptr<float>(),    \
                 output.data_ptr<float>(),                                      \
                 n_groups, (int)in_dim, packed_group_bytes);

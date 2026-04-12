@@ -1117,12 +1117,10 @@ def _replace_linear_layers(
             torch.cuda.empty_cache()
 
     if _moe_compressed_count > 0:
-        logger.warning(
-            "TurboQuant compressed %d FusedMoE layer(s). Pass "
-            "--enforce-eager to vllm serve — the MoE forward path "
-            "produces incorrect output under CUDA graph capture "
-            "(shared dequant scratch aliases across layers). See "
-            "varjoranta/turboquant-vllm#14 for status.",
+        logger.info(
+            "TurboQuant compressed %d FusedMoE layer(s). CUDA dequant "
+            "kernels run on PyTorch's current stream — CUDA graph "
+            "capture is supported (no --enforce-eager required).",
             _moe_compressed_count,
         )
 

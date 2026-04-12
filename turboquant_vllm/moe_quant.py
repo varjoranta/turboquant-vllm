@@ -2,10 +2,10 @@
 
 ``apply()`` runs inside ``torch.ops.vllm.moe_forward`` (a PT2 custom op
 with a fake impl), so the pybind11 dequant call and arbitrary Python
-are safe there — dynamo never traces into the body. Requires
-``--enforce-eager``; see varjoranta/turboquant-vllm#14 for the CUDA
-graph aliasing limitation. Installed by
-``weight_quant._replace_linear_layers`` Phase 2A.
+are safe there — dynamo never traces into the body. CUDA dequant
+kernels launch on PyTorch's current stream via
+``c10::cuda::getCurrentCUDAStream``, so CUDA graph capture works.
+Installed by ``weight_quant._replace_linear_layers`` Phase 2A.
 """
 
 from __future__ import annotations

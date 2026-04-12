@@ -33,6 +33,7 @@
 
 #include "turbo_quant.h"
 
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
@@ -594,8 +595,10 @@ void quantize(torch::Tensor input, torch::Tensor indices, torch::Tensor norms) {
     int hd = input.size(1);
     int bt = ((hd + 31) / 32) * 32;
     int smem = (hd + bt) * sizeof(float);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
+        input.device().index()).stream();
 
-    quantize_kernel<<<n, bt, smem>>>(
+    quantize_kernel<<<n, bt, smem, stream>>>(
         reinterpret_cast<const half*>(input.data_ptr()),
         indices.data_ptr<uint8_t>(), norms.data_ptr<float>(), n);
 }
@@ -604,8 +607,10 @@ void dequantize(torch::Tensor indices, torch::Tensor norms, torch::Tensor output
     int n = indices.size(0);
     int hd = indices.size(1);
     int bt = ((hd + 31) / 32) * 32;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
+        indices.device().index()).stream();
 
-    dequantize_kernel<<<n, bt, hd * sizeof(float)>>>(
+    dequantize_kernel<<<n, bt, hd * sizeof(float), stream>>>(
         indices.data_ptr<uint8_t>(), norms.data_ptr<float>(),
         reinterpret_cast<half*>(output.data_ptr()), n);
 }
@@ -626,8 +631,10 @@ void reshape_and_cache(
     int grid = nt * nkv;
     int bt = ((hd + 31) / 32) * 32;
     int smem = (hd + bt) * sizeof(float);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
+        key.device().index()).stream();
 
-    reshape_and_cache_kernel<<<grid, bt, smem>>>(
+    reshape_and_cache_kernel<<<grid, bt, smem, stream>>>(
         reinterpret_cast<const half*>(key.data_ptr()),
         reinterpret_cast<const half*>(value.data_ptr()),
         key_cache.data_ptr<uint8_t>(), value_cache.data_ptr<uint8_t>(),
@@ -647,10 +654,10 @@ void dequant_paged_cache(
 
     int grid = seq_len * nkv;
     int bt = ((hd + 31) / 32) * 32;
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream(
+        cache.device().index()).stream();
 
-    // Determine if this is K or V based on cache pointer matching
-    // For now, default to K=1. Caller should use separate calls for K and V.
-    dequant_paged_kernel<<<grid, bt, hd * sizeof(float)>>>(
+    dequant_paged_kernel<<<grid, bt, hd * sizeof(float), stream>>>(
         cache.data_ptr<uint8_t>(), norms.data_ptr<float>(),
         reinterpret_cast<half*>(output.data_ptr()),
         block_table.data_ptr<int32_t>(),
