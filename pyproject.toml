@@ -4,7 +4,7 @@ version = "0.6.0"
 description = "TurboQuant+ compression for vLLM. 4.3x weight compression + 3.7x KV cache, zero calibration."
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "torch>=2.1",
     "scipy>=1.11",
