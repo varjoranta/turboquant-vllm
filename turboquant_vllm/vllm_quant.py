@@ -89,24 +89,276 @@ def register():
         def get_quant_method(
             self, layer: nn.Module, prefix: str
         ) -> "QuantizeMethodBase | None":
-            # Native TQ3 checkpoints are decompressed to bf16 during
-            # weight loading (see _patch_weight_name_remapping).  All
-            # layers receive standard bf16 weights via unquantized
-            # methods.  The runtime plugin (enable_weight_quantization)
-            # re-compresses on GPU after loading.
             if isinstance(layer, LinearBase):
-                from vllm.model_executor.layers.linear import UnquantizedLinearMethod
-                return UnquantizedLinearMethod()
+                return TurboQuantOnlineLinearMethod(self.bits, self.group_size)
             try:
                 from vllm.model_executor.layers.fused_moe import FusedMoE
-                from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-                    UnquantizedFusedMoEMethod,
-                )
+
                 if isinstance(layer, FusedMoE):
-                    return UnquantizedFusedMoEMethod(layer.moe_config)
+                    return TurboQuantOnlineMoEMethod(
+                        self.bits, self.group_size, layer.moe_config,
+                    )
             except ImportError:
                 pass
             return None
+
+    # ── Online quant methods (meta-device init, per-layer compression) ──
+
+    class TurboQuantOnlineLinearMethod(QuantizeMethodBase):
+        """Load bf16 on meta device, compress to TQ3 per-layer after loading.
+
+        Follows the same pattern as vLLM's online FP8 quantization:
+        allocate on meta device during model init (zero GPU memory),
+        materialize + compress one layer at a time during weight loading.
+        """
+
+        uses_meta_device: bool = True
+
+        def __init__(self, bits: int, group_size: int):
+            self.bits = bits
+            self.group_size = group_size
+
+        def create_weights(
+            self,
+            layer: nn.Module,
+            input_size_per_partition: int,
+            output_partition_sizes: list[int],
+            input_size: int,
+            output_size: int,
+            params_dtype: torch.dtype,
+            **extra_weight_attrs,
+        ):
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                initialize_online_processing,
+            )
+            from vllm.model_executor.parameter import ModelWeightParameter
+
+            output_size_per_partition = sum(output_partition_sizes)
+            weight_loader = extra_weight_attrs.get("weight_loader")
+
+            weight = ModelWeightParameter(
+                data=torch.empty(
+                    output_size_per_partition,
+                    input_size_per_partition,
+                    device="meta",
+                    dtype=params_dtype,
+                ),
+                input_dim=1,
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight", weight)
+
+            # Store config for process_weights_after_loading
+            layer.tq_bits = self.bits
+            layer.tq_group_size = self.group_size
+
+            initialize_online_processing(layer)
+
+        def process_weights_after_loading(self, layer: nn.Module) -> None:
+            """Compress materialized bf16 weight → TQ3 packed format on GPU."""
+            from turboquant_vllm.weight_quant import (
+                _ensure_triton_backends,
+                _get_cuda_module,
+                _get_quantizer,
+                pack_indices,
+                padded_size,
+            )
+
+            weight = layer.weight.data
+            bits = layer.tq_bits
+            group_size = layer.tq_group_size
+            device = str(weight.device)
+
+            out_dim, in_dim = weight.shape
+            padded_in, n_groups = padded_size(in_dim, group_size)
+
+            if padded_in > in_dim:
+                padded = torch.zeros(
+                    out_dim, padded_in, dtype=weight.dtype, device=weight.device,
+                )
+                padded[:, :in_dim] = weight
+            else:
+                padded = weight
+
+            grouped = padded.reshape(-1, group_size)
+            quantizer = _get_quantizer(group_size, bits, device)
+            indices, norms_raw = quantizer.quantize(grouped, norm_correction=True)
+            packed = pack_indices(indices, bits)
+            norms = norms_raw.reshape(out_dim, n_groups)
+
+            # Delete bf16 weight, store packed data as buffers
+            delattr(layer, "weight")
+            layer.register_buffer("tq_packed_weight", packed)
+            layer.register_buffer("tq_norms", norms)
+            layer.register_buffer("tq_signs1", quantizer.signs1)
+            layer.register_buffer("tq_signs2", quantizer.signs2)
+            layer.register_buffer("tq_centroids", quantizer.centroids)
+            layer.tq_in_features = in_dim
+            layer.tq_out_features = out_dim
+            layer.tq_padded_in = padded_in
+            layer.tq_n_groups = n_groups
+
+            # Pre-cache Triton rotation matrix (must happen before graph capture)
+            _ensure_triton_backends()
+            _get_cuda_module()
+
+            del weight, padded, grouped, indices, norms_raw
+
+        def apply(
+            self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None,
+        ) -> torch.Tensor:
+            from turboquant_vllm.weight_quant import (
+                _tq_fused_gemm_fn,
+                _tq_fwht_input_fn,
+                _triton_available,
+            )
+
+            if _triton_available:
+                args = (
+                    x, layer.tq_packed_weight, layer.tq_norms,
+                    layer.tq_signs1, layer.tq_signs2, layer.tq_centroids,
+                )
+                kwargs = dict(
+                    group_size=self.group_size, bits=self.bits, bias=bias,
+                )
+                primary = (
+                    _tq_fwht_input_fn
+                    if layer.tq_out_features >= 4096
+                    else _tq_fused_gemm_fn
+                )
+                fallback = (
+                    _tq_fused_gemm_fn
+                    if layer.tq_out_features >= 4096
+                    else _tq_fwht_input_fn
+                )
+                try:
+                    return primary(*args, **kwargs)
+                except (ValueError, RuntimeError):
+                    return fallback(*args, **kwargs)
+
+            # CPU/CUDA fallback — dequantize then matmul
+            from turboquant_vllm.weight_quant import _get_quantizer, unpack_indices
+
+            indices = unpack_indices(
+                layer.tq_packed_weight, self.bits, self.group_size,
+            )
+            norms_flat = layer.tq_norms.reshape(-1)
+            quantizer = _get_quantizer(
+                self.group_size, self.bits, str(x.device),
+            )
+            w_groups = quantizer.dequantize(indices, norms_flat)
+            w_deq = w_groups.reshape(
+                layer.tq_out_features, layer.tq_padded_in,
+            )[:, : layer.tq_in_features].to(x.dtype)
+            output = torch.matmul(x, w_deq.t())
+            if bias is not None:
+                output = output + bias
+            return output
+
+    class TurboQuantOnlineMoEMethod:
+        """Online TQ3 compression for FusedMoE layers.
+
+        Same meta-device pattern: allocate bf16 on meta, materialize per-layer,
+        then compress expert weights to TQ3 after loading.
+        """
+
+        uses_meta_device: bool = True
+
+        def __init__(self, bits: int, group_size: int, moe_config: Any):
+            self.bits = bits
+            self.group_size = group_size
+            self.moe_config = moe_config
+
+        def create_weights(
+            self, layer: nn.Module, **kwargs,
+        ):
+            """Delegate to UnquantizedFusedMoEMethod but on meta device."""
+            from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+                UnquantizedFusedMoEMethod,
+            )
+            from vllm.model_executor.model_loader.reload.layerwise import (
+                initialize_online_processing,
+            )
+
+            # Use the standard unquantized method to create bf16 weight structure
+            unquant = UnquantizedFusedMoEMethod(self.moe_config)
+            unquant.create_weights(layer, **kwargs)
+
+            # Move all created parameters to meta device
+            for name, param in list(layer.named_parameters()):
+                if param.device != torch.device("meta"):
+                    meta_param = torch.nn.Parameter(
+                        torch.empty_like(param, device="meta"),
+                        requires_grad=False,
+                    )
+                    # Preserve weight_loader if present
+                    if hasattr(param, "weight_loader"):
+                        meta_param.weight_loader = param.weight_loader
+                    # Preserve sharding metadata
+                    for attr in ("output_dim", "input_dim", "packed_dim", "packed_factor"):
+                        if hasattr(param, attr):
+                            setattr(meta_param, attr, getattr(param, attr))
+                    delattr(layer, name)
+                    layer.register_parameter(name, meta_param)
+
+            layer.tq_bits = self.bits
+            layer.tq_group_size = self.group_size
+
+            initialize_online_processing(layer)
+
+        def process_weights_after_loading(self, layer: nn.Module) -> None:
+            """Compress FusedMoE expert weights to TQ3 after loading."""
+            from turboquant_vllm.weight_quant import _replace_linear_layers
+
+            count = _replace_linear_layers(
+                layer, bits=layer.tq_bits, group_size=layer.tq_group_size,
+            )
+            if count > 0:
+                logger.info(
+                    "TQ%d compressed %d MoE sub-layers", layer.tq_bits, count,
+                )
+
+        def apply(
+            self,
+            layer: nn.Module,
+            x: torch.Tensor,
+            router_logits: torch.Tensor,
+            top_k: int,
+            renormalize: bool,
+            use_grouped_topk: bool = False,
+            topk_group: int | None = None,
+            num_expert_group: int | None = None,
+            custom_routing_function: Any | None = None,
+            scoring_func: str = "softmax",
+            e_score_correction_bias: torch.Tensor | None = None,
+            activation: str = "silu",
+            apply_router_weight_on_input: bool = False,
+        ) -> torch.Tensor:
+            """After compression, expert weights are TurboQuantWrappers.
+
+            Fall back to standard FusedMoE forward — the compressed weights
+            are handled by TurboQuantWrapper.forward() inside the MoE dispatch.
+            """
+            from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+                UnquantizedFusedMoEMethod,
+            )
+
+            # Delegate to unquantized MoE method — works because the expert
+            # weight tensors are now TurboQuantWrappers that decompress on
+            # the fly during the FusedMoE kernel's matmul calls.
+            unquant = UnquantizedFusedMoEMethod(self.moe_config)
+            return unquant.apply(
+                layer, x, router_logits, top_k, renormalize,
+                use_grouped_topk=use_grouped_topk,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                activation=activation,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+            )
 
     _patch_weight_name_remapping()
 
@@ -136,105 +388,53 @@ def _patch_weight_name_remapping():
     _original_get_all_weights = DefaultModelLoader.get_all_weights
 
     def _decompress_get_all_weights(self, model_config, model):
-        """Decompress TQ3 → bf16 per tensor, compress each layer on GPU
-        immediately after its weights land.
+        """Decompress TQ3 → bf16 per tensor for vLLM's weight loader.
 
-        This keeps peak GPU memory at ~1 layer bf16 + all previously
-        compressed layers, instead of the full model in bf16.  Critical
-        for fitting 309 GB models on 2×H200 (282 GB).
+        The checkpoint contains ``.tq_packed`` / ``.tq_norms`` tensor pairs.
+        This generator collects each pair, decompresses to bf16 on CPU, and
+        yields with the original ``.weight`` name so vLLM's model-specific
+        weight loaders (stacked qkv, fused gate_up, expert assembly) work
+        unchanged.
 
-        Flow per layer:
-          1. Generator yields decompressed bf16 tensors for layer N
-          2. vLLM's weight_loader places each on GPU
-          3. Generator detects layer N+1 starting → compresses layer N
-             on GPU via _replace_linear_layers, freeing bf16 memory
-          4. Repeat for layer N+1
+        GPU compression happens later via ``process_weights_after_loading``
+        in ``TurboQuantOnlineLinearMethod`` / ``TurboQuantOnlineMoEMethod``.
         """
         import os as _os
 
-        # Resolve tq_config.json — model_config.model may be a HF repo
-        # ID (e.g. "varjosoft/GLM-5.1-Open-TQ3") or a local path.
         tq_config_path = _os.path.join(model_config.model, "tq_config.json")
         if not _os.path.isfile(tq_config_path):
             try:
                 from huggingface_hub import hf_hub_download
+
                 revision = getattr(model_config, "revision", None)
                 tq_config_path = hf_hub_download(
-                    model_config.model, "tq_config.json",
-                    revision=revision,
+                    model_config.model, "tq_config.json", revision=revision,
                 )
-                logger.info("Found tq_config.json via HuggingFace: %s", tq_config_path)
             except Exception as e:
-                logger.info("No tq_config.json found for %s (%s), skipping TQ3 hook", model_config.model, e)
+                logger.info(
+                    "No tq_config.json for %s (%s), passing through",
+                    model_config.model, e,
+                )
                 yield from _original_get_all_weights(self, model_config, model)
                 return
 
         import json as _json
-        import re
 
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
         bits = tq_cfg.get("bits", 3)
         group_size = tq_cfg.get("group_size", 128)
         logger.info(
-            "TQ3 native checkpoint detected (bits=%d, group_size=%d), "
-            "streaming decompress + per-layer compression",
+            "TQ3 native checkpoint (bits=%d, group_size=%d): "
+            "decompressing to bf16 for online quantization",
             bits, group_size,
         )
 
-        # Import compression function for per-layer GPU compression
-        from turboquant_vllm.weight_quant import _replace_linear_layers
-
-        # Track which layer is currently being loaded
-        _layer_re = re.compile(r"model\.layers\.(\d+)\.")
-        prev_layer_idx = None
-        compressed_layers = 0
-
-        def _compress_prev_layer(layer_idx):
-            """Compress a single decoder layer's weights on GPU."""
-            nonlocal compressed_layers
-            # Navigate model → model.model.layers (Llama/DeepSeek/GLM pattern)
-            inner = getattr(model, "model", None)
-            layers = getattr(inner, "layers", None)
-            if layers is None:
-                if compressed_layers == 0:
-                    logger.warning(
-                        "Per-layer compression: model.model.layers not found "
-                        "(model type: %s, attrs: %s). Falling back to post-load compression.",
-                        type(model).__name__,
-                        [a for a in dir(model) if not a.startswith("_")][:10],
-                    )
-                return
-            if layer_idx >= len(layers):
-                return
-            count = _replace_linear_layers(
-                layers[layer_idx], bits=bits, group_size=group_size,
-            )
-            if count > 0:
-                compressed_layers += count
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                if compressed_layers % 50 == 0:
-                    mem = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
-                    logger.info(
-                        "  Compressed layer %d (%d total, %.1f GB GPU)",
-                        layer_idx, compressed_layers, mem,
-                    )
-
-        pending_packed = {}
-        pending_norms = {}
+        pending_packed: dict[str, torch.Tensor] = {}
+        pending_norms: dict[str, torch.Tensor] = {}
+        decompressed = 0
 
         for name, tensor in _original_get_all_weights(self, model_config, model):
-            # Detect layer boundary
-            m = _layer_re.search(name)
-            cur_layer_idx = int(m.group(1)) if m else None
-
-            if cur_layer_idx is not None and cur_layer_idx != prev_layer_idx:
-                if prev_layer_idx is not None:
-                    _compress_prev_layer(prev_layer_idx)
-                prev_layer_idx = cur_layer_idx
-
-            # Handle TQ3 packed tensors — collect pairs, decompress when complete
             if name.endswith(".weight.tq_packed"):
                 base = name[: -len(".tq_packed")]
                 pending_packed[base] = tensor
@@ -257,19 +457,14 @@ def _patch_weight_name_remapping():
                     torch.bfloat16, bits, group_size,
                 )
                 w = comp.decompress().squeeze(0)
+                decompressed += 1
+                if decompressed % 50 == 0:
+                    logger.info("  Decompressed %d tensors", decompressed)
                 yield base, w
                 del packed, norms, comp, w
 
-        # Compress the last layer
-        if prev_layer_idx is not None:
-            _compress_prev_layer(prev_layer_idx)
-
-        if compressed_layers > 0:
-            mem = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
-            logger.info(
-                "Streaming compression complete: %d layers compressed, %.1f GB GPU",
-                compressed_layers, mem,
-            )
+        if decompressed > 0:
+            logger.info("TQ3 decompression complete: %d tensors", decompressed)
 
         for base in pending_packed:
             logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
