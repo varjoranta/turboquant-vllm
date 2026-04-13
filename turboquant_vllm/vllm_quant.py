@@ -94,7 +94,7 @@ def register():
             try:
                 from vllm.model_executor.layers.fused_moe import FusedMoE
 
-                if isinstance(layer, FusedMoE):
+                if isinstance(layer, FusedMoE) and TurboQuantOnlineMoEMethod is not None:
                     return TurboQuantOnlineMoEMethod(
                         self.bits, self.group_size, layer.moe_config,
                     )
@@ -256,109 +256,71 @@ def register():
                 output = output + bias
             return output
 
-    class TurboQuantOnlineMoEMethod:
-        """Online TQ3 compression for FusedMoE layers.
+    # ── MoE online method ──
+    # For FusedMoE layers, use the standard unquantized method but with
+    # meta-device initialization. After weights load, compress expert
+    # tensors to TQ3 via _replace_linear_layers.
 
-        Same meta-device pattern: allocate bf16 on meta, materialize per-layer,
-        then compress expert weights to TQ3 after loading.
-        """
+    try:
+        from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
+            FusedMoEMethodBase,
+        )
+        from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+            UnquantizedFusedMoEMethod,
+        )
 
-        uses_meta_device: bool = True
+        class TurboQuantOnlineMoEMethod(FusedMoEMethodBase):
+            """Online TQ3 for FusedMoE: meta-device init + per-layer compression."""
 
-        def __init__(self, bits: int, group_size: int, moe_config: Any):
-            self.bits = bits
-            self.group_size = group_size
-            self.moe_config = moe_config
+            uses_meta_device: bool = True
 
-        def create_weights(
-            self, layer: nn.Module, **kwargs,
-        ):
-            """Delegate to UnquantizedFusedMoEMethod but on meta device."""
-            from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-                UnquantizedFusedMoEMethod,
-            )
-            from vllm.model_executor.model_loader.reload.layerwise import (
-                initialize_online_processing,
-            )
+            def __init__(self, bits: int, group_size: int, moe_config: Any):
+                self.bits = bits
+                self.group_size = group_size
+                self.moe_config = moe_config
+                self._unquant = UnquantizedFusedMoEMethod(moe_config)
 
-            # Use the standard unquantized method to create bf16 weight structure
-            unquant = UnquantizedFusedMoEMethod(self.moe_config)
-            unquant.create_weights(layer, **kwargs)
-
-            # Move all created parameters to meta device
-            for name, param in list(layer.named_parameters()):
-                if param.device != torch.device("meta"):
-                    meta_param = torch.nn.Parameter(
-                        torch.empty_like(param, device="meta"),
-                        requires_grad=False,
-                    )
-                    # Preserve weight_loader if present
-                    if hasattr(param, "weight_loader"):
-                        meta_param.weight_loader = param.weight_loader
-                    # Preserve sharding metadata
-                    for attr in ("output_dim", "input_dim", "packed_dim", "packed_factor"):
-                        if hasattr(param, attr):
-                            setattr(meta_param, attr, getattr(param, attr))
-                    delattr(layer, name)
-                    layer.register_parameter(name, meta_param)
-
-            layer.tq_bits = self.bits
-            layer.tq_group_size = self.group_size
-
-            initialize_online_processing(layer)
-
-        def process_weights_after_loading(self, layer: nn.Module) -> None:
-            """Compress FusedMoE expert weights to TQ3 after loading."""
-            from turboquant_vllm.weight_quant import _replace_linear_layers
-
-            count = _replace_linear_layers(
-                layer, bits=layer.tq_bits, group_size=layer.tq_group_size,
-            )
-            if count > 0:
-                logger.info(
-                    "TQ%d compressed %d MoE sub-layers", layer.tq_bits, count,
+            def create_weights(self, layer: nn.Module, **kwargs):
+                from vllm.model_executor.model_loader.reload.layerwise import (
+                    initialize_online_processing,
                 )
 
-        def apply(
-            self,
-            layer: nn.Module,
-            x: torch.Tensor,
-            router_logits: torch.Tensor,
-            top_k: int,
-            renormalize: bool,
-            use_grouped_topk: bool = False,
-            topk_group: int | None = None,
-            num_expert_group: int | None = None,
-            custom_routing_function: Any | None = None,
-            scoring_func: str = "softmax",
-            e_score_correction_bias: torch.Tensor | None = None,
-            activation: str = "silu",
-            apply_router_weight_on_input: bool = False,
-        ) -> torch.Tensor:
-            """After compression, expert weights are TurboQuantWrappers.
+                self._unquant.create_weights(layer, **kwargs)
 
-            Fall back to standard FusedMoE forward — the compressed weights
-            are handled by TurboQuantWrapper.forward() inside the MoE dispatch.
-            """
-            from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
-                UnquantizedFusedMoEMethod,
-            )
+                # Move parameters to meta device
+                for name, param in list(layer.named_parameters(recurse=False)):
+                    if param.device != torch.device("meta"):
+                        meta_param = torch.nn.Parameter(
+                            torch.empty_like(param, device="meta"),
+                            requires_grad=False,
+                        )
+                        if hasattr(param, "weight_loader"):
+                            meta_param.weight_loader = param.weight_loader
+                        for attr in ("output_dim", "input_dim", "packed_dim",
+                                     "packed_factor", "is_metadata"):
+                            if hasattr(param, attr):
+                                setattr(meta_param, attr, getattr(param, attr))
+                        delattr(layer, name)
+                        layer.register_parameter(name, meta_param)
 
-            # Delegate to unquantized MoE method — works because the expert
-            # weight tensors are now TurboQuantWrappers that decompress on
-            # the fly during the FusedMoE kernel's matmul calls.
-            unquant = UnquantizedFusedMoEMethod(self.moe_config)
-            return unquant.apply(
-                layer, x, router_logits, top_k, renormalize,
-                use_grouped_topk=use_grouped_topk,
-                topk_group=topk_group,
-                num_expert_group=num_expert_group,
-                custom_routing_function=custom_routing_function,
-                scoring_func=scoring_func,
-                e_score_correction_bias=e_score_correction_bias,
-                activation=activation,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-            )
+                layer.tq_bits = self.bits
+                layer.tq_group_size = self.group_size
+                initialize_online_processing(layer)
+
+            def process_weights_after_loading(self, layer: nn.Module) -> None:
+                from turboquant_vllm.weight_quant import _replace_linear_layers
+
+                count = _replace_linear_layers(
+                    layer, bits=layer.tq_bits, group_size=layer.tq_group_size,
+                )
+                if count > 0:
+                    logger.info("TQ%d compressed %d MoE sub-layers", layer.tq_bits, count)
+
+            def apply(self, layer: nn.Module, x: torch.Tensor, **kwargs) -> torch.Tensor:
+                return self._unquant.apply(layer, x, **kwargs)
+
+    except ImportError:
+        TurboQuantOnlineMoEMethod = None  # type: ignore[assignment,misc]
 
     _patch_weight_name_remapping()
 
