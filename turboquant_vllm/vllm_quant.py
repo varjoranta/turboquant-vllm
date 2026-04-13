@@ -353,16 +353,20 @@ def _patch_weight_name_remapping():
     _original_get_all_weights = DefaultModelLoader.get_all_weights
 
     def _decompress_get_all_weights(self, model_config, model):
-        """Decompress TQ3 → bf16 per tensor for vLLM's weight loader.
+        """Decompress TQ3 → bf16, layer-by-layer to bound CPU memory.
 
-        The checkpoint contains ``.tq_packed`` / ``.tq_norms`` tensor pairs.
-        This generator collects each pair, decompresses to bf16 on CPU, and
-        yields with the original ``.weight`` name so vLLM's model-specific
-        weight loaders (stacked qkv, fused gate_up, expert assembly) work
-        unchanged.
+        Two-phase approach to avoid OOM on large MoE models:
 
-        GPU compression happens later via ``process_weights_after_loading``
-        in ``TurboQuantOnlineLinearMethod`` / ``TurboQuantOnlineMoEMethod``.
+        Phase 1 — collect: iterate all checkpoint tensors. Non-TQ3
+        tensors (layernorms, embeddings) are yielded immediately.
+        TQ3 pairs (.tq_packed/.tq_norms) are collected as references
+        (mmap'd from safetensors, near-zero RSS).
+
+        Phase 2 — decompress by layer: sort collected TQ3 pairs by
+        decoder layer index, decompress one layer at a time. Online
+        processing completes each layer and frees its bf16 buffer
+        before the next layer is decompressed. Peak RSS: ~1 layer
+        bf16 instead of the full model.
         """
         import os as _os
 
@@ -384,6 +388,8 @@ def _patch_weight_name_remapping():
                 return
 
         import json as _json
+        import re
+        from collections import defaultdict
 
         with open(tq_config_path) as f:
             tq_cfg = _json.load(f)
@@ -391,50 +397,79 @@ def _patch_weight_name_remapping():
         group_size = tq_cfg.get("group_size", 128)
         logger.info(
             "TQ3 native checkpoint (bits=%d, group_size=%d): "
-            "decompressing to bf16 for online quantization",
+            "two-phase layer-by-layer decompression",
             bits, group_size,
         )
 
-        pending_packed: dict[str, torch.Tensor] = {}
-        pending_norms: dict[str, torch.Tensor] = {}
-        decompressed = 0
+        # ── Phase 1: collect TQ3 pairs, yield non-TQ3 immediately ──
+        tq_pairs: dict[str, dict[str, torch.Tensor]] = {}
 
         for name, tensor in _original_get_all_weights(self, model_config, model):
             if name.endswith(".weight.tq_packed"):
                 base = name[: -len(".tq_packed")]
-                pending_packed[base] = tensor
+                tq_pairs.setdefault(base, {})["packed"] = tensor
             elif name.endswith(".weight.tq_norms"):
                 base = name[: -len(".tq_norms")]
-                pending_norms[base] = tensor
+                tq_pairs.setdefault(base, {})["norms"] = tensor
             else:
                 yield name, tensor
-                continue
 
-            if base in pending_packed and base in pending_norms:
-                packed = pending_packed.pop(base)
-                norms = pending_norms.pop(base)
+        logger.info(
+            "Phase 1 complete: collected %d TQ3 pairs", len(tq_pairs),
+        )
 
-                n_rows = norms.shape[0]
-                n_groups = norms.shape[1]
-                in_dim = n_groups * group_size
-                comp = Compressed3D.from_packed(
-                    packed, norms, (1, n_rows, in_dim),
-                    torch.bfloat16, bits, group_size,
-                )
-                w = comp.decompress().squeeze(0)
+        # ── Phase 2: group by layer, decompress in order ──
+        layer_re = re.compile(r"model\.layers\.(\d+)\.")
+        by_layer: dict[int, list[tuple[str, dict]]] = defaultdict(list)
+        no_layer: list[tuple[str, dict]] = []
+
+        for base, data in tq_pairs.items():
+            m = layer_re.search(base)
+            if m:
+                by_layer[int(m.group(1))].append((base, data))
+            else:
+                no_layer.append((base, data))
+
+        def _decompress_pair(base, data):
+            packed = data.get("packed")
+            norms = data.get("norms")
+            if packed is None or norms is None:
+                if packed is None:
+                    logger.warning("Missing .tq_packed for %s", base)
+                if norms is None:
+                    logger.warning("Missing .tq_norms for %s", base)
+                return None, None
+            n_rows = norms.shape[0]
+            n_groups = norms.shape[1]
+            in_dim = n_groups * group_size
+            comp = Compressed3D.from_packed(
+                packed, norms, (1, n_rows, in_dim),
+                torch.bfloat16, bits, group_size,
+            )
+            return base, comp.decompress().squeeze(0)
+
+        decompressed = 0
+        for layer_idx in sorted(by_layer.keys()):
+            for base, data in by_layer[layer_idx]:
+                name, w = _decompress_pair(base, data)
+                if w is not None:
+                    yield name, w
+                    decompressed += 1
+                    del w
+            # Free references for this layer
+            del by_layer[layer_idx]
+            if decompressed % 100 == 0 and decompressed > 0:
+                logger.info("  Decompressed %d tensors (layer %d)", decompressed, layer_idx)
+
+        # Non-layer tensors (embeddings, lm_head, etc.)
+        for base, data in no_layer:
+            name, w = _decompress_pair(base, data)
+            if w is not None:
+                yield name, w
                 decompressed += 1
-                if decompressed % 50 == 0:
-                    logger.info("  Decompressed %d tensors", decompressed)
-                yield base, w
-                del packed, norms, comp, w
+                del w
 
-        if decompressed > 0:
-            logger.info("TQ3 decompression complete: %d tensors", decompressed)
-
-        for base in pending_packed:
-            logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
-        for base in pending_norms:
-            logger.warning("Orphaned .tq_norms without .tq_packed: %s", base)
+        logger.info("TQ3 decompression complete: %d tensors", decompressed)
 
     DefaultModelLoader.get_all_weights = _decompress_get_all_weights
     logger.info("TQ3 decompress-on-load hook installed on DefaultModelLoader.get_all_weights")
