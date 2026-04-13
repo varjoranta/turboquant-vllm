@@ -974,6 +974,12 @@ def _replace_linear_layers(
                 prune_experts * 100,
             )
 
+    # Free memory released by Phase 1 compression before Phase 2A
+    # allocates MoE scratch buffers. Critical when GPU is near-full
+    # (e.g. 309 GB model on 2×H200 at 155 GB/GPU, 5 GB headroom).
+    if replacements > 0 and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     _moe_compressed_count = 0
 
     # --- Phase 2A: FusedMoE quant method replacement (vLLM path) ---
