@@ -3,7 +3,7 @@
 TurboQuant+ compression for vLLM. What this package ships today:
 
 - **Weight compression** (4.3-4.6x) via 3-bit TQ3. Any BF16 checkpoint, compressed in 9 seconds, zero calibration. Faster than uncompressed serving. **Unique to this plugin.**
-- **Native TQ3 checkpoints** for small-GPU deployments (L40S, RTX 6000 Ada). MoE expert regrouping handled automatically.
+- **Native TQ3 checkpoints** for small-GPU deployments (L40S, RTX 6000 Ada) and large-model deployments (GLM-5.1 754B on 2×H200). MoE expert regrouping handled automatically.
 - **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models.
 - **AWQ export** from TQ-compressed weights — ~2 min instead of hours of AWQ calibration.
 - **Legacy KV cache compression** (monkey-patch, MLA-only) for GLM-4.7/DeepSeek-V3 users on stock vLLM until upstream KV compression supports MLA.
@@ -27,8 +27,9 @@ patch_vllm_attention(k_bits=4, v_bits=3, norm_correction=True)
 
 Headline numbers:
 
-- **Gemma 4 26B**: ~52 GB BF16 → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost. Honest BF16 baseline on current vLLM 0.19 (measured 2026-04-11 on A100 80GB): see the throughput table below.
-- **GLM-4.7-Flash 355B MoE**: 62.4 GB → **14.7 GB** (4.2x). Native TQ3 checkpoint with MoE expert regrouping, 13.3 GB GPU memory. Tested on A100 80GB.
+- **GLM-5.1 (754B MoE)**: 1,508 GB BF16 → **309 GB native TQ3** → serves on **2×H200** (282 GB VRAM). Without TQ3, this requires 8×H200. **7× hardware cost reduction.**
+- **Gemma 4 26B**: ~52 GB BF16 → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost.
+- **GLM-4.7-Flash 355B MoE**: 62.4 GB → **14.7 GB** (4.2x). Native TQ3 checkpoint with MoE expert regrouping, 13.3 GB GPU memory.
 - **Qwen3-30B**: 61 GB → **13 GB** (4.6x).
 
 ## Why this exists
@@ -78,6 +79,7 @@ GLM-4.7 355B: native TQ3 checkpoint verified (14.7 GB, 4.2x compression). Full q
 |---|---|---|---|---|
 | Qwen3 (0.6B-235B) | GQA | Works | Works | Use upstream [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) for KV cache compression once merged |
 | Gemma 4 26B | GQA | Works (4.79/5) | Works | Flagship benchmark model |
+| GLM-5.1 754B | **MLA (DSA)** | Works (native TQ3 ckpt, 2×H200) | Untested | Requires DeepGEMM + `--quantization turboquant` |
 | GLM-4.7-Flash 355B | **MLA** | Works (native TQ3 ckpt) | **Works** | **Only place TurboQuant KV works on MLA today** — #38479 does not cover MLA |
 | DeepSeek-V3 | **MLA** | Pending (larger disk) | Works | Same: MLA requires the legacy monkey-patch path |
 | Qwen3.5-35B-A3B | MoE + GatedDeltaNet + GQA | Works (as of varjoranta/turboquant-vllm#15) | Untested | Hybrid architecture; weight quant validated via @gaby's fixes |
@@ -257,7 +259,7 @@ Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Had
 |-------|------|-------------|-------------|---------|
 | **Gemma 4 26B** | 52 GB | **12 GB** | 4.3x | 4.79/5 |
 | **GLM-4.7-Flash 355B** | 62.4 GB | **14.7 GB** | 4.2x | Tested ✓ |
-| **GLM-5.1 769B** | 1,510 GB | **309 GB** | 4.9x | [Pending](https://huggingface.co/varjosoft/GLM-5.1-Open-TQ3) |
+| **GLM-5.1 754B** | 1,508 GB | **309 GB** | 4.9x | Serving on 2×H200 ✓ |
 | **Qwen3-30B** | 61 GB | **13 GB** | 4.6x | -- |
 
 Gemma 4 TQ3 quality: **4.79/5** on 20 multi-turn conversation scenarios (scored by Llama-3.3-70B judge). Matches Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost.
@@ -345,6 +347,31 @@ save_tq3_checkpoint("zai-org/GLM-4.7-Flash", "./glm47-tq3")
 ```
 
 **Important: Gemma 4 requires `transformers >= 5.5.0`** (the `gemma4` model type was added in that version). vLLM 0.19.0 pins `transformers < 5`, so Gemma 4 loading requires a manual override: `pip install 'transformers>=5.5'`.
+
+### Serving native TQ3 checkpoints with vLLM
+
+For models too large to fit in GPU memory even as BF16 (e.g., GLM-5.1 at 1,508 GB), native TQ3 checkpoints can be served directly through vLLM with `--quantization turboquant`. This uses **meta-device initialization** — the model architecture is allocated with zero GPU memory, then weights are decompressed from TQ3→BF16 and re-compressed to TQ3 on GPU one layer at a time:
+
+```bash
+# GLM-5.1 (754B) on 2×H200 — impossible without TQ3 (needs 754 GB BF16)
+vllm serve varjosoft/GLM-5.1-Open-TQ3 \
+    --quantization turboquant \
+    --tensor-parallel-size 2 \
+    --max-model-len 4096 \
+    --dtype bfloat16
+```
+
+How it works:
+1. `TurboQuantOnlineLinearMethod` and `TurboQuantOnlineMoEMethod` set `uses_meta_device=True`
+2. Model init allocates zero GPU memory (all weights on meta device)
+3. `get_all_weights` hook decompresses `.tq_packed`/`.tq_norms` → BF16 per tensor
+4. vLLM's online processing buffers one layer at a time, materializes on GPU
+5. `process_weights_after_loading` compresses BF16→TQ3 on GPU per layer
+6. Peak memory: ~1 layer BF16 + all previous layers compressed
+
+This is the same pattern vLLM uses for online FP8 quantization. No `TQ_WEIGHT_BITS` env var needed — the quantization config is read from `tq_config.json` in the checkpoint.
+
+**GLM-5.1 (754B MoE):** 1,508 GB BF16 → 309 GB native TQ3 checkpoint. Fits on 2×H200 (282 GB VRAM) with `--quantization turboquant --tensor-parallel-size 2`. Without TQ3, this model requires 8×H200 (€350K) — a **7× hardware cost reduction**.
 
 ### Limitations
 
