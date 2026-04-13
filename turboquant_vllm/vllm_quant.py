@@ -152,10 +152,19 @@ def _patch_weight_name_remapping():
         """
         import os as _os
 
+        # Resolve tq_config.json — model_config.model may be a HF repo
+        # ID (e.g. "varjosoft/GLM-5.1-Open-TQ3") or a local path.
         tq_config_path = _os.path.join(model_config.model, "tq_config.json")
         if not _os.path.isfile(tq_config_path):
-            yield from _original_get_all_weights(self, model_config, model)
-            return
+            try:
+                from huggingface_hub import hf_hub_download
+                tq_config_path = hf_hub_download(
+                    model_config.model, "tq_config.json",
+                    revision=model_config.revision,
+                )
+            except Exception:
+                yield from _original_get_all_weights(self, model_config, model)
+                return
 
         import json as _json
         import re
