@@ -353,12 +353,48 @@ def register():
                 # before each forward. FusedMoE is a CustomOp so its
                 # forward body is opaque to CUDA graph tracing — the
                 # decompression kernels are captured in the graph.
+                # Cache PolarQuant tensors for dynamo-safe decompression
+                from turboquant_vllm.weight_quant import _get_quantizer
+
+                _pq = _get_quantizer(group_size, bits, str(w13_c.packed.device))
+                _signs1 = _pq.signs1
+                _signs2 = _pq.signs2
+                _centroids = _pq.centroids
+                _w13_packed = w13_c.packed
+                _w13_norms = w13_c.norms
+                _w2_packed = w2_c.packed
+                _w2_norms = w2_c.norms
+                _shape_w13 = w13_c.shape
+                _shape_w2 = w2_c.shape
+
                 original_fwd = layer._forward_method
 
-                @torch.compiler.disable
                 def _tq_forward(*args, **kwargs):
-                    w13_c.decompress_into(pool.w13, fp32_scratch=pool.w13_fp32)
-                    w2_c.decompress_into(pool.w2, fp32_scratch=pool.w2_fp32)
+                    # Decompress using pure-PyTorch ops (dynamo-traceable).
+                    # The CUDA extension path can't be used inside vLLM's
+                    # fullgraph AOT compile.
+                    from turboquant_vllm.weight_quant import unpack_indices
+
+                    for packed, norms, shape, dst in [
+                        (_w13_packed, _w13_norms, _shape_w13, pool.w13),
+                        (_w2_packed, _w2_norms, _shape_w2, pool.w2),
+                    ]:
+                        indices = unpack_indices(packed, bits, group_size)
+                        norms_flat = norms.reshape(-1)
+                        reconstructed = _centroids[indices]
+                        rotated = torch.matmul(
+                            reconstructed.reshape(-1, group_size).float(),
+                            torch.outer(_signs1, _signs2).float(),
+                        )
+                        scaled = rotated * norms_flat.unsqueeze(1)
+                        n_exp, out_dim, in_dim = shape
+                        padded_in = (indices.shape[0] // (n_exp * out_dim)) * group_size
+                        dst.copy_(
+                            scaled.reshape(n_exp, out_dim, padded_in)[
+                                :, :, :in_dim
+                            ].to(dst.dtype)
+                        )
+
                     return original_fwd(*args, **kwargs)
 
                 layer._forward_method = _tq_forward
