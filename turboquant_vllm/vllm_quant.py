@@ -291,12 +291,20 @@ def register():
                     initialize_online_processing,
                 )
 
-                self._unquant.create_weights(layer, **kwargs)
                 import sys
-                print(
-                    f"TQDEBUG create_weights: _unquant.kernel={self._unquant.kernel}",
-                    file=sys.stderr, flush=True,
-                )
+                try:
+                    self._unquant.create_weights(layer, **kwargs)
+                    print(
+                        f"TQDEBUG create_weights OK: kernel={self._unquant.kernel}",
+                        file=sys.stderr, flush=True,
+                    )
+                except Exception as e:
+                    print(
+                        f"TQDEBUG create_weights FAILED: {e}",
+                        file=sys.stderr, flush=True,
+                    )
+                    # Fall back — create weights without kernel
+                    pass
 
                 # Move parameters to meta device
                 for name, param in list(layer.named_parameters(recurse=False)):
