@@ -277,7 +277,13 @@ def register():
         _shared_moe_scratch_pool = None
 
         class TurboQuantOnlineMoEMethod(FusedMoEMethodBase):
-            """Online TQ3 for FusedMoE: meta-device init + per-layer compression."""
+            """Meta-device MoE: compress after loading, decompress per forward.
+
+            The MoE kernel is initialized by the underlying unquantized
+            method's ``process_weights_after_loading``. After compression,
+            ``apply()`` decompresses into a shared scratch pool and
+            delegates to the unquantized method (which has the kernel).
+            """
 
             uses_meta_device: bool = True
 
@@ -286,6 +292,9 @@ def register():
                 self.bits = bits
                 self.group_size = group_size
                 self._unquant = UnquantizedFusedMoEMethod(moe_config)
+                self._pool = None
+                self._w13_c = None
+                self._w2_c = None
 
             def create_weights(self, layer: nn.Module, **kwargs):
                 from vllm.model_executor.model_loader.reload.layerwise import (
@@ -294,7 +303,7 @@ def register():
 
                 self._unquant.create_weights(layer, **kwargs)
 
-                # Move parameters to meta device
+                # Move parameters to meta device (zero GPU at init)
                 for name, param in list(layer.named_parameters(recurse=False)):
                     if param.device != torch.device("meta"):
                         meta_param = torch.nn.Parameter(
@@ -313,59 +322,40 @@ def register():
                 initialize_online_processing(layer)
 
             def process_weights_after_loading(self, layer: nn.Module) -> None:
-                # Guard: called twice (online processing + global sweep)
                 if hasattr(layer, "_tq_w13_weight"):
-                    return
+                    return  # guard: called twice (online + global sweep)
 
                 nonlocal _shared_moe_scratch_pool
 
                 from turboquant_vllm.moe_quant import TurboQuantFusedMoEScratchPool
                 from turboquant_vllm.weight_quant import _compress_3d_param
 
-                bits = self.bits
-                group_size = self.group_size
-
-                # Let the unquantized method set up the MoE kernel FIRST
+                # Set up the MoE kernel (via _setup_kernel in vLLM 0.19)
                 self._unquant.process_weights_after_loading(layer)
 
                 w13 = getattr(layer, "w13_weight", None)
                 w2 = getattr(layer, "w2_weight", None)
                 if w13 is None or w2 is None or w13.dim() != 3 or w2.dim() != 3:
-                    logger.warning(
-                        "FusedMoE layer missing w13/w2 3D weights, skipping TQ3",
-                    )
                     return
 
-                _compress_3d_param(layer, "w13_weight", bits, group_size)
-                _compress_3d_param(layer, "w2_weight", bits, group_size)
+                _compress_3d_param(layer, "w13_weight", self.bits, self.group_size)
+                _compress_3d_param(layer, "w2_weight", self.bits, self.group_size)
 
-                w13_c = layer._tq_w13_weight
-                w2_c = layer._tq_w2_weight
+                self._w13_c = layer._tq_w13_weight
+                self._w2_c = layer._tq_w2_weight
 
                 if _shared_moe_scratch_pool is None:
                     _shared_moe_scratch_pool = TurboQuantFusedMoEScratchPool(
-                        w13_c, w2_c,
+                        self._w13_c, self._w2_c,
                     )
                 else:
-                    _shared_moe_scratch_pool.assert_matches(w13_c, w2_c)
+                    _shared_moe_scratch_pool.assert_matches(
+                        self._w13_c, self._w2_c,
+                    )
 
-                pool = _shared_moe_scratch_pool
-                layer.w13_weight.data = pool.w13
-                layer.w2_weight.data = pool.w2
-
-                # Init modular kernel so AOT compile sees a working
-                # MoE dispatch chain (FusedMoEModularMethod has kernel).
-                if hasattr(layer, "maybe_init_modular_kernel"):
-                    layer.maybe_init_modular_kernel()
-
-                original_fwd = layer._forward_method
-
-                def _tq_forward(*args, **kwargs):
-                    w13_c.decompress_into(pool.w13, fp32_scratch=pool.w13_fp32)
-                    w2_c.decompress_into(pool.w2, fp32_scratch=pool.w2_fp32)
-                    return original_fwd(*args, **kwargs)
-
-                layer._forward_method = _tq_forward
+                self._pool = _shared_moe_scratch_pool
+                layer.w13_weight.data = self._pool.w13
+                layer.w2_weight.data = self._pool.w2
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -374,8 +364,15 @@ def register():
                 return self._unquant.get_fused_moe_quant_config(layer)
 
             def apply(self, layer: nn.Module, x: torch.Tensor, **kwargs) -> torch.Tensor:
-                # Decompression is handled by the _forward_method wrapper.
-                # Kernel was initialized by _unquant.process_weights_after_loading.
+                # Decompress into shared scratch pool, then delegate to
+                # the unquantized method which has the MoE kernel.
+                if self._pool is not None and self._w13_c is not None:
+                    self._w13_c.decompress_into(
+                        self._pool.w13, fp32_scratch=self._pool.w13_fp32,
+                    )
+                    self._w2_c.decompress_into(
+                        self._pool.w2, fp32_scratch=self._pool.w2_fp32,
+                    )
                 return self._unquant.apply(layer, x, **kwargs)
 
     except ImportError:
