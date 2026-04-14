@@ -149,14 +149,9 @@ def register():
             )
             layer.register_parameter("weight", weight)
 
-            # Store config for process_weights_after_loading
-            layer.tq_bits = self.bits
-            layer.tq_group_size = self.group_size
-
             initialize_online_processing(layer)
 
         def process_weights_after_loading(self, layer: nn.Module) -> None:
-            """Compress materialized bf16 weight → TQ3 packed format on GPU."""
             from turboquant_vllm.weight_quant import (
                 _ensure_triton_backends,
                 _get_cuda_module,
@@ -166,8 +161,8 @@ def register():
             )
 
             weight = layer.weight.data
-            bits = layer.tq_bits
-            group_size = layer.tq_group_size
+            bits = self.bits
+            group_size = self.group_size
             device = str(weight.device)
 
             out_dim, in_dim = weight.shape
@@ -187,7 +182,6 @@ def register():
             packed = pack_indices(indices, bits)
             norms = norms_raw.reshape(out_dim, n_groups)
 
-            # Delete bf16 weight, store packed data as buffers
             delattr(layer, "weight")
             layer.register_buffer("tq_packed_weight", packed)
             layer.register_buffer("tq_norms", norms)
@@ -197,45 +191,43 @@ def register():
             layer.tq_in_features = in_dim
             layer.tq_out_features = out_dim
             layer.tq_padded_in = padded_in
-            layer.tq_n_groups = n_groups
 
-            # Pre-cache Triton rotation matrix (must happen before graph capture)
+            # Cache dispatch functions — avoids per-forward cross-module lookups
             _ensure_triton_backends()
             _get_cuda_module()
+            from turboquant_vllm.weight_quant import (
+                _tq_fused_gemm_fn,
+                _tq_fwht_input_fn,
+                _triton_available,
+            )
+            if _triton_available:
+                layer._tq_primary_fn = (
+                    _tq_fwht_input_fn if out_dim >= 4096 else _tq_fused_gemm_fn
+                )
+                layer._tq_fallback_fn = (
+                    _tq_fused_gemm_fn if out_dim >= 4096 else _tq_fwht_input_fn
+                )
+            else:
+                layer._tq_primary_fn = None
 
             del weight, padded, grouped, indices, norms_raw
 
         def apply(
             self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None,
         ) -> torch.Tensor:
-            from turboquant_vllm.weight_quant import (
-                _tq_fused_gemm_fn,
-                _tq_fwht_input_fn,
-                _triton_available,
-            )
-
-            if _triton_available:
+            if layer._tq_primary_fn is not None:
                 args = (
                     x, layer.tq_packed_weight, layer.tq_norms,
                     layer.tq_signs1, layer.tq_signs2, layer.tq_centroids,
                 )
-                kwargs = dict(
-                    group_size=self.group_size, bits=self.bits, bias=bias,
-                )
-                primary = (
-                    _tq_fwht_input_fn
-                    if layer.tq_out_features >= 4096
-                    else _tq_fused_gemm_fn
-                )
-                fallback = (
-                    _tq_fused_gemm_fn
-                    if layer.tq_out_features >= 4096
-                    else _tq_fwht_input_fn
-                )
                 try:
-                    return primary(*args, **kwargs)
+                    return layer._tq_primary_fn(
+                        *args, group_size=self.group_size, bits=self.bits, bias=bias,
+                    )
                 except (ValueError, RuntimeError):
-                    return fallback(*args, **kwargs)
+                    return layer._tq_fallback_fn(
+                        *args, group_size=self.group_size, bits=self.bits, bias=bias,
+                    )
 
             # CPU/CUDA fallback — dequantize then matmul
             from turboquant_vllm.weight_quant import _get_quantizer, unpack_indices
@@ -309,12 +301,9 @@ def register():
                         delattr(layer, name)
                         layer.register_parameter(name, meta_param)
 
-                layer.tq_bits = self.bits
-                layer.tq_group_size = self.group_size
                 initialize_online_processing(layer)
 
             def process_weights_after_loading(self, layer: nn.Module) -> None:
-                """Compress FusedMoE w13/w2 to TQ3, install TurboQuantFusedMoEMethod."""
                 nonlocal _shared_moe_scratch_pool
 
                 from turboquant_vllm.moe_quant import (
@@ -323,8 +312,8 @@ def register():
                 )
                 from turboquant_vllm.weight_quant import _compress_3d_param
 
-                bits = layer.tq_bits
-                group_size = layer.tq_group_size
+                bits = self.bits
+                group_size = self.group_size
 
                 w13 = getattr(layer, "w13_weight", None)
                 w2 = getattr(layer, "w2_weight", None)
@@ -472,6 +461,7 @@ def _patch_weight_name_remapping():
                 by_layer[int(m.group(1))].append((base, data))
             else:
                 no_layer.append((base, data))
+        del tq_pairs  # free dict; data dicts now only referenced from by_layer/no_layer
 
         def _decompress_pair(base, data):
             packed = data.get("packed")
@@ -499,7 +489,7 @@ def _patch_weight_name_remapping():
                     yield name, w
                     decompressed += 1
                     del w
-            # Free references for this layer
+            # sorted() returned a snapshot list, safe to mutate during iteration
             del by_layer[layer_idx]
             if decompressed % 100 == 0 and decompressed > 0:
                 logger.info("  Decompressed %d tensors (layer %d)", decompressed, layer_idx)
