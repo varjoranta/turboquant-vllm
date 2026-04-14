@@ -318,10 +318,7 @@ def register():
 
                 nonlocal _shared_moe_scratch_pool
 
-                from turboquant_vllm.moe_quant import (
-                    TurboQuantFusedMoEMethod,
-                    TurboQuantFusedMoEScratchPool,
-                )
+                from turboquant_vllm.moe_quant import TurboQuantFusedMoEScratchPool
                 from turboquant_vllm.weight_quant import _compress_3d_param
 
                 bits = self.bits
@@ -348,22 +345,22 @@ def register():
                 else:
                     _shared_moe_scratch_pool.assert_matches(w13_c, w2_c)
 
-                # Point w13/w2 data at the shared scratch pool
-                layer.w13_weight.data = _shared_moe_scratch_pool.w13
-                layer.w2_weight.data = _shared_moe_scratch_pool.w2
+                pool = _shared_moe_scratch_pool
+                layer.w13_weight.data = pool.w13
+                layer.w2_weight.data = pool.w2
 
-                # Init modular kernel BEFORE replacing quant method — this
-                # installs FusedMoEModularMethod (with a working kernel) as
-                # the current quant_method. Then _replace_quant_method stores
-                # it as base_quant_method, giving TurboQuantFusedMoEMethod a
-                # kernel-backed delegate for the actual MoE dispatch.
-                if hasattr(layer, "maybe_init_modular_kernel"):
-                    layer.maybe_init_modular_kernel()
+                # Wrap _forward_method to decompress TQ3 → scratch pool
+                # before each forward. FusedMoE is a CustomOp so its
+                # forward body is opaque to CUDA graph tracing — the
+                # decompression kernels are captured in the graph.
+                original_fwd = layer._forward_method
 
-                new_method = TurboQuantFusedMoEMethod(
-                    layer.moe_config, w13_c, w2_c, _shared_moe_scratch_pool,
-                )
-                layer._replace_quant_method(new_method)
+                def _tq_forward(*args, **kwargs):
+                    w13_c.decompress_into(pool.w13, fp32_scratch=pool.w13_fp32)
+                    w2_c.decompress_into(pool.w2, fp32_scratch=pool.w2_fp32)
+                    return original_fwd(*args, **kwargs)
+
+                layer._forward_method = _tq_forward
 
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
