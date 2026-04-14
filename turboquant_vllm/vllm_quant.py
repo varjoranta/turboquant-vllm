@@ -355,6 +355,7 @@ def register():
                 # decompression kernels are captured in the graph.
                 original_fwd = layer._forward_method
 
+                @torch.compiler.disable
                 def _tq_forward(*args, **kwargs):
                     w13_c.decompress_into(pool.w13, fp32_scratch=pool.w13_fp32)
                     w2_c.decompress_into(pool.w2, fp32_scratch=pool.w2_fp32)
