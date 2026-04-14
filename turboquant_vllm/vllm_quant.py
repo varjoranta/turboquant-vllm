@@ -1,11 +1,13 @@
 """TurboQuant vLLM integration: quantization config + TQ3 checkpoint loader.
 
-Two roles:
-1. Register ``TurboQuantConfig`` so vLLM recognises ``quantization_config``
-   in config.json (backward compat for old checkpoints).
-2. Patch ``DefaultModelLoader.get_all_weights`` to detect ``tq_config.json``
-   and decompress TQ3 packed weights on load, with per-layer GPU compression
-   to keep peak VRAM at ~1 layer bf16 + all previously compressed layers.
+Three roles:
+1. Register ``TurboQuantConfig`` with ``--quantization turboquant`` so
+   vLLM allocates model weights on meta device (zero GPU at init).
+2. Online quant methods (``TurboQuantOnlineLinearMethod``,
+   ``TurboQuantOnlineMoEMethod``) compress bf16 → TQ3 per-layer after
+   weight loading, keeping peak GPU memory at ~1 layer bf16.
+3. Patch ``DefaultModelLoader.get_all_weights`` to decompress native
+   TQ3 checkpoints (``.tq_packed`` / ``.tq_norms``) to bf16 on the fly.
 """
 
 from __future__ import annotations
@@ -17,7 +19,6 @@ import torch
 from torch import nn
 
 logger = logging.getLogger(__name__)
-
 
 
 def _lazy_import_vllm():
@@ -258,9 +259,6 @@ def register():
             return output
 
     # ── MoE online method ──
-    # For FusedMoE layers, use the standard unquantized method but with
-    # meta-device initialization. After weights load, compress expert
-    # tensors to TQ3 via _replace_linear_layers.
 
     try:
         from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (

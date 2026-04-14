@@ -259,7 +259,7 @@ Inspired by [TurboQuant](https://arxiv.org/abs/2504.19874) (Zandieh, Daliri, Had
 |-------|------|-------------|-------------|---------|
 | **Gemma 4 26B** | 52 GB | **12 GB** | 4.3x | 4.79/5 |
 | **GLM-4.7-Flash 355B** | 62.4 GB | **14.7 GB** | 4.2x | Tested ✓ |
-| **GLM-5.1 754B** | 1,508 GB | **309 GB** | 4.9x | Serving on 2×H200 ✓ |
+| **GLM-5.1 754B** | 1,508 GB | **309 GB** | 4.9x | Validated on GLM-4.7-Flash (same arch) |
 | **Qwen3-30B** | 61 GB | **13 GB** | 4.6x | -- |
 
 Gemma 4 TQ3 quality: **4.79/5** on 20 multi-turn conversation scenarios (scored by Llama-3.3-70B judge). Matches Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost.
