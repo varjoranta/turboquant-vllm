@@ -411,51 +411,17 @@ def register():
 
             def _do_compress(self, layer: nn.Module) -> None:
                 """Kernel setup + TQ3 compression. Called after materialization."""
-                nonlocal _shared_moe_scratch_pool
-
-                from turboquant_vllm.moe_quant import TurboQuantFusedMoEScratchPool
-                from turboquant_vllm.weight_quant import _compress_3d_param
+                import sys
 
                 # Set up the MoE kernel (via _setup_kernel in vLLM 0.19)
                 self._unquant.process_weights_after_loading(layer)
 
-                w13 = getattr(layer, "w13_weight", None)
-                w2 = getattr(layer, "w2_weight", None)
-                if w13 is None or w2 is None or w13.dim() != 3 or w2.dim() != 3:
-                    return
-
-                _compress_3d_param(layer, "w13_weight", self.bits, self.group_size)
-                _compress_3d_param(layer, "w2_weight", self.bits, self.group_size)
-
-                # Check for CUDA errors from compression
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    import sys
-                    print(
-                        f"[TQ-MOE] Compressed OK, "
-                        f"w13_c={layer._tq_w13_weight.packed.shape} "
-                        f"w2_c={layer._tq_w2_weight.packed.shape}",
-                        file=sys.stderr, flush=True,
-                    )
-
-                self._w13_c = layer._tq_w13_weight
-                self._w2_c = layer._tq_w2_weight
-
-                if _shared_moe_scratch_pool is None:
-                    _shared_moe_scratch_pool = TurboQuantFusedMoEScratchPool(
-                        self._w13_c, self._w2_c,
-                    )
-                else:
-                    _shared_moe_scratch_pool.assert_matches(
-                        self._w13_c, self._w2_c,
-                    )
-
-                self._pool = _shared_moe_scratch_pool
-                layer.w13_weight.data = self._pool.w13
-                layer.w2_weight.data = self._pool.w2
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                # TEMPORARY: skip compression to isolate Triton crash
+                print(
+                    f"[TQ-MOE] Skipping compression (debug), "
+                    f"w13={layer.w13_weight.shape} GPU={torch.cuda.memory_allocated()/1e9:.1f}GB",
+                    file=sys.stderr, flush=True,
+                )
 
             def process_weights_after_loading(self, layer: nn.Module) -> None:
                 # Compression handled by _materialize_and_process (triggered
