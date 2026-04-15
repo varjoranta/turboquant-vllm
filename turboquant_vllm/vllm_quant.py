@@ -406,9 +406,7 @@ def register():
                 def _make_buffering_loader(param_name, orig_loader):
                     def _buffering_loader(*args, **kwargs):
                         if materialized[0]:
-                            # After materialization, run directly
                             return orig_loader(*args, **kwargs)
-                        # Buffer the call + track loaded numel
                         loaded_weight = args[1] if len(args) > 1 else None
                         numel = (
                             loaded_weight.numel()
@@ -419,12 +417,14 @@ def register():
                         loaded_numel[0] += numel
 
                         if loaded_numel[0] >= total_numel:
-                            # All weights arrived — materialize + replay
                             materialized[0] = True
                             _materialize_and_process(
                                 layer, buffer, orig_loaders,
                                 param_shapes, param_dtypes, self,
                             )
+                        # Return True so callers with return_success=True
+                        # don't think the load failed
+                        return True
                     return _buffering_loader
 
                 for pname, param in layer.named_parameters(recurse=False):
