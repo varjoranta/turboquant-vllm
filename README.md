@@ -8,7 +8,7 @@ TurboQuant+ compression for vLLM. What this package ships today:
 - **AWQ export** from TQ-compressed weights — ~2 min instead of hours of AWQ calibration.
 - **Legacy KV cache compression** (monkey-patch, MLA-only) for GLM-4.7/DeepSeek-V3 users on stock vLLM until upstream KV compression supports MLA.
 
-> **KV cache compression for GQA/MHA models (Qwen, Llama, Mistral, Gemma) is being upstreamed to vLLM directly in [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)** by @vibhavagarwal5 — under mgoin's review, close to merging. Once it lands, use `--kv-cache-dtype turboquant_3bit_nc` (or `k8v4`, `4bit_nc`, `k3v4_nc`) on stock vLLM with no plugin required. This package's role going forward is weight quantization + MLA KV compression + the supporting tooling, not the standard KV-cache path.
+> **KV cache compression for GQA/MHA models (Qwen, Llama, Mistral, Gemma) is now upstream in vLLM via [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)** by @vibhavagarwal5 (merged 2026-04-15). Use `--kv-cache-dtype turboquant_3bit_nc` (or `k8v4`, `4bit_nc`, `k3v4_nc`) on stock vLLM with no plugin required. This package's role going forward is weight quantization + MLA KV compression + the supporting tooling, not the standard KV-cache path.
 
 ## Quick start
 
@@ -88,7 +88,7 @@ GLM-4.7 355B: native TQ3 checkpoint verified (14.7 GB, 4.2x compression). Full q
 
 **Where to get KV cache compression:**
 
-- **GQA/MHA models** (Qwen, Llama, Mistral, Gemma): use upstream [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479), or Vibhav's branch while the PR is under review. This plugin's old `--kv-cache-dtype tq3` path has been removed.
+- **GQA/MHA models** (Qwen, Llama, Mistral, Gemma): use upstream `--kv-cache-dtype turboquant_3bit_nc` on stock vLLM (merged in [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479)). This plugin's old `--kv-cache-dtype tq3` path has been removed.
 - **MLA models** (GLM-4.7, DeepSeek-V3): use this plugin's `TQ_KV_K_BITS=4` monkey-patch path. It is the only option today. Will be retired once upstream adds MLA support.
 - **Hybrid models** (Qwen3.5, gpt-oss): neither path is fully supported yet. Weight quantization still works.
 
@@ -421,7 +421,7 @@ Contributions and testing on different models welcome. Write-up: [varjosoft.com/
 
 ## KV cache compression: upstream is the path forward
 
-TurboQuant KV cache compression for GQA/MHA models (Qwen, Llama, Mistral, Gemma) is being upstreamed to vLLM directly via [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) by @vibhavagarwal5. As of 2026-04-11 the PR is OPEN, MERGEABLE, tagged `ready`, and under active review by maintainer @mgoin ("I think this is looking quite solid! Enabling CI as I look more carefully"). Merge is close.
+TurboQuant KV cache compression for GQA/MHA models (Qwen, Llama, Mistral, Gemma) is now upstream in vLLM via [vllm-project/vllm#38479](https://github.com/vllm-project/vllm/pull/38479) by @vibhavagarwal5 (merged 2026-04-15). Use `--kv-cache-dtype turboquant_3bit_nc` on stock vLLM — no plugin needed.
 
 Once #38479 lands, the recommended path is:
 
