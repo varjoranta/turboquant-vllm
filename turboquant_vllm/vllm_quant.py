@@ -319,6 +319,59 @@ def register():
 
                 initialize_online_processing(layer)
 
+                # Fix: CopyCounter doesn't count copy_() into meta tensors,
+                # so online processing never detects module completion.
+                # Patch each param's weight_loader to count from the loaded
+                # tensor's numel directly.
+                self._patch_meta_counting(layer)
+
+            @staticmethod
+            def _patch_meta_counting(layer: nn.Module):
+                """Replace online_process_loaders with meta-aware versions.
+
+                The standard online_process_loader uses CopyCounter to track
+                how many elements were loaded. CopyCounter intercepts
+                aten.copy_ — but copy_ into meta tensors may not dispatch
+                correctly, leaving load_numel at 0 forever. This patch
+                counts from the loaded tensor's numel instead.
+                """
+                from vllm.model_executor.model_loader.reload.layerwise import (
+                    _layerwise_process,
+                    get_layerwise_info,
+                )
+
+                info = get_layerwise_info(layer)
+
+                for name, param in layer.named_parameters(recurse=False):
+                    if not hasattr(param, "weight_loader"):
+                        continue
+                    online_loader = param.weight_loader
+                    if not hasattr(online_loader, "__name__") or \
+                            online_loader.__name__ != "online_process_loader":
+                        continue
+
+                    def _make_meta_loader(orig_loader, param_name):
+                        def meta_aware_loader(*args, **kwargs):
+                            loaded = args[1] if len(args) > 1 else None
+                            numel = (
+                                loaded.numel()
+                                if isinstance(loaded, torch.Tensor)
+                                else 0
+                            )
+                            pre = info.load_numel
+                            ret = orig_loader(*args, **kwargs)
+                            counted = info.load_numel - pre
+                            # If CopyCounter didn't fire (meta tensor),
+                            # add our count from the loaded tensor
+                            if counted == 0 and numel > 0:
+                                info.load_numel += numel
+                                if info.load_numel >= info.load_numel_total:
+                                    _layerwise_process(layer, info)
+                            return ret
+                        return meta_aware_loader
+
+                    param.weight_loader = _make_meta_loader(online_loader, name)
+
             def process_weights_after_loading(self, layer: nn.Module) -> None:
                 if hasattr(layer, "_tq_w13_weight"):
                     return  # guard: called twice (online + global sweep)
