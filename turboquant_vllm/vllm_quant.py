@@ -293,13 +293,37 @@ def register():
                     layer.register_parameter(name, real_param)
 
             # 2. Replay all buffered weight_loader calls
+            replay_ok = 0
+            replay_fail = 0
             for pname, args, kwargs in buffer:
                 loader = orig_loaders.get(pname)
                 if loader is not None:
-                    # Update the param reference in args
                     param = getattr(layer, pname)
                     new_args = (param,) + args[1:]
-                    loader(*new_args, **kwargs)
+                    try:
+                        loader(*new_args, **kwargs)
+                        replay_ok += 1
+                    except Exception as e:
+                        replay_fail += 1
+                        if replay_fail <= 3:
+                            print(
+                                f"[TQ-REPLAY] FAIL #{replay_fail}: {pname} "
+                                f"args_types={[type(a).__name__ for a in new_args]} "
+                                f"kwargs={list(kwargs.keys())} err={e}",
+                                file=sys.stderr, flush=True,
+                            )
+
+            # Check if data actually landed
+            for pname in ["w13_weight", "w2_weight"]:
+                p = getattr(layer, pname, None)
+                if p is not None:
+                    nonzero = (p.data != 0).any().item() if p.numel() > 0 else False
+                    print(
+                        f"[TQ-REPLAY] {pname}: shape={tuple(p.shape)} "
+                        f"device={p.device} nonzero={nonzero} "
+                        f"ok={replay_ok} fail={replay_fail}",
+                        file=sys.stderr, flush=True,
+                    )
             buffer.clear()
 
             # 3. Run process_weights_after_loading (kernel setup + compress)
