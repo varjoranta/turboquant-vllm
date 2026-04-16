@@ -156,9 +156,7 @@ def register():
             initialize_online_processing(layer)
 
         def process_weights_after_loading(self, layer: nn.Module) -> None:
-            # Guard: called twice (online processing + global sweep).
-            # After first call, weight is emptied; packed data is in tq_packed_weight.
-            if not hasattr(layer, "weight") or layer.weight.numel() == 0:
+            if getattr(layer, "_already_called_process_weights_after_loading", False):
                 return
 
             from turboquant_vllm.weight_quant import (
@@ -219,6 +217,7 @@ def register():
             else:
                 layer._tq_primary_fn = None
 
+            layer._already_called_process_weights_after_loading = True
             del weight, padded, grouped, indices, norms_raw
 
         def apply(
@@ -227,6 +226,10 @@ def register():
             x: torch.Tensor,
             bias: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            # Pad input if in_dim was not a multiple of group_size
+            if x.shape[-1] != layer.tq_padded_in:
+                x = torch.nn.functional.pad(x, (0, layer.tq_padded_in - x.shape[-1]))
+
             if layer._tq_primary_fn is not None:
                 args = (
                     x,
@@ -243,7 +246,8 @@ def register():
                         bits=self.bits,
                         bias=bias,
                     )
-                except (ValueError, RuntimeError):
+                except (ValueError, RuntimeError) as e:
+                    logger.warning("TurboQuant primary kernel failed, using fallback: %s", e)
                     return layer._tq_fallback_fn(
                         *args,
                         group_size=self.group_size,
@@ -269,7 +273,7 @@ def register():
             w_deq = w_groups.reshape(
                 layer.tq_out_features,
                 layer.tq_padded_in,
-            )[:, : layer.tq_in_features].to(x.dtype)
+            ).to(x.dtype)
             output = torch.matmul(x, w_deq.t())
             if bias is not None:
                 output = output + bias

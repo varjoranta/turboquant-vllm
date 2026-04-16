@@ -402,6 +402,9 @@ class TurboQuantWrapper(nn.Module):
         lookups / string conversions. vLLM 0.19 AOT-compiles this path.
         """
         if _triton_available and x.is_cuda:
+            # Pad input if in_features was not a multiple of group_size
+            if x.shape[-1] != self.padded_in:
+                x = torch.nn.functional.pad(x, (0, self.padded_in - x.shape[-1]))
             args = (x, self.packed_weight, self.norms, self.tq_signs1, self.tq_signs2, self.tq_centroids)
             kwargs = dict(group_size=self.group_size, bits=self.bits, bias=self.bias)
 
