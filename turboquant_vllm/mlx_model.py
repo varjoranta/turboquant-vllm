@@ -102,3 +102,94 @@ class TurboQuantMLXLinear(nn.Module):
         if x.ndim > 2:
             return out_flat.reshape(*orig_shape[:-1], self.out_features)
         return out_flat
+
+
+class TurboQuantMLXSwitchLinear(nn.Module):
+    """TQ3 drop-in for ``mlx_lm.models.switch_layers.SwitchLinear``.
+
+    Stores ``num_experts`` packed TQ3 experts as a single tensor and on
+    every forward dequantises them via the FWHT-on-input codebook-lookup
+    path, then calls ``mx.gather_mm`` (the same primitive SwitchLinear
+    uses) to route tokens to their selected experts.
+
+    Full dequant of all experts per forward, not just the active ones:
+    it's the simplest correct implementation and fits comfortably into
+    unified memory for the model sizes we care about on Apple Silicon.
+    Active-only dequant is a follow-up optimisation.
+
+    Args:
+        packed_weight: uint8 ``(num_experts * out_features * n_groups,
+            bytes_per_group)`` — the TQ3 native MoE layout where
+            ``bytes_per_group = group_size * bits / 8``.
+        norms: float32 ``(num_experts * out_features, n_groups)``
+            shape-gain scales.
+        state: shared ``PolarQuantStateMLX``.
+        in_features: original input dim before padding.
+        out_features: per-expert output dim.
+        num_experts: number of experts in the layer.
+        bias: optional ``(num_experts, out_features)`` bias, or ``None``.
+    """
+
+    def __init__(
+        self,
+        packed_weight: mx.array,
+        norms: mx.array,
+        state: PolarQuantStateMLX,
+        in_features: int,
+        out_features: int,
+        num_experts: int,
+        bias: mx.array | None = None,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.in_features = in_features
+        self.out_features = out_features
+        self.quant_state = state
+        self.bias = bias
+
+        self.group_size = state.dim
+        self.padded_in, self.n_groups = padded_size(in_features, self.group_size)
+        self._pad_needed = self.padded_in > in_features
+
+        self.packed_weight = packed_weight
+        self.norms = norms.reshape(num_experts, out_features, self.n_groups)
+
+        # Pre-unpack once. Shape (num_experts, out_features, n_groups, group_size).
+        unpacked = unpack_indices_3bit_mlx(packed_weight, dim=self.padded_in).reshape(
+            num_experts * out_features * self.n_groups, self.group_size
+        )
+        self._indices_grouped = unpacked.reshape(num_experts, out_features, self.n_groups, self.group_size)
+
+    def __call__(
+        self,
+        x: mx.array,
+        indices: mx.array,
+        sorted_indices: bool = False,
+    ) -> mx.array:
+        # Pad input if the original in_features wasn't a multiple of group_size
+        if self._pad_needed:
+            x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, self.padded_in - self.in_features)])
+
+        # FWHT-on-input: apply the transform once per token, not per weight row
+        leading = x.shape[:-1]
+        x_groups = x.reshape(*leading, self.n_groups, self.group_size)
+        x_groups = x_groups * self.quant_state.signs1
+        x_groups = mx.hadamard_transform(x_groups)
+        x_groups = x_groups * self.quant_state.signs2
+        x_rot = x_groups.reshape(*leading, self.padded_in)
+
+        # Dequantise all experts: codebook lookup + shape-gain scale
+        w = self.quant_state.centroids[self._indices_grouped]
+        w = w * self.norms[:, :, :, None]
+        w = w.reshape(self.num_experts, self.out_features, self.padded_in).astype(x.dtype)
+
+        # Expert-routed matmul (same primitive SwitchLinear uses)
+        out = mx.gather_mm(
+            x_rot,
+            w.swapaxes(-1, -2),
+            rhs_indices=indices,
+            sorted_indices=sorted_indices,
+        )
+        if self.bias is not None:
+            out = out + mx.expand_dims(self.bias[indices], -2)
+        return out
