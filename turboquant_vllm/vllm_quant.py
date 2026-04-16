@@ -57,6 +57,12 @@ def register():
 
         def __init__(self, bits: int = 3, group_size: int = 128, sensitive_bits: int | None = None):
             super().__init__()
+            if bits not in (2, 3, 4):
+                raise ValueError(f"turboquant bits must be 2, 3, or 4; got {bits}")
+            if group_size <= 0 or group_size % 8 != 0:
+                raise ValueError(f"turboquant group_size must be a positive multiple of 8; got {group_size}")
+            if sensitive_bits is not None and sensitive_bits not in (2, 3, 4):
+                raise ValueError(f"turboquant sensitive_bits must be 2, 3, or 4 or None; got {sensitive_bits}")
             self.bits = bits
             self.group_size = group_size
             self.sensitive_bits = sensitive_bits
