@@ -164,6 +164,11 @@ class TurboQuantMLXSwitchLinear(nn.Module):
         indices: mx.array,
         sorted_indices: bool = False,
     ) -> mx.array:
+        # ``sorted_indices`` is accepted for API parity with mlx_lm's
+        # ``SwitchLinear`` but unused here: we dequant per-slot regardless of
+        # sort order, so the hint buys nothing.
+        del sorted_indices
+
         if self._pad_needed:
             x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, self.padded_in - self.in_features)])
 
@@ -171,16 +176,30 @@ class TurboQuantMLXSwitchLinear(nn.Module):
             x, self.quant_state.signs1, self.quant_state.signs2, self.n_groups, self.group_size
         ).reshape(*x.shape[:-1], self.padded_in)
 
-        w = self.quant_state.centroids[self._indices_grouped]
-        w = w * self.norms[:, :, :, None]
-        w = w.reshape(self.num_experts, self.out_features, self.padded_in).astype(x.dtype)
+        # Active-experts-only dequant. With top-k routing (typically 8/256
+        # experts per token), dequanting only referenced experts is ~30x
+        # cheaper than materialising the full ``(n_experts, out, in)``
+        # weight tensor every forward. Duplicates in ``indices`` redundantly
+        # dequant the same expert — acceptable trade-off to avoid a
+        # host-side unique() sync that MLX doesn't support natively.
+        ids_flat = indices.reshape(-1)
+        active_idx_grouped = mx.take(self._indices_grouped, ids_flat, axis=0)
+        active_norms = mx.take(self.norms, ids_flat, axis=0)
 
-        out = mx.gather_mm(
-            x_rot,
-            w.swapaxes(-1, -2),
-            rhs_indices=indices,
-            sorted_indices=sorted_indices,
-        )
+        w = self.quant_state.centroids[active_idx_grouped]
+        w = w * active_norms[:, :, :, None]
+        w = w.reshape(ids_flat.size, self.out_features, self.padded_in).astype(x.dtype)
+
+        # SwitchGLU calls with x shape ``(*leading, 1, 1, in)`` and indices
+        # shape ``(*leading, k)``; output must be ``(*leading, k, 1, out)`` so
+        # SwitchGLU's final ``squeeze(-2)`` lands on ``(*leading, k, out)``.
+        x_rot_per_k = mx.broadcast_to(
+            x_rot.squeeze(-2),
+            (*indices.shape, self.padded_in),
+        ).reshape(ids_flat.size, self.padded_in)
+        out_flat = mx.einsum("ki,koi->ko", x_rot_per_k, w)
+
         if self.bias is not None:
-            out = out + mx.expand_dims(self.bias[indices], -2)
-        return out
+            out_flat = out_flat + mx.take(self.bias, ids_flat, axis=0)
+
+        return out_flat.reshape(*indices.shape, 1, self.out_features)
