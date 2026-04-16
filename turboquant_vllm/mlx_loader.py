@@ -49,6 +49,74 @@ def _build_state(group_size: int, bits: int, seed: int) -> PolarQuantStateMLX:
     return PolarQuantStateMLX.from_torch_quantizer(pq)
 
 
+def _split_fused_gate_up_proj_packed(weights: dict[str, mx.array], model: nn.Module) -> None:
+    """Split compressed ``experts.gate_up_proj`` into ``switch_mlp.gate_proj`` +
+    ``switch_mlp.up_proj``, and rename ``experts.down_proj`` → ``switch_mlp.down_proj.weight``.
+
+    Background: HF stores each MoE layer's gate and up projections fused as
+    one 3D tensor ``(n_experts, 2*moe_intermediate, hidden)``. mlx_lm's
+    ``sanitize()`` splits this at load time. Our ``save_tq3_checkpoint``
+    compresses the fused tensor, and the sanitize split only fires on the
+    uncompressed key, so the packed halves never line up with the split
+    ``SwitchLinear`` modules. This function performs the equivalent split
+    on the packed+norms tensors post-sanitize so the compressed MoE path
+    works for Qwen3.5-MoE and architecturally similar models.
+
+    The split is identical to splitting the dequantised tensor at
+    ``out_dim // 2`` because PolarQuant's quantize/dequantize runs per
+    group independently, so the top half's indices/norms are unaffected
+    by the presence of the bottom half and vice versa.
+    """
+    if not _HAS_SWITCH_LINEAR:
+        return
+
+    switch_modules = {name: m for name, m in model.named_modules() if isinstance(m, SwitchLinear)}
+
+    to_delete: list[str] = []
+    to_add: dict[str, mx.array] = {}
+
+    for key in list(weights.keys()):
+        if ".experts.down_proj.tq_" in key:
+            to_add[key.replace(".experts.down_proj.tq_", ".switch_mlp.down_proj.weight.tq_")] = weights[key]
+            to_delete.append(key)
+            continue
+        if ".experts.gate_up_proj.tq_" not in key:
+            continue
+
+        prefix, suffix = key.rsplit(".experts.gate_up_proj.", 1)
+        gate_target = f"{prefix}.switch_mlp.gate_proj"
+        up_target = f"{prefix}.switch_mlp.up_proj"
+        if gate_target not in switch_modules:
+            continue
+
+        n_experts, out_half, _in = switch_modules[gate_target].weight.shape
+        tensor = weights[key]
+
+        if suffix == "tq_packed":
+            # shape (n_experts * 2*out_half * n_groups, bytes_per_group)
+            n_groups = tensor.shape[0] // (n_experts * 2 * out_half)
+            reshaped = tensor.reshape(n_experts, 2 * out_half, n_groups, tensor.shape[-1])
+            gate = reshaped[:, :out_half, :, :].reshape(n_experts * out_half * n_groups, tensor.shape[-1])
+            up = reshaped[:, out_half:, :, :].reshape(n_experts * out_half * n_groups, tensor.shape[-1])
+            to_add[f"{gate_target}.weight.tq_packed"] = gate
+            to_add[f"{up_target}.weight.tq_packed"] = up
+        elif suffix == "tq_norms":
+            # shape (n_experts * 2*out_half, n_groups)
+            reshaped = tensor.reshape(n_experts, 2 * out_half, tensor.shape[-1])
+            gate = reshaped[:, :out_half, :].reshape(n_experts * out_half, tensor.shape[-1])
+            up = reshaped[:, out_half:, :].reshape(n_experts * out_half, tensor.shape[-1])
+            to_add[f"{gate_target}.weight.tq_norms"] = gate
+            to_add[f"{up_target}.weight.tq_norms"] = up
+        else:
+            continue
+
+        to_delete.append(key)
+
+    for k in to_delete:
+        del weights[k]
+    weights.update(to_add)
+
+
 def _rewrite_legacy_rope_keys(config: dict[str, Any]) -> None:
     """Translate the new consolidated ``rope_parameters`` dict back to the
     legacy ``rope_theta``/``rope_scaling`` keys.
@@ -230,6 +298,7 @@ def load_tq3_model(path_or_hf_repo: str) -> tuple[nn.Module, dict[str, Any]]:
     weights = _load_safetensor_shards(model_path)
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
+    _split_fused_gate_up_proj_packed(weights, model)
 
     default_state = _build_state(group_size, bits, seed)
     sensitive_state = (
