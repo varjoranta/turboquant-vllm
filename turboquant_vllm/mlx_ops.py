@@ -42,6 +42,16 @@ class PolarQuantStateMLX:
             p <<= 1
         return p
 
+    @classmethod
+    def from_torch_quantizer(cls, pq) -> "PolarQuantStateMLX":
+        """Convert a ``PolarQuantTorch`` instance into MLX-side state."""
+        return cls(
+            signs1=mx.array(pq.signs1.numpy()),
+            signs2=mx.array(pq.signs2.numpy()),
+            centroids=mx.array(pq.centroids.numpy()),
+            dim=pq.dim,
+        )
+
 
 def fast_wht_batch_mlx(x: mx.array) -> mx.array:
     """Batched fast Walsh-Hadamard transform, orthonormally normalized.
@@ -82,6 +92,54 @@ def unpack_indices_3bit_mlx(packed: mx.array, dim: int) -> mx.array:
     unpacked = mx.stack([v0, v1, v2, v3, v4, v5, v6, v7], axis=-1)
     unpacked = unpacked.reshape(n_rows, n_groups_of_3 * 8)
     return unpacked[:, :dim]
+
+
+def fwht_on_input_matmul_mlx(
+    x: mx.array,
+    indices_grouped: mx.array,  # (out_features * n_groups, group_size) int32
+    norms: mx.array,  # (out_features, n_groups) float32
+    state: PolarQuantStateMLX,
+    bias: mx.array | None = None,
+    output_dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    """FWHT-on-input matmul: W @ x.T via one forward WHT on x instead of
+    inverse-WHT per weight row.
+
+    Standard path:  y = [norm * inv_WHT(D1 .* centroids .* D2)] @ x
+    This path:      y = norm * centroids @ (D2 .* WHT(D1 .* x))
+
+    Valid because the WHT is self-inverse (its own transpose up to the
+    1/sqrt(n) scale which is absorbed by hadamard_transform's default
+    normalization). Per call: 1 input transform + one grouped matmul
+    instead of out_features × n_groups inverse transforms.
+
+    Best perf when wrapped in ``mx.compile`` (fuses the three sign/WHT
+    multiplies into one compiled graph).
+    """
+    batch = x.shape[0]
+    group_size = state.dim
+    out_features, n_groups = norms.shape
+    padded_in = n_groups * group_size
+
+    if x.shape[-1] != padded_in:
+        x = mx.pad(x, [(0, 0)] * (x.ndim - 1) + [(0, padded_in - x.shape[-1])])
+
+    x_g = x.reshape(batch, n_groups, group_size)
+    x_g = x_g * state.signs1[None, None, :]
+    x_g = mx.hadamard_transform(x_g)
+    x_g = x_g * state.signs2[None, None, :]
+
+    # centroids are constructed as fp32 in from_torch_quantizer, so indexing
+    # produces fp32 directly — no explicit cast needed.
+    w_g = state.centroids[indices_grouped]
+    w_g = w_g.reshape(out_features, n_groups, group_size)
+    w_g = w_g * norms[:, :, None]
+
+    out = mx.einsum("bgi,ogi->bo", x_g, w_g)
+
+    if bias is not None:
+        out = out + bias.astype(out.dtype)
+    return out.astype(output_dtype)
 
 
 def polar_quant_dequantize_mlx(

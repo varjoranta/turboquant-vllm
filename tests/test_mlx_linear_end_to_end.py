@@ -83,12 +83,7 @@ class TestTurboQuantMLXLinearParity(unittest.TestCase):
         ref = (x @ w_deq_pt.t()).numpy()
 
         # MLX path: build state + TurboQuantMLXLinear, run forward on the same input
-        state = PolarQuantStateMLX(
-            signs1=mx.array(pq.signs1.numpy()),
-            signs2=mx.array(pq.signs2.numpy()),
-            centroids=mx.array(pq.centroids.numpy()),
-            dim=group_size,
-        )
+        state = PolarQuantStateMLX.from_torch_quantizer(pq)
         layer = TurboQuantMLXLinear(
             packed_weight=mx.array(comp["packed"].numpy()),
             norms=mx.array(comp["norms"].numpy()),
@@ -115,6 +110,50 @@ class TestTurboQuantMLXLinearParity(unittest.TestCase):
         """in_features=200 needs padding to 256."""
         self._compare_to_pytorch_reference(in_features=200, out_features=64)
 
+    def test_fwht_on_input_matches_full_dequant(self):
+        """FWHT-on-input matmul matches the dense-dequant + matmul path."""
+        from turboquant_vllm.mlx_ops import (
+            PolarQuantStateMLX,
+            fwht_on_input_matmul_mlx,
+            unpack_indices_3bit_mlx,
+        )
+
+        for in_features, out_features in [(128, 64), (256, 128), (200, 64)]:
+            with self.subTest(in_features=in_features, out_features=out_features):
+                comp = self._compress_linear(in_features, out_features)
+                pq = comp["quantizer"]
+                state = PolarQuantStateMLX.from_torch_quantizer(pq)
+
+                packed_mx = mx.array(comp["packed"].numpy())
+                norms_mx = mx.array(comp["norms"].numpy())
+                indices_grouped = unpack_indices_3bit_mlx(
+                    packed_mx, dim=comp["padded_in"]
+                ).reshape(out_features * comp["n_groups"], 128)
+
+                torch.manual_seed(3)
+                x_pt = torch.randn(4, in_features, dtype=torch.float32)
+                x_mx = mx.array(x_pt.numpy())
+
+                # Reference: PyTorch decompress + matmul
+                from turboquant_vllm.weight_quant import unpack_indices
+
+                indices = unpack_indices(comp["packed"], 3, 128)
+                w_groups = pq.dequantize(indices, comp["norms"].reshape(-1))
+                w_deq = w_groups.reshape(out_features, comp["padded_in"])[
+                    :, :in_features
+                ]
+                ref = (x_pt @ w_deq.t()).numpy()
+
+                out_mx = fwht_on_input_matmul_mlx(
+                    x=x_mx,
+                    indices_grouped=indices_grouped,
+                    norms=norms_mx,
+                    state=state,
+                )
+                out_np = np.array(out_mx)
+
+                np.testing.assert_allclose(out_np, ref, rtol=5e-3, atol=5e-3)
+
     def test_with_bias(self):
         """Bias is added in fp32 then cast to x.dtype."""
         from turboquant_vllm.mlx_model import TurboQuantMLXLinear
@@ -127,12 +166,7 @@ class TestTurboQuantMLXLinearParity(unittest.TestCase):
         torch.manual_seed(7)
         bias_pt = torch.randn(out_features, dtype=torch.float32)
 
-        state = PolarQuantStateMLX(
-            signs1=mx.array(pq.signs1.numpy()),
-            signs2=mx.array(pq.signs2.numpy()),
-            centroids=mx.array(pq.centroids.numpy()),
-            dim=128,
-        )
+        state = PolarQuantStateMLX.from_torch_quantizer(pq)
         layer = TurboQuantMLXLinear(
             packed_weight=mx.array(comp["packed"].numpy()),
             norms=mx.array(comp["norms"].numpy()),
