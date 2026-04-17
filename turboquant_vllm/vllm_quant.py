@@ -210,6 +210,24 @@ def register():
             layer.register_buffer("tq_signs1", quantizer.signs1)
             layer.register_buffer("tq_signs2", quantizer.signs2)
             layer.register_buffer("tq_centroids", quantizer.centroids)
+            # Pre-cast bf16 companions consumed by the bs=1 CUDA GEMV fast path.
+            # Casting once at load time avoids per-decode-step HBM traffic.
+            # Gate registration on the arch requirement so apply()'s fast-path
+            # check collapses to a single hasattr() rather than a per-call
+            # cudaGetDeviceProperties query.
+            arch_ok = (
+                torch.cuda.is_available()
+                and torch.cuda.get_device_capability(weight.device)[0] >= 8
+            )
+            if bits == 3 and group_size == 128 and arch_ok:
+                bytes_per_group = group_size * bits // 8
+                layer.register_buffer(
+                    "tq_packed_bs1", packed.view(out_dim * n_groups, bytes_per_group),
+                )
+                layer.register_buffer("tq_norms_bf16", norms.to(torch.bfloat16))
+                layer.register_buffer(
+                    "tq_centroids_bf16", quantizer.centroids.to(torch.bfloat16),
+                )
             layer.tq_in_features = in_dim
             layer.tq_out_features = out_dim
             layer.tq_padded_in = padded_in
@@ -235,6 +253,31 @@ def register():
             # Pad input if in_dim was not a multiple of group_size
             if x.shape[-1] != layer.tq_padded_in:
                 x = torch.nn.functional.pad(x, (0, layer.tq_padded_in - x.shape[-1]))
+
+            # Triton's GEMV pads M=1 up to M=16 and wastes tensor cores;
+            # route bs=1 bf16 to the dedicated CUDA GEMV instead.
+            if (
+                bias is None
+                and x.dtype == torch.bfloat16
+                and x.numel() == x.shape[-1]
+                and hasattr(layer, "tq_packed_bs1")
+            ):
+                from turboquant_vllm.weight_quant import _get_cuda_module
+                cuda_mod = _get_cuda_module()
+                gemv = getattr(cuda_mod, "tq3_gemv_bs1", None) if cuda_mod else None
+                if gemv is not None:
+                    from turboquant_vllm.triton_ops import rotate_input
+                    x_flat = x.reshape(1, x.shape[-1])
+                    x_rot = rotate_input(
+                        x_flat.float(), layer.tq_signs1, layer.tq_signs2, self.group_size,
+                    ).to(torch.bfloat16)
+                    out_vec = gemv(
+                        x_rot.view(-1),
+                        layer.tq_packed_bs1,
+                        layer.tq_norms_bf16,
+                        layer.tq_centroids_bf16,
+                    )
+                    return out_vec.view(*x.shape[:-1], layer.tq_out_features)
 
             if layer._tq_primary_fn is not None:
                 args = (

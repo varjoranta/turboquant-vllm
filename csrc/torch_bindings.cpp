@@ -13,6 +13,7 @@
 
 #include "turbo_quant.h"
 #include "tq_weight_dequant.h"
+#include "tq_weight_gemv_bs1.h"
 #include <torch/extension.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -76,4 +77,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("centroids"), py::arg("output"),
           py::arg("group_size"), py::arg("bits"),
           py::arg("n_experts"), py::arg("out_dim"), py::arg("in_dim"));
+
+    m.def("tq3_gemv_bs1", &tq3_gemv_bs1,
+          "bs=1 GEMV for 3-bit weights (warp-per-OC, sm_80+, bf16)",
+          py::arg("x_rot"), py::arg("packed"),
+          py::arg("norms"), py::arg("codebook"));
 }
