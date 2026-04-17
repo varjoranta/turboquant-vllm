@@ -4,7 +4,7 @@ Model compression for vLLM. What this package ships today:
 
 - **Weight compression** (4.3-4.6x) via 3-bit TQ3. Any BF16 checkpoint, compressed in seconds, zero calibration. Algorithm is the scalar case of HIGGS; see "How it works" below.
 - **Native TQ3 checkpoints** for small-GPU deployments (L40S, RTX 6000 Ada) and large-model deployments (GLM-5.1 754B on 2×H200). MoE expert regrouping handled automatically.
-- **MLX port for Apple Silicon** (`turboquant_vllm.mlx_ops`) — 49× faster than the PyTorch CPU fallback on M4 Pro, enabling local dev-loop iteration on Mac without paid GPUs.
+- **MLX port for Apple Silicon** — loads TQ3 checkpoints through `mlx-lm` on Mac (dense + MoE). Qwen2.5-0.5B at 26 tok/s, Granite-1B MoE at 84 tok/s, Qwen3.5-35B (256 experts) fits in 19 GB on a 48 GB MacBook. [Write-up](https://varjosoft.com/70gb-on-48gb-mac.html).
 - **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models.
 - **AWQ export** from TQ-compressed weights — ~2 min instead of hours of AWQ calibration.
 - **Legacy KV cache compression** (monkey-patch, MLA-only) for GLM-4.7/DeepSeek-V3 users on stock vLLM until upstream KV compression supports MLA.
@@ -384,32 +384,36 @@ This is the same pattern vLLM uses for online FP8 quantization. No `TQ_WEIGHT_BI
 - **TQ2 (2-bit)** destroys quality. 4 centroids too few for MLP weight distributions.
 - **Native TQ3 inference speed** is slower than runtime compression due to per-forward-pass decompression overhead.
 
-## Mac dev loop (MLX)
+## Mac / MLX
 
-Apple Silicon port of the dequant pipeline. Lets you iterate on TQ3 quality locally without paid GPU time — compress a checkpoint, load, generate, measure.
-
-Per-layer benchmark on M4 Pro 48GB against a real Linear from the Qwen3-Coder-30B-A3B TQ3 checkpoint (4096×2048 q_proj):
-
-| Path | ms/call | Speedup vs CPU |
-|---|---|---|
-| PyTorch CPU fallback | 44.32 | 1.0x (baseline) |
-| MLX native | 1.81 | 24.5x |
-| MLX + `mx.compile` fusion | 1.59 | 27.8x |
-| MLX + FWHT-on-input | 0.94 | 47.0x |
-| **MLX + FWHT-on-input + compile** | **0.90** | **49.2x** |
-
-The FWHT-on-input trick exploits the WHT's self-inverse property — apply forward WHT to the input once per group instead of inverse WHT to every weight row. The same optimization our CUDA path uses, ported to MLX with `mx.hadamard_transform`. Validated to rtol=5e-3 against the dense dequant + matmul reference.
+Loads TQ3 native checkpoints through `mlx-lm` on Apple Silicon — dense architectures and MoE. No paid GPU needed for local development, quality validation, or small-model inference.
 
 ```python
-from turboquant_vllm.mlx_ops import (
-    PolarQuantStateMLX,
-    fwht_on_input_matmul_mlx,
-    unpack_indices_3bit_mlx,
-)
-from turboquant_vllm.mlx_model import TurboQuantMLXLinear
+from turboquant_vllm.mlx_loader import load_tq3
+from mlx_lm import generate
+
+model, tokenizer = load_tq3("./my-tq3-checkpoint")
+text = generate(model, tokenizer, "The capital of France is", max_tokens=64)
 ```
 
-The MLX path is **opt-in** — nothing in the CUDA/Triton/CPU paths imports it, so Linux/vLLM users are unaffected. See `scripts/bench_mlx_vs_cpu.py` for the full benchmark. Full integration with `mlx-lm` (model loader + `mlx_lm.server`) is still pending.
+End-to-end results on M4 Pro 48 GB:
+
+| Model | Type | tok/s | Model state |
+|---|---|---|---|
+| Qwen2.5-0.5B | Dense | 26 | 0.4 GB |
+| IBM Granite 1B-A400M | MoE (40 experts) | 84 | 2.5 GB |
+| Qwen3.5-35B-A3B | MoE (256 experts) | ~1 | 19 GB |
+
+The 35B result is compute-bound, not memory-bound: the model fits (70 GB BF16 → 19 GB TQ3 resident), but ~440 unfused Metal kernel launches per token cap throughput at ~1 tok/s. Smaller models are fast because the per-kernel work dominates over launch overhead. Details: [varjosoft.com/70gb-on-48gb-mac.html](https://varjosoft.com/70gb-on-48gb-mac.html).
+
+Key implementation choices:
+
+- **FWHT-on-input** — rotate input once per token instead of inverse-rotating every weight row. 49× faster than the PyTorch CPU fallback per layer.
+- **Active-only expert dequant** — for MoE models, gather only the top-k active experts' packed uint8 bytes via `mx.take`, unpack on the fly. Avoids the 120 GB int32 blowup that happens when all 256 experts are pre-unpacked.
+- **Fused gate_up_proj split** — handles the HF → mlx_lm weight layout translation for Qwen3.5-MoE style architectures post-sanitize.
+- **RoPE compat** — translates transformers 4.52+ `rope_parameters` back to the legacy `rope_theta`/`rope_scaling` keys mlx_lm expects.
+
+The MLX path is **opt-in** — nothing in the CUDA/Triton/CPU paths imports it, so Linux/vLLM users are unaffected.
 
 ## Expert pruning (REAP)
 
