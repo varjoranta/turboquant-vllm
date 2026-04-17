@@ -74,6 +74,7 @@ class TestMLXDequantParity(unittest.TestCase):
         out_np = np.array(out_mx)
 
         np.testing.assert_array_equal(out_np, ref)
+        assert out_mx.dtype == mx.uint8
 
     def test_unpack_3bit_cross_byte_boundary(self):
         """MLX unpack correctly handles cross-byte positions (2 and 5)."""

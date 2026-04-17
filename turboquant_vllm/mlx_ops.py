@@ -88,7 +88,7 @@ def rht_on_last_dim_mlx(
 
 
 def unpack_indices_3bit_mlx(packed: mx.array, dim: int) -> mx.array:
-    """Unpack 3-bit indices from uint8 into int32.
+    """Unpack 3-bit indices from uint8 into uint8 (values 0-7).
 
     Layout matches ``turboquant_vllm.weight_quant.unpack_indices``:
     8 values x 3 bits = 24 bits = 3 bytes per group. Values at packed
@@ -114,12 +114,12 @@ def unpack_indices_3bit_mlx(packed: mx.array, dim: int) -> mx.array:
 
     unpacked = mx.stack([v0, v1, v2, v3, v4, v5, v6, v7], axis=-1)
     unpacked = unpacked.reshape(n_rows, n_groups_of_3 * 8)
-    return unpacked[:, :dim]
+    return unpacked[:, :dim].astype(mx.uint8)
 
 
 def fwht_on_input_matmul_mlx(
     x: mx.array,
-    indices_grouped: mx.array,  # (out_features * n_groups, group_size) int32
+    indices_grouped: mx.array,  # (out_features * n_groups, group_size) uint8
     norms: mx.array,  # (out_features, n_groups) float32
     state: PolarQuantStateMLX,
     bias: mx.array | None = None,
