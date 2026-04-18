@@ -1,6 +1,6 @@
 [project]
 name = "turboquant-plus-vllm"
-version = "0.9.0"
+version = "0.10.0"
 description = "TurboQuant+ compression for vLLM. 4.3x weight compression + 3.7x KV cache, zero calibration."
 readme = "README.md"
 license = {text = "MIT"}
