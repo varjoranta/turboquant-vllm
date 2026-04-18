@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +48,34 @@ def _build_state(group_size: int, bits: int, seed: int) -> PolarQuantStateMLX:
     """Recreate the PolarQuantStateMLX from the deterministic seed."""
     pq = PolarQuantTorch(dim=group_size, bit_width=bits, seed=seed, device="cpu")
     return PolarQuantStateMLX.from_torch_quantizer(pq)
+
+
+_PER_EXPERT_TQ_RE = re.compile(
+    r"^(?P<prefix>.*)\.experts\.(?P<expert>\d+)\.(?P<proj>gate_proj|up_proj|down_proj)\.weight\.tq_(?P<suffix>packed|norms)$"
+)
+
+
+def _stack_per_expert_tq_packed(weights: dict[str, mx.array]) -> None:
+    """Stack per-expert ``experts.{E}.{proj}.weight.tq_{packed,norms}`` into
+    ``switch_mlp.{proj}.weight.tq_{packed,norms}`` along the expert axis.
+
+    mlx_lm's ``Qwen3MoE.sanitize()`` does the equivalent stack for plain
+    ``.weight`` keys, but early-returns when the weights are already
+    compressed (``.tq_packed`` / ``.tq_norms``). Without this helper the
+    per-expert packed tensors never match any ``SwitchLinear`` module and
+    get silently skipped — the MoE path then runs with zero weights.
+    """
+    groups: dict[tuple[str, str, str], dict[int, mx.array]] = {}
+    for key in list(weights.keys()):
+        m = _PER_EXPERT_TQ_RE.match(key)
+        if m is None:
+            continue
+        bucket = groups.setdefault((m["prefix"], m["proj"], m["suffix"]), {})
+        bucket[int(m["expert"])] = weights.pop(key)
+
+    for (prefix, proj, suffix), bucket in groups.items():
+        ordered = [bucket[e] for e in sorted(bucket)]
+        weights[f"{prefix}.switch_mlp.{proj}.weight.tq_{suffix}"] = mx.concatenate(ordered, axis=0)
 
 
 def _split_fused_gate_up_proj_packed(weights: dict[str, mx.array], model: nn.Module) -> None:
@@ -291,11 +320,15 @@ def load_tq3_model(path_or_hf_repo: str) -> tuple[nn.Module, dict[str, Any]]:
 
     config = load_config(model_path)
     _rewrite_legacy_rope_keys(config)
+    # HF config uses `num_local_experts`; newer mlx_lm expects `num_experts`.
+    if "num_local_experts" in config and "num_experts" not in config:
+        config["num_experts"] = config["num_local_experts"]
     model_class, model_args_class = _get_classes(config=config)
     model_args = model_args_class.from_dict(config)
     model = model_class(model_args)
 
     weights = _load_safetensor_shards(model_path)
+    _stack_per_expert_tq_packed(weights)
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
     _split_fused_gate_up_proj_packed(weights, model)
