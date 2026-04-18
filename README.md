@@ -417,6 +417,16 @@ Key implementation choices:
 
 The MLX path is **opt-in** — nothing in the CUDA/Triton/CPU paths imports it, so Linux/vLLM users are unaffected.
 
+### Serving via OpenAI-compatible HTTP (opencode, aider, etc.)
+
+[`examples/mac-serve-tq3.py`](examples/mac-serve-tq3.py) wraps `mlx_lm.server` with three patches needed to survive agent clients on a 48 GiB Mac: it monkey-patches the server's loader to route TQ3 checkpoints through `load_tq3`, serializes requests behind a single lock (so parallel agent calls don't double up Metal command buffer allocations), and caps MLX's wired/memory/cache limits with a `mx.clear_cache()` between requests. ~40 lines total.
+
+```bash
+python examples/mac-serve-tq3.py --model ~/models/qwen3-coder-30b-a3b-tq3 --port 8080
+```
+
+Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. Validated end-to-end with opencode against a 30B MoE — see [34 tok/s on a MacBook](https://varjosoft.com/34-tokens-per-second).
+
 ## Expert pruning (REAP)
 
 Integrated [REAP](https://arxiv.org/abs/2510.13999) (Cerebras, ICLR 2026) saliency scoring for MoE expert pruning. Measures actual expert contribution during inference, not just weight magnitude.
