@@ -707,6 +707,61 @@ try:
         N = norms.shape[0]
         return x.new_empty((*x.shape[:-1], N))
 
+    # TQ3 linear with runtime-internal M-based dispatch.
+    # vLLM's Dynamo compile traces the model once on profile_run (batch >> 1)
+    # and specializes that trace against the traced shape. A Python-level
+    # `if x.shape[0] == 1` branch in apply() therefore gets the True branch
+    # compiled out, and every CUDA-graph replay (including the size-1
+    # capture) replays the fallback path. Pushing the branch inside a
+    # custom op keeps Dynamo opaque: each size-specific capture re-runs the
+    # internal branch with the actual shape.
+    @torch.library.custom_op(
+        "turboquant::tq3_apply", mutates_args=(), device_types=("cuda",),
+    )
+    def _tq3_apply_op(
+        x: torch.Tensor,
+        packed_weight: torch.Tensor,
+        norms: torch.Tensor,
+        signs1: torch.Tensor,
+        signs2: torch.Tensor,
+        centroids: torch.Tensor,
+        packed_bs1: torch.Tensor,
+        norms_bf16: torch.Tensor,
+        centroids_bf16: torch.Tensor,
+        group_size: int,
+        bits: int,
+    ) -> torch.Tensor:
+        if x.dim() == 2 and x.shape[0] == 1 and bits == 3:
+            from turboquant_vllm.weight_quant import _get_cuda_module
+            cuda_mod = _get_cuda_module()
+            gemv = getattr(cuda_mod, "tq3_gemv_bs1", None) if cuda_mod else None
+            if gemv is not None:
+                x_rot = rotate_input(
+                    x.float(), signs1, signs2, group_size,
+                ).to(torch.bfloat16)
+                out = gemv(x_rot.view(-1), packed_bs1, norms_bf16, centroids_bf16)
+                return out.view(1, -1)
+        return _tq_fwht_input_gemm_impl(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            group_size=group_size, bits=bits, bias=None,
+        )
+
+    @_tq3_apply_op.register_fake
+    def _(x, packed_weight, norms, signs1, signs2, centroids,
+          packed_bs1, norms_bf16, centroids_bf16, group_size, bits):
+        N = norms.shape[0]
+        return x.new_empty((*x.shape[:-1], N))
+
+    def tq3_apply(  # type: ignore[no-redef]
+        x, packed_weight, norms, signs1, signs2, centroids,
+        packed_bs1, norms_bf16, centroids_bf16,
+        group_size, bits,
+    ):
+        return torch.ops.turboquant.tq3_apply(
+            x, packed_weight, norms, signs1, signs2, centroids,
+            packed_bs1, norms_bf16, centroids_bf16, group_size, bits,
+        )
+
     # Public callables that dynamo treats as opaque ops. Keyword args are
     # not supported across the custom_op boundary (schema is positional),
     # so we wrap to restore the original keyword-friendly call signature.

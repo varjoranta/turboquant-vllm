@@ -254,30 +254,25 @@ def register():
             if x.shape[-1] != layer.tq_padded_in:
                 x = torch.nn.functional.pad(x, (0, layer.tq_padded_in - x.shape[-1]))
 
-            # Triton's GEMV pads M=1 up to M=16 and wastes tensor cores;
-            # route bs=1 bf16 to the dedicated CUDA GEMV instead.
+            # Route TQ3 bf16 through a runtime-dispatching custom op so the
+            # bs=1 CUDA GEMV gets captured inside each size-specific CUDA
+            # graph. Dynamo traces the model once (batch >> 1 on
+            # profile_run) and would specialize a Python-level M==1 branch
+            # against that shape, so the branch must live inside the op.
             if (
                 bias is None
+                and self.bits == 3
                 and x.dtype == torch.bfloat16
-                and x.numel() == x.shape[-1]
                 and hasattr(layer, "tq_packed_bs1")
             ):
-                from turboquant_vllm.weight_quant import _get_cuda_module
-                cuda_mod = _get_cuda_module()
-                gemv = getattr(cuda_mod, "tq3_gemv_bs1", None) if cuda_mod else None
-                if gemv is not None:
-                    from turboquant_vllm.triton_ops import rotate_input
-                    x_flat = x.reshape(1, x.shape[-1])
-                    x_rot = rotate_input(
-                        x_flat.float(), layer.tq_signs1, layer.tq_signs2, self.group_size,
-                    ).to(torch.bfloat16)
-                    out_vec = gemv(
-                        x_rot.view(-1),
-                        layer.tq_packed_bs1,
-                        layer.tq_norms_bf16,
-                        layer.tq_centroids_bf16,
-                    )
-                    return out_vec.view(*x.shape[:-1], layer.tq_out_features)
+                return torch.ops.turboquant.tq3_apply(
+                    x,
+                    layer.tq_packed_weight, layer.tq_norms,
+                    layer.tq_signs1, layer.tq_signs2, layer.tq_centroids,
+                    layer.tq_packed_bs1, layer.tq_norms_bf16,
+                    layer.tq_centroids_bf16,
+                    self.group_size, self.bits,
+                )
 
             if layer._tq_primary_fn is not None:
                 args = (
