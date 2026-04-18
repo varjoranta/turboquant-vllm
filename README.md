@@ -427,6 +427,10 @@ python examples/mac-serve-tq3.py --model ~/models/qwen3-coder-30b-a3b-tq3 --port
 
 Point any OpenAI-compatible client at `http://127.0.0.1:8080/v1`. Validated end-to-end with opencode against a 30B MoE — see [34 tok/s on a MacBook](https://varjosoft.com/34-tokens-per-second).
 
+### Related MLX work
+
+For **KV-cache** compression on MLX (the original TurboQuant paper's actual subject — Zandieh et al., ICLR 2026), see [sharpner/turboquant-mlx](https://github.com/sharpner/turboquant-mlx). That project implements V2 (hardware-accelerated `mx.quantized_matmul`) and V3 (Lloyd-Max paper-correct) KV-cache compression paths, with perplexity + throughput benchmarks across Llama 3.1/3.2, Mistral, and Gemma 3. Our MLX path above compresses **weights** via HIGGS-scalar; sharpner's compresses the **KV cache** via TurboQuant. The two are orthogonal and can coexist in the same serving stack.
+
 ## Expert pruning (REAP)
 
 Integrated [REAP](https://arxiv.org/abs/2510.13999) (Cerebras, ICLR 2026) saliency scoring for MoE expert pruning. Measures actual expert contribution during inference, not just weight magnitude.
