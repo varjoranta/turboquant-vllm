@@ -1,0 +1,41 @@
+turboquant-plus-vllm
+Copyright (c) 2026 Hannu Varjoranta
+Licensed under the MIT License — see LICENSE
+
+This product includes software developed by third parties:
+
+---
+
+FLUTE — Flexible Lookup Table Engine for LUT-quantized LLMs
+https://github.com/HanGuo97/flute
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Licensed under the Apache License, Version 2.0
+
+Vendored at:
+  csrc/flute/                       (CUDA/C++ sources)
+  turboquant_vllm/flute/            (Python wrappers + data configs)
+
+Modifications from upstream:
+  - TORCH_LIBRARY namespace renamed from ``flute`` to ``turboquant_flute``
+    to avoid conflict with externally installed flute-kernel
+  - Python internal imports rewritten from ``flute.*`` to
+    ``turboquant_vllm.flute.*``
+  - Build path migrated from setup.py to torch JIT via
+    turboquant_vllm.flute_build.build()
+
+Citation:
+  Guo, Han, et al. "FLUTE: Flexible Lookup Table Engine for LUT-quantized
+  LLMs." EMNLP Findings 2024. arXiv:2407.10960
+
+Apache 2.0 license text: https://www.apache.org/licenses/LICENSE-2.0
+
+---
+
+CUTLASS — CUDA Templates for Linear Algebra Subroutines
+https://github.com/NVIDIA/cutlass
+Copyright (c) NVIDIA Corporation
+Licensed under the BSD 3-Clause License
+
+Included as a git submodule at third_party/cutlass (pinned to v3.9.2).
+Not redistributed in wheel form — users who install from git source
+will clone the submodule.
