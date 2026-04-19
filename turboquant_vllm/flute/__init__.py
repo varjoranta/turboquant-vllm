@@ -1,7 +1,15 @@
 import os
+import sys
 import torch
 import click
 from typing import Callable, cast
+
+# Register ourselves as the module `flute` so internal bare references
+# like `flute.tune.TuneMetaData` in the vendored wrapper files resolve
+# to this package without touching every file. Use setdefault so any
+# pre-existing external flute-kernel install wins — avoids surprising
+# users who already depend on the upstream package.
+sys.modules.setdefault("flute", sys.modules[__name__])
 
 # Vendored FLUTE uses torch JIT-compile via turboquant_vllm.flute_build.
 # First import triggers a compile (~5-15 min); cached thereafter.
