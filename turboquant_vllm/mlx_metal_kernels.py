@@ -379,3 +379,284 @@ def tq3_gemv_bs1_mlx(
         output_dtypes=[mx.float16],
     )[0]
     return out
+
+
+# ---------------------------------------------------------------------------
+# TQ4 bs=1 GEMV kernels (4-bit packing: 2 values per byte, 64 bytes/group)
+# ---------------------------------------------------------------------------
+#
+# Same warp-per-output-channel design as the TQ3 kernels. Differences:
+#   - 16-entry codebook (4 bits) staged to threadgroup memory
+#   - 64 bytes per 128-element group (2 indices/byte nibble layout)
+#   - No cross-byte unpack complexity (vs TQ3's 8-in-3-byte packing)
+#   - Chunked as 4 x 16 bytes = 64 bytes per group, each chunk supplies
+#     32 indices that cover 32 x activation values
+# Kernel bodies are intentionally kept close to the TQ3 versions so a
+# future unified TQN kernel (with bits as a template constant) is a
+# small diff away.
+
+
+_GEMV4_SOURCE = """
+    threadgroup half cb_lut[16];
+    uint tid = thread_position_in_threadgroup.x;
+    if (tid < 16u) {
+        cb_lut[tid] = codebook[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint oc         = thread_position_in_grid.y;
+    uint lane       = thread_position_in_grid.x;
+    uint OC_v       = OC[0];
+    uint n_groups_v = n_groups[0];
+
+    if (oc >= OC_v) return;
+
+    float psum = 0.0f;
+
+    for (uint g = lane; g < n_groups_v; g += 32u) {
+        device const uint8_t* grp = packed + (oc * n_groups_v + g) * 64u;
+        float norm = float(norms[oc * n_groups_v + g]);
+        device const half* x_chunk = x_rot + g * 128u;
+
+        // 4 chunks × 16 bytes each. Each byte gives 2 indices (lo, hi).
+        for (uint c = 0u; c < 4u; ++c) {
+            device const uint8_t* chunk = grp + c * 16u;
+            device const half* xc = x_chunk + c * 32u;
+            for (uint b = 0u; b < 16u; ++b) {
+                uint byte = (uint)chunk[b];
+                uint i_lo =  byte        & 0xFu;
+                uint i_hi = (byte >> 4)  & 0xFu;
+                uint base = b * 2u;
+                psum += float(cb_lut[i_lo]) * norm * float(xc[base + 0u]);
+                psum += float(cb_lut[i_hi]) * norm * float(xc[base + 1u]);
+            }
+        }
+    }
+
+    psum = simd_sum(psum);
+    if (lane == 0u) {
+        out[oc] = (half)psum;
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _gemv4_kernel():
+    return mx.fast.metal_kernel(
+        name="tq4_gemv_bs1_mlx",
+        input_names=["x_rot", "packed", "norms", "codebook", "OC", "n_groups"],
+        output_names=["out"],
+        source=_GEMV4_SOURCE,
+    )
+
+
+def tq4_gemv_bs1_mlx(
+    x_rot: mx.array,
+    packed: mx.array,
+    norms: mx.array,
+    codebook: mx.array,
+) -> mx.array:
+    """bs=1 GEMV for TQ4 Linear. Same interface as tq3_gemv_bs1_mlx except
+    packed.shape[1] == 64 (not 48) and codebook.size == 16 (not 8)."""
+    assert x_rot.dtype == mx.float16, f"x_rot must be float16, got {x_rot.dtype}"
+    assert packed.dtype == mx.uint8 and packed.ndim == 2 and packed.shape[1] == 64
+    assert norms.dtype == mx.float16 and norms.ndim == 2
+    assert codebook.dtype == mx.float16 and codebook.size == 16
+
+    OC = norms.shape[0]
+    n_groups = norms.shape[1]
+    assert x_rot.size == n_groups * 128
+
+    OC_arg = mx.array([OC], dtype=mx.uint32)
+    ng_arg = mx.array([n_groups], dtype=mx.uint32)
+    kernel = _gemv4_kernel()
+    out = kernel(
+        inputs=[x_rot, packed, norms, codebook, OC_arg, ng_arg],
+        grid=(32, OC, 1),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(OC,)],
+        output_dtypes=[mx.float16],
+    )[0]
+    return out
+
+
+_GEMV4_BATCHED_SOURCE = """
+    threadgroup half cb_lut[16];
+    uint tid = thread_position_in_threadgroup.x;
+    if (tid < 16u) {
+        cb_lut[tid] = codebook[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint oc         = thread_position_in_grid.y;
+    uint k_active   = thread_position_in_grid.z;
+    uint lane       = thread_position_in_grid.x;
+    uint OC_v       = OC[0];
+    uint n_groups_v = n_groups[0];
+    uint K_active_v = K_active[0];
+
+    if (oc >= OC_v || k_active >= K_active_v) return;
+
+    device const uint8_t* packed_e = packed + k_active * OC_v * n_groups_v * 64u;
+    device const half*    norms_e  = norms  + k_active * OC_v * n_groups_v;
+
+    float psum = 0.0f;
+
+    for (uint g = lane; g < n_groups_v; g += 32u) {
+        device const uint8_t* grp = packed_e + (oc * n_groups_v + g) * 64u;
+        float norm = float(norms_e[oc * n_groups_v + g]);
+        device const half* x_chunk = x_rot + g * 128u;
+
+        for (uint c = 0u; c < 4u; ++c) {
+            device const uint8_t* chunk = grp + c * 16u;
+            device const half* xc = x_chunk + c * 32u;
+            for (uint b = 0u; b < 16u; ++b) {
+                uint byte = (uint)chunk[b];
+                uint i_lo =  byte        & 0xFu;
+                uint i_hi = (byte >> 4)  & 0xFu;
+                uint base = b * 2u;
+                psum += float(cb_lut[i_lo]) * norm * float(xc[base + 0u]);
+                psum += float(cb_lut[i_hi]) * norm * float(xc[base + 1u]);
+            }
+        }
+    }
+
+    psum = simd_sum(psum);
+    if (lane == 0u) {
+        out[k_active * OC_v + oc] = (half)psum;
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _gemv4_batched_kernel():
+    return mx.fast.metal_kernel(
+        name="tq4_gemv_bs1_batched_mlx",
+        input_names=["x_rot", "packed", "norms", "codebook", "OC", "n_groups", "K_active"],
+        output_names=["out"],
+        source=_GEMV4_BATCHED_SOURCE,
+    )
+
+
+def tq4_gemv_bs1_batched_mlx(
+    x_rot: mx.array,
+    packed: mx.array,
+    norms: mx.array,
+    codebook: mx.array,
+) -> mx.array:
+    """bs=1 GEMV for K_active experts sharing the same x_rot, TQ4 layout."""
+    assert x_rot.dtype == mx.float16
+    assert packed.dtype == mx.uint8 and packed.ndim == 3 and packed.shape[2] == 64
+    assert norms.dtype == mx.float16 and norms.ndim == 3
+    assert codebook.dtype == mx.float16 and codebook.size == 16
+
+    K_active = norms.shape[0]
+    OC = norms.shape[1]
+    n_groups = norms.shape[2]
+    assert x_rot.size == n_groups * 128
+    assert packed.shape[0] == K_active and packed.shape[1] == OC * n_groups
+
+    OC_arg = mx.array([OC], dtype=mx.uint32)
+    ng_arg = mx.array([n_groups], dtype=mx.uint32)
+    ka_arg = mx.array([K_active], dtype=mx.uint32)
+    kernel = _gemv4_batched_kernel()
+    out = kernel(
+        inputs=[x_rot, packed, norms, codebook, OC_arg, ng_arg, ka_arg],
+        grid=(32, OC, K_active),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(K_active, OC)],
+        output_dtypes=[mx.float16],
+    )[0]
+    return out
+
+
+_GEMV4_BATCHED_PER_X_SOURCE = """
+    threadgroup half cb_lut[16];
+    uint tid = thread_position_in_threadgroup.x;
+    if (tid < 16u) {
+        cb_lut[tid] = codebook[tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint oc         = thread_position_in_grid.y;
+    uint k_active   = thread_position_in_grid.z;
+    uint lane       = thread_position_in_grid.x;
+    uint OC_v       = OC[0];
+    uint n_groups_v = n_groups[0];
+    uint K_active_v = K_active[0];
+    uint K_v        = n_groups_v * 128u;
+
+    if (oc >= OC_v || k_active >= K_active_v) return;
+
+    device const uint8_t* packed_e = packed + k_active * OC_v * n_groups_v * 64u;
+    device const half*    norms_e  = norms  + k_active * OC_v * n_groups_v;
+    device const half*    x_e      = x_rot  + k_active * K_v;
+
+    float psum = 0.0f;
+
+    for (uint g = lane; g < n_groups_v; g += 32u) {
+        device const uint8_t* grp = packed_e + (oc * n_groups_v + g) * 64u;
+        float norm = float(norms_e[oc * n_groups_v + g]);
+        device const half* x_chunk = x_e + g * 128u;
+
+        for (uint c = 0u; c < 4u; ++c) {
+            device const uint8_t* chunk = grp + c * 16u;
+            device const half* xc = x_chunk + c * 32u;
+            for (uint b = 0u; b < 16u; ++b) {
+                uint byte = (uint)chunk[b];
+                uint i_lo =  byte        & 0xFu;
+                uint i_hi = (byte >> 4)  & 0xFu;
+                uint base = b * 2u;
+                psum += float(cb_lut[i_lo]) * norm * float(xc[base + 0u]);
+                psum += float(cb_lut[i_hi]) * norm * float(xc[base + 1u]);
+            }
+        }
+    }
+
+    psum = simd_sum(psum);
+    if (lane == 0u) {
+        out[k_active * OC_v + oc] = (half)psum;
+    }
+"""
+
+
+@lru_cache(maxsize=1)
+def _gemv4_batched_per_x_kernel():
+    return mx.fast.metal_kernel(
+        name="tq4_gemv_bs1_batched_per_x_mlx",
+        input_names=["x_rot", "packed", "norms", "codebook", "OC", "n_groups", "K_active"],
+        output_names=["out"],
+        source=_GEMV4_BATCHED_PER_X_SOURCE,
+    )
+
+
+def tq4_gemv_bs1_batched_per_x_mlx(
+    x_rot: mx.array,
+    packed: mx.array,
+    norms: mx.array,
+    codebook: mx.array,
+) -> mx.array:
+    """bs=1 GEMV for K_active experts with per-expert x, TQ4 layout."""
+    assert x_rot.dtype == mx.float16 and x_rot.ndim == 2
+    assert packed.dtype == mx.uint8 and packed.ndim == 3 and packed.shape[2] == 64
+    assert norms.dtype == mx.float16 and norms.ndim == 3
+    assert codebook.dtype == mx.float16 and codebook.size == 16
+
+    K_active = x_rot.shape[0]
+    K = x_rot.shape[1]
+    OC = norms.shape[1]
+    n_groups = norms.shape[2]
+    assert K == n_groups * 128
+
+    OC_arg = mx.array([OC], dtype=mx.uint32)
+    ng_arg = mx.array([n_groups], dtype=mx.uint32)
+    ka_arg = mx.array([K_active], dtype=mx.uint32)
+    kernel = _gemv4_batched_per_x_kernel()
+    out = kernel(
+        inputs=[x_rot, packed, norms, codebook, OC_arg, ng_arg, ka_arg],
+        grid=(32, OC, K_active),
+        threadgroup=(32, 1, 1),
+        output_shapes=[(K_active, OC)],
+        output_dtypes=[mx.float16],
+    )[0]
+    return out

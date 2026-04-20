@@ -29,6 +29,9 @@ from turboquant_vllm.mlx_metal_kernels import (
     tq3_gemv_bs1_batched_mlx,
     tq3_gemv_bs1_batched_per_x_mlx,
     tq3_gemv_bs1_mlx,
+    tq4_gemv_bs1_batched_mlx,
+    tq4_gemv_bs1_batched_per_x_mlx,
+    tq4_gemv_bs1_mlx,
 )
 from turboquant_vllm.mlx_ops import (
     PolarQuantStateMLX,
@@ -95,18 +98,16 @@ class TurboQuantMLXLinear(nn.Module):
         orig_shape = x.shape
         x_flat = x.reshape(-1, orig_shape[-1]) if x.ndim > 2 else x
 
-        # bs=1 fp16 fast path via the custom Metal GEMV kernel: skips the
-        # full bf16/fp16 weight materialization that fwht_on_input_matmul_mlx
-        # does, fusing 3-bit unpack + codebook lookup + norm + matmul into
-        # one pass. 5-10x over the existing path on Qwen3-8B layer shapes.
-        # Kernel only supports 3-bit packing (48 bytes/group). For 4-bit
-        # TQ-apex layers we fall through to the generic path, which uses
-        # pre-unpacked uint8 indices and works for any bit width.
-        if (
+        # bs=1 fp16 fast path via custom Metal GEMV kernels: fuses unpack +
+        # codebook lookup + norm + matmul into one pass. Dispatch on bit
+        # width — TQ3 uses 48-byte groups / 8-entry codebook, TQ4 uses
+        # 64-byte groups / 16-entry codebook.
+        use_fast_path = (
             x_flat.shape[0] == 1
             and x_flat.dtype == mx.float16
-            and self.quant_state.bits == 3
-        ):
+            and self.quant_state.bits in (3, 4)
+        )
+        if use_fast_path:
             x_padded = (
                 mx.pad(x_flat, [(0, 0), (0, self.padded_in - self.in_features)])
                 if self._pad_needed else x_flat
@@ -115,10 +116,12 @@ class TurboQuantMLXLinear(nn.Module):
                 x_padded, self.quant_state.signs1, self.quant_state.signs2,
                 self.n_groups, self.group_size,
             ).reshape(self.padded_in).astype(mx.float16)
+            bytes_per_group = 48 if self.quant_state.bits == 3 else 64
             packed_view = self.packed_weight.reshape(
-                self.out_features * self.n_groups, 48,
+                self.out_features * self.n_groups, bytes_per_group,
             )
-            out_vec = tq3_gemv_bs1_mlx(
+            gemv = tq3_gemv_bs1_mlx if self.quant_state.bits == 3 else tq4_gemv_bs1_mlx
+            out_vec = gemv(
                 x_rot,
                 packed_view,
                 self.norms.astype(mx.float16),
@@ -229,13 +232,20 @@ class TurboQuantMLXSwitchLinear(nn.Module):
         #       x has shape (1, 1, 1, K), x_rot.size == padded_in.
         #   (b) per-expert-x: down_proj — each expert sees its own activation.
         #       x has shape (1, K_active, 1, K), x_rot.size == K_active * padded_in.
-        # bs=1 fused Metal GEMV fast path. Both variants (shared-x and per-
-        # expert-x) are 3-bit-only — fall through to the generic dequant path
-        # for TQ-apex layers whose state is 4-bit.
+        # bs=1 fused Metal GEMV fast path — dispatch on state.bits (3 or 4).
+        # Each of the two variants (shared-x and per-expert-x) has TQ3 and
+        # TQ4 kernels. 4-bit packed is 64 bytes/group, 3-bit is 48.
         K_active = ids_flat.size
-        if self.quant_state.bits == 3 and x.dtype == mx.float16 and x_rot.size == self.padded_in:
+        use_fast_path = (
+            x.dtype == mx.float16 and self.quant_state.bits in (3, 4)
+        )
+        if use_fast_path and x_rot.size == self.padded_in:
             x_rot_flat = x_rot.reshape(self.padded_in).astype(mx.float16)
-            out_flat = tq3_gemv_bs1_batched_mlx(
+            gemv = (
+                tq3_gemv_bs1_batched_mlx if self.quant_state.bits == 3
+                else tq4_gemv_bs1_batched_mlx
+            )
+            out_flat = gemv(
                 x_rot_flat,
                 active_packed,
                 active_norms.astype(mx.float16),
@@ -244,9 +254,13 @@ class TurboQuantMLXSwitchLinear(nn.Module):
             if self.bias is not None:
                 out_flat = out_flat + mx.take(self.bias, ids_flat, axis=0).astype(mx.float16)
             return out_flat.reshape(*indices.shape, 1, self.out_features)
-        if self.quant_state.bits == 3 and x.dtype == mx.float16 and x_rot.size == K_active * self.padded_in:
+        if use_fast_path and x_rot.size == K_active * self.padded_in:
             x_rot_per_k = x_rot.reshape(K_active, self.padded_in).astype(mx.float16)
-            out_flat = tq3_gemv_bs1_batched_per_x_mlx(
+            gemv = (
+                tq3_gemv_bs1_batched_per_x_mlx if self.quant_state.bits == 3
+                else tq4_gemv_bs1_batched_per_x_mlx
+            )
+            out_flat = gemv(
                 x_rot_per_k,
                 active_packed,
                 active_norms.astype(mx.float16),
