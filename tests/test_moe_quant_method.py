@@ -339,6 +339,48 @@ class TestFusedMoEWalkerInstallation(unittest.TestCase):
             f"TQ3 compression ratio {ratio:.2f}× is suspiciously low (should be around 5× for bf16 → 3-bit)",
         )
 
+    def test_walker_picks_bits_independently_per_side(self):
+        """w13 (gate/up) and w2 (down) must get independent bit-width selection
+        under kurtosis_aware. Down-projection is consistently heavier-tailed
+        than gate/up on every MoE model measured; giving them the same bits
+        wastes allocation capacity.
+
+        Seeds w13 with a mostly-Gaussian distribution (low kurtosis, should
+        pick the default or fewer bits) and w2 with a heavy-tailed one (high
+        kurtosis, should pick more bits). Checks that the chosen bit widths
+        differ.
+        """
+        model = nn.Module()
+        expert = _FakeFusedMoE(num_experts=4, hidden=128, intermediate=128)
+
+        rng = torch.Generator().manual_seed(0)
+        # w13: tight Gaussian → kurt ≈ 3 → _select_bits picks default - 1
+        expert.w13_weight = nn.Parameter(
+            torch.randn(4, 256, 128, generator=rng, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        # w2: mixture giving heavy tails → kurt > 8 → _select_bits picks default + 2
+        base = torch.randn(4, 128, 128, generator=rng, dtype=torch.float32)
+        spikes = torch.zeros_like(base)
+        idx = torch.randint(0, base.numel(), (50,), generator=rng)
+        spikes.view(-1)[idx] = 20.0 * torch.randn(50, generator=rng)
+        expert.w2_weight = nn.Parameter(
+            (base + spikes).to(torch.bfloat16),
+            requires_grad=False,
+        )
+        model.add_module("block_0", expert)
+
+        _replace_linear_layers(model, bits=3, group_size=128, kurtosis_aware=True)
+
+        w13_bits = model.block_0._tq_w13_weight.bits
+        w2_bits = model.block_0._tq_w2_weight.bits
+        self.assertNotEqual(
+            w13_bits, w2_bits,
+            f"expected independent bit widths for w13/w2 under kurtosis_aware; "
+            f"got w13_bits={w13_bits}, w2_bits={w2_bits} (same = side-independence broken)",
+        )
+        self.assertLess(w13_bits, w2_bits, "heavy-tailed w2 should get more bits than tight-Gaussian w13")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
