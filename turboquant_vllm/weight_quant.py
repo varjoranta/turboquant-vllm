@@ -1161,19 +1161,24 @@ def _replace_linear_layers(
                 continue
 
             # Select bit width for this MoE block. Respect per-module override,
-            # routed_expert_bits, then kurtosis_aware, then default.
+            # routed_expert_bits, then kurtosis_aware (per side), then default.
+            # Gate/up (w13) and down (w2) have different kurtosis on every MoE
+            # model we've measured (down is consistently heavier-tailed), so
+            # reading kurtosis once on w13 and applying to both sides misses
+            # ~2-5% of the bit-allocation ceiling.
             if per_module_bits and name in per_module_bits:
-                tensor_bits = per_module_bits[name]
+                w13_bits = w2_bits = per_module_bits[name]
             elif routed_expert_bits is not None:
-                tensor_bits = routed_expert_bits
+                w13_bits = w2_bits = routed_expert_bits
             else:
-                tensor_bits = _select_bits(w13_param.data, bits, kurtosis_aware)
+                w13_bits = _select_bits(w13_param.data, bits, kurtosis_aware)
+                w2_bits = _select_bits(w2_param.data, bits, kurtosis_aware)
 
             # Compress both tensors in place via the shared helper.
             # _compress_3d_param stores Compressed3D as _tq_{param_name}
             # and resets param.data to an empty tensor.
-            w13_orig, w13_comp = _compress_3d_param(module, "w13_weight", tensor_bits, group_size)
-            w2_orig, w2_comp = _compress_3d_param(module, "w2_weight", tensor_bits, group_size)
+            w13_orig, w13_comp = _compress_3d_param(module, "w13_weight", w13_bits, group_size)
+            w2_orig, w2_comp = _compress_3d_param(module, "w2_weight", w2_bits, group_size)
             total_original += w13_orig + w2_orig
             total_compressed += w13_comp + w2_comp
             expert_layers += 2
