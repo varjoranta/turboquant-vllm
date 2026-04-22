@@ -34,9 +34,12 @@ __device__ __forceinline__ uint32_t decode_position(
 // In-place 128-lane butterfly Walsh-Hadamard on `w_smem`, using tid as lane.
 // Caller must hold 128 threads in the block; caller is responsible for the
 // __syncthreads() before entry so all writers have landed.
-__device__ __forceinline__ void fwht_128_inplace(float* __restrict__ w_smem, int tid)
+//
+// No __forceinline__ / #pragma unroll — earlier form with unroll + inline
+// produced wrong output on sm_120 (nvcc 13.0); suspected reordering across
+// the per-stage __syncthreads when the body is inlined at the call site.
+__device__ void fwht_128_inplace(float* w_smem, int tid)
 {
-    #pragma unroll
     for (int stage = 0; stage < WHT_STAGES; ++stage) {
         const int h = 1 << stage;
         __syncthreads();
