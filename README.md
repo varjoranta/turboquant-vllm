@@ -261,6 +261,28 @@ TQ_WEIGHT_BITS=3 vllm serve google/gemma-4-26B-A4B-it
 
 The weight path implements the scalar case of HIGGS (Malinovskii et al., NAACL 2025) — see "How it works" above for the full attribution. Weight compression was seeded by @coffeecup2020's TQ3_1S proof-of-concept for llama.cpp.
 
+### Two paths: this plugin vs upstream vLLM
+
+Two independent implementations of the same algorithm exist, with different trade-offs:
+
+- **This plugin (`pip install turboquant-plus-vllm`)** — monkey-patches vLLM at import time via the `vllm.general_plugins` entry point. Works with any stable vLLM release, includes the CUDA bs=1 fused-dequant kernel, and the MoE path via `FusedMoE._replace_quant_method`. Enabled through the `TQ_WEIGHT_BITS` env var; fully standalone.
+- **Upstream `--quantization turboquant`** ([vLLM PR #39970](https://github.com/vllm-project/vllm/pull/39970) + the MoE follow-up) — native vLLM scheme. Same algorithm, routed through `OnlineQuantizationConfig`. Not yet merged. When it lands you get `vllm serve <model> --quantization turboquant` without any plugin install, at the cost of tracking vLLM versions.
+
+The **upstream MoE path requires forcing the Triton MoE backend** (FlashInfer-CUTLASS and AITER permute expert weight storage during setup, which breaks the shared scratch-pool invariant both paths rely on):
+
+```python
+from vllm import LLM
+
+llm = LLM(
+    model="Qwen/Qwen3-30B-A3B-Instruct-2507",
+    quantization="turboquant",
+    kernel_config={"moe_backend": "triton"},
+)
+# or via CLI: vllm serve ... --quantization turboquant -cc.moe_backend=triton
+```
+
+**Known quirk (upstream path only):** set `VLLM_USE_DEEP_GEMM=0` if the `deep_gemm` package isn't installed on the serving box. vLLM's `kernel_warmup` probes every Linear for DeepGEMM compatibility and crashes on missing import even though TurboQuant doesn't use FP8 kernels. This is a vLLM infrastructure behavior unrelated to the algorithm.
+
 ### Results
 
 | Model | BF16 | TQ3 (3-bit) | Compression | Quality |
@@ -268,7 +290,7 @@ The weight path implements the scalar case of HIGGS (Malinovskii et al., NAACL 2
 | **Gemma 4 26B** | 52 GB | **12 GB** | 4.3x | 4.79/5 |
 | **GLM-4.7-Flash 355B** | 62.4 GB | **14.7 GB** | 4.2x | Tested ✓ |
 | **GLM-5.1 754B** | 1,508 GB | **309 GB** | 4.9x | Validated on GLM-4.7-Flash (same arch) |
-| **Qwen3-30B** | 61 GB | **13 GB** | 4.6x | -- |
+| **Qwen3-30B-A3B-Instruct-2507** | ~60 GB | **13.69 GB** | 4.4x | **GSM8K-200 91.5%** |
 
 Gemma 4 TQ3 quality: **4.79/5** on 20 multi-turn conversation scenarios (scored by Llama-3.3-70B judge). Matches Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost.
 
@@ -616,6 +638,7 @@ Code: [containers/deploy.py](https://github.com/varjoranta/verda-model-bench/blo
 - **[turbo-quant-lite](https://pypi.org/project/turbo-quant-lite/)** — Numpy-only TurboQuant for embedding compression in databases. Same math, different codebook and use case.
 - **[turboquant_plus](https://github.com/TheTom/turboquant_plus)** — Research implementation of the KV cache algorithm. This package builds production CUDA kernels on top of that work.
 - **TQ3_1S for llama.cpp** — @coffeecup2020's proof-of-concept applying TurboQuant to model weights (not just KV cache). Achieved near-Q4_0 quality at 3.5-bit. Inspired the weight quantization feature in this package.
+- **[ITQ3_S](https://arxiv.org/abs/2603.27914)** — Yoon, March 2026. Single-author preprint describing interleaved ternary (`{-1, 0, +1}`) quantization over FWHT-rotated weights, with the inverse FWHT fused into the CUDA SMEM-load stage (claimed ~2.1% compute overhead). Blackwell-tuned (256-point blocks); LLaMA-3 8B benchmarks on RTX 5090; code not released. Different quant-grid axis than our Lloyd-Max scalar — ternary vs 16-centroid — and a kernel idea worth mining (FWHT-in-SMEM fusion) for our own Blackwell path.
 - **[REAP](https://arxiv.org/abs/2510.13999)** — Cerebras, ICLR 2026. Router-weighted expert pruning for MoE compression.
 - **[SpinQuant](https://arxiv.org/abs/2405.16406)** — Facebook Research, ICLR 2025. Learned rotation optimization (up to 45% improvement over fixed Hadamard). Our `learned_rotation.py` implements a simplified version.
 - **[SqueezeLLM](https://arxiv.org/abs/2306.07629)** — ICML 2024. Sensitivity-weighted codebooks and sparse outlier extraction. Influenced our research direction.
