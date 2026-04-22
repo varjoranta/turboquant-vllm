@@ -105,24 +105,108 @@ def _get_cuda_module():
         return None
 
 
-def _get_quantizer(group_size: int, bits: int, device: str) -> PolarQuantTorch:
-    """Get or create a PolarQuant quantizer for a given group size and bit width."""
+def _get_quantizer(
+    group_size: int,
+    bits: int,
+    device: str,
+    rotary_dim: "int | None" = None,
+) -> PolarQuantTorch:
+    """Get or create a PolarQuant quantizer for a given (group_size, bits, device, rotary_dim).
+
+    ``rotary_dim`` selects between a full-width WHT (``None``) and a block-
+    diagonal WHT (independent ``rotary_dim``-wide blocks). Used by partial-
+    rotary models (MiniMax M2.5/M2.7, Qwen3.6-A3B) so the RoPE-rotated
+    prefix and content-only suffix don't mix inside a quantization group.
+    Values ``>= group_size`` fold to ``None`` so full-width quantizers are
+    shared via cache across partial- and non-partial callers.
+    """
     dev = torch.device(device)
     if dev.type == "cuda" and dev.index is None:
         dev = torch.device("cuda", torch.cuda.current_device())
     normalized_device = str(dev)
-    key = (group_size, bits, normalized_device)
+    effective_rotary_dim = (
+        rotary_dim
+        if (rotary_dim is not None and rotary_dim < group_size)
+        else None
+    )
+    key = (group_size, bits, normalized_device, effective_rotary_dim)
     quantizer = _quantizers.get(key)
     if quantizer is None:
-        quantizer = PolarQuantTorch(group_size, bits, seed=42, device=normalized_device)
+        quantizer = PolarQuantTorch(
+            group_size, bits, seed=42, device=normalized_device,
+            rotary_dim=effective_rotary_dim,
+        )
         _quantizers[key] = quantizer
 
     # Defensive fallback in case a stale/mutated cache entry has mismatched device.
     if str(quantizer.device) != normalized_device:
-        quantizer = PolarQuantTorch(group_size, bits, seed=42, device=normalized_device)
+        quantizer = PolarQuantTorch(
+            group_size, bits, seed=42, device=normalized_device,
+            rotary_dim=effective_rotary_dim,
+        )
         _quantizers[key] = quantizer
 
     return quantizer
+
+
+_PARTIAL_ROTARY_ALIASES = (
+    "partial_rotary_factor",
+    "rotary_pct",
+    "rotary_emb_fraction",
+)
+
+
+def _derive_rotary_dim(model_config) -> "int | None":
+    """Extract a block-diag rotary_dim from a vLLM ModelConfig, or None.
+
+    Returns the largest power of two ≤ ``head_dim * partial_rotary_factor``
+    that divides ``head_dim``. Returns ``None`` for non-partial-rotary
+    models. Examples: MiniMax M2.7 (128, 0.5) → 64; Qwen3.6-A3B (256, 0.25)
+    → 64; Qwen3-30B (128, 1.0) → None.
+    """
+    if model_config is None:
+        return None
+    head_dim = None
+    get_head_size = getattr(model_config, "get_head_size", None)
+    if callable(get_head_size):
+        try:
+            head_dim = int(get_head_size())
+        except (AttributeError, TypeError, ValueError):
+            head_dim = None
+    if head_dim is None:
+        hf = getattr(model_config, "hf_text_config", None) or getattr(
+            model_config, "hf_config", None
+        )
+        head_dim = getattr(hf, "head_dim", None) if hf else None
+    if not head_dim:
+        return None
+
+    cfg = (
+        getattr(model_config, "hf_text_config", None)
+        or getattr(model_config, "hf_config", None)
+        or model_config
+    )
+    factor = None
+    for name in _PARTIAL_ROTARY_ALIASES:
+        factor = getattr(cfg, name, None)
+        if factor is not None:
+            break
+    if factor is None:
+        rope_params = getattr(cfg, "rope_parameters", None)
+        if isinstance(rope_params, dict):
+            for name in _PARTIAL_ROTARY_ALIASES:
+                if name in rope_params:
+                    factor = rope_params[name]
+                    break
+    if factor is None or factor >= 1.0 or factor <= 0.0:
+        return None
+    rd_target = int(head_dim * factor)
+    if rd_target <= 0 or rd_target >= head_dim:
+        return None
+    rd_p2 = 1 << (rd_target.bit_length() - 1)
+    if rd_p2 <= 0 or head_dim % rd_p2 != 0:
+        return None
+    return rd_p2
 
 
 def pack_indices(indices: torch.Tensor, bits: int) -> torch.Tensor:
@@ -235,13 +319,26 @@ class TurboQuantWrapper(nn.Module):
     Lloyd-Max codebook. This matches how GPTQ/AWQ use per-group scales.
     """
 
-    def __init__(self, original: nn.Linear, bits: int = 3, group_size: int = 128, rotation: torch.Tensor | None = None):
+    # When set, forward uses PolarQuantTorch dequant-then-matmul — the
+    # Triton and CUDA kernels hardcode a full-width WHT and would mismatch
+    # against block-diag-compressed weights.
+    rotary_dim: "int | None" = None
+
+    def __init__(
+        self,
+        original: nn.Linear,
+        bits: int = 3,
+        group_size: int = 128,
+        rotation: torch.Tensor | None = None,
+        rotary_dim: "int | None" = None,
+    ):
         super().__init__()
         self.bits = bits
         self.group_size = group_size
         self.in_features = original.in_features
         self.out_features = original.out_features
         self._has_learned_rotation = rotation is not None
+        self.rotary_dim = rotary_dim
 
         # vLLM's Linear subclasses return either `output` or a
         # `(output, output_bias)` tuple depending on the `return_bias`
@@ -266,7 +363,10 @@ class TurboQuantWrapper(nn.Module):
         # tensor attributes rather than calling _get_quantizer() — that
         # helper does a dict lookup and Python object construction that
         # vLLM 0.19's fullgraph dynamo compile cannot trace.
-        _pq = _get_quantizer(group_size, bits, str(original.weight.device))
+        _pq = _get_quantizer(
+            group_size, bits, str(original.weight.device),
+            rotary_dim=rotary_dim,
+        )
         self.register_buffer("tq_signs1", _pq.signs1)
         self.register_buffer("tq_signs2", _pq.signs2)
         self.register_buffer("tq_centroids", _pq.centroids)
@@ -311,8 +411,12 @@ class TurboQuantWrapper(nn.Module):
             packed, norms, _ = quantize_with_learned_rotation(weight, rotation, bits=bits, group_size=group_size)
             self.register_buffer("rotation", rotation)
         else:
-            # Use fixed WHT rotation (default) with norm correction
-            quantizer = _get_quantizer(group_size, bits, str(weight.device))
+            # Use fixed WHT rotation (default) with norm correction. Must
+            # match the rotary_dim the forward path will dequant with —
+            # both paths share the cached quantizer via _get_quantizer.
+            quantizer = _get_quantizer(
+                group_size, bits, str(weight.device), rotary_dim=rotary_dim,
+            )
             indices, norms_raw = quantizer.quantize(grouped, norm_correction=True)
             packed = pack_indices(indices, bits)
             norms = norms_raw.reshape(out_dim, self.n_groups)
@@ -409,6 +513,11 @@ class TurboQuantWrapper(nn.Module):
             return output, None
         return output
 
+    def _can_use_full_wht_kernels(self) -> bool:
+        # Triton and CUDA kernels assume full-width WHT on input; block-diag
+        # compression would produce incorrect output through them.
+        return self.rotary_dim is None
+
     def _forward_gpu(self, x: torch.Tensor) -> torch.Tensor:
         """Fullgraph-dynamo-clean forward for GPU (Triton or CUDA backends).
 
@@ -416,7 +525,7 @@ class TurboQuantWrapper(nn.Module):
         helpers, or method calls on non-tensor Python objects that do dict
         lookups / string conversions. vLLM 0.19 AOT-compiles this path.
         """
-        if _triton_available and x.is_cuda:
+        if _triton_available and x.is_cuda and self._can_use_full_wht_kernels():
             # Pad input if in_features was not a multiple of group_size
             if x.shape[-1] != self.padded_in:
                 x = torch.nn.functional.pad(x, (0, self.padded_in - x.shape[-1]))
@@ -433,42 +542,45 @@ class TurboQuantWrapper(nn.Module):
             except (ValueError, RuntimeError):
                 return fallback(*args, **kwargs)
 
-        # CUDA C++ extension path — called via the compiled .so, which
-        # dynamo treats as opaque. Built once at plugin init by build.py.
-        output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
-        w_deq = torch.empty(self.out_features, self.in_features, dtype=output_dtype, device=x.device)
-        _cuda_mod.weight_dequant(
-            self.packed_weight,
-            self.norms,
-            self.tq_signs1,
-            self.tq_signs2,
-            self.tq_centroids,
-            w_deq,
-            self.group_size,
-            self.bits,
-            self.out_features,
-            self.in_features,
-        )
+        # CUDA C++ extension path — called via the compiled .so.
+        if _cuda_mod is not None and self._can_use_full_wht_kernels():
+            output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
+            w_deq = torch.empty(self.out_features, self.in_features, dtype=output_dtype, device=x.device)
+            _cuda_mod.weight_dequant(
+                self.packed_weight,
+                self.norms,
+                self.tq_signs1,
+                self.tq_signs2,
+                self.tq_centroids,
+                w_deq,
+                self.group_size,
+                self.bits,
+                self.out_features,
+                self.in_features,
+            )
 
-        if w_deq.dtype != x.dtype:
-            w_deq = w_deq.to(x.dtype)
-        output = torch.matmul(x, w_deq.t())
-        if self.bias is not None:
-            output = output + self.bias
-        return output
+            if w_deq.dtype != x.dtype:
+                w_deq = w_deq.to(x.dtype)
+            output = torch.matmul(x, w_deq.t())
+            if self.bias is not None:
+                output = output + self.bias
+            return output
+
+        # PolarQuantTorch fallback — honors self.rotary_dim via _apply_wht.
+        return self._forward_cpu(x)
 
     def _forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
-        """CPU fallback using the PolarQuant reference implementation.
+        """PolarQuant reference dequant + matmul. Device-agnostic.
 
-        Used on systems without Triton and without a built CUDA extension
-        (typically developer machines, tests, and CI). Not dynamo-friendly
-        because _fast_wht_batch has a data-dependent while loop and
-        PolarQuantTorch.dequantize is a method call — but that's fine
-        because this path only runs in eager mode.
+        Runs in eager mode only — the butterfly has a data-dependent while
+        loop that vLLM 0.19 fullgraph dynamo can't trace.
         """
         indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
         norms_flat = self.norms.reshape(-1)
-        quantizer = _get_quantizer(self.group_size, self.bits, str(x.device))
+        quantizer = _get_quantizer(
+            self.group_size, self.bits, str(x.device),
+            rotary_dim=self.rotary_dim,
+        )
         w_groups = quantizer.dequantize(indices, norms_flat)
         w_deq = w_groups.reshape(self.out_features, self.padded_in)[:, : self.in_features]
         w_deq = w_deq.to(x.dtype)
@@ -832,6 +944,7 @@ def _replace_linear_layers(
     routed_expert_bits: int | None = None,
     per_module_bits: dict[str, int] | None = None,
     learned_rotations: dict[str, torch.Tensor] | None = None,
+    rotary_dim: "int | None" = None,
 ):
     """Compress model weights: nn.Linear layers AND MoE expert weights.
 
@@ -933,7 +1046,10 @@ def _replace_linear_layers(
             tensor_bits = _select_bits(module.weight.data, bits, kurtosis_aware)
 
         rotation = learned_rotations.get(name) if learned_rotations else None
-        wrapper = TurboQuantWrapper(module, bits=tensor_bits, group_size=group_size, rotation=rotation)
+        wrapper = TurboQuantWrapper(
+            module, bits=tensor_bits, group_size=group_size,
+            rotation=rotation, rotary_dim=rotary_dim,
+        )
         setattr(parent, attr_name, wrapper)
 
         compressed_bytes = wrapper.packed_weight.numel() + wrapper.norms.numel() * wrapper.norms.element_size()
@@ -1167,8 +1283,14 @@ def patch_vllm_loader(**replace_kwargs) -> None:
 
     def patched_process_weights(model, model_config, target_device):
         _original(model, model_config, target_device)
+        rotary_dim = _derive_rotary_dim(model_config)
+        if rotary_dim is not None:
+            logger.info(
+                "TurboQuant: partial_rotary detected — using block-diag WHT "
+                "with block_size=%d", rotary_dim,
+            )
         logger.info("Applying TurboQuant weight compression...")
-        count = _replace_linear_layers(model, **replace_kwargs)
+        count = _replace_linear_layers(model, rotary_dim=rotary_dim, **replace_kwargs)
         if count > 0:
             mem_gb = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
             logger.info("TurboQuant: %d layers compressed, GPU memory: %.1f GB", count, mem_gb)
