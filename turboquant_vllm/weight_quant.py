@@ -596,8 +596,14 @@ class TurboQuantWrapper(nn.Module):
         )
 
 
-# Layers to never quantize
-_SKIP_PATTERNS = ("lm_head", "embed", "norm", "head")
+# Layers to never quantize.
+# - `lm_head`, `embed`, `norm`, `head`: precision-sensitive.
+# - `conv1d`: Qwen3-Next / Qwen3.5 Gated DeltaNet stores a Mamba-style causal
+#   conv projection as `ColumnParallelLinear`, then calls `causal_conv1d_*`
+#   kernels that read `self.conv1d.weight.view(...)` directly. `TurboQuantWrapper`
+#   has no `.weight`, so the direct-read path crashes. The layer is tiny
+#   (kernel_size × conv_dim), so skipping costs negligible memory.
+_SKIP_PATTERNS = ("lm_head", "embed", "norm", "head", "conv1d")
 
 # Layers that benefit from higher precision (attention output + MLP output)
 _SENSITIVE_PATTERNS = ("o_proj", "down_proj")

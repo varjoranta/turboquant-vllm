@@ -27,7 +27,11 @@ import unittest
 import torch
 import torch.nn as nn
 
-from turboquant_vllm.weight_quant import Compressed3D, _replace_linear_layers
+from turboquant_vllm.weight_quant import (
+    Compressed3D,
+    TurboQuantWrapper,
+    _replace_linear_layers,
+)
 
 
 class _FakeMoeConfig:
@@ -288,6 +292,37 @@ class TestFusedMoEWalkerInstallation(unittest.TestCase):
         self.assertIsNone(
             model.lm_head_experts.installed_method,
             "lm_head_experts should have been skipped by _SKIP_PATTERNS",
+        )
+
+    def test_walker_skips_conv1d_linears(self):
+        """Qwen3-Next / Qwen3.5 Gated DeltaNet stores the Mamba causal conv as
+        a ``ColumnParallelLinear`` named ``conv1d`` and then reads
+        ``self.conv1d.weight.view(...)`` directly in ``_forward_core``.
+        ``TurboQuantWrapper`` has no ``.weight``, so the walker must leave
+        the layer as a plain Linear.
+
+        Shapes mirror the real Qwen3.6-A3B GDN layout: conv1d is
+        (conv_kernel_size=4, conv_dim=2048), out_proj is (hidden, hidden)
+        with hidden > min_size so it actually gets wrapped.
+        """
+        model = nn.Module()
+        layer_0 = nn.Module()
+        layer_0.add_module("linear_attn", nn.Module())
+        layer_0.linear_attn.add_module("conv1d", nn.Linear(4, 2048, dtype=torch.bfloat16))
+        layer_0.linear_attn.add_module("out_proj", nn.Linear(2048, 2048, dtype=torch.bfloat16))
+        model.add_module("layer_0", layer_0)
+
+        _replace_linear_layers(model, bits=3, group_size=128)
+
+        self.assertNotIsInstance(
+            model.layer_0.linear_attn.conv1d,
+            TurboQuantWrapper,
+            "conv1d must be skipped — causal_conv1d kernels read .weight directly",
+        )
+        self.assertIsInstance(
+            model.layer_0.linear_attn.out_proj,
+            TurboQuantWrapper,
+            "out_proj is a regular Linear and should be wrapped as usual",
         )
 
     def test_walker_compression_ratio_is_real(self):
