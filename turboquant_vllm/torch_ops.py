@@ -95,6 +95,31 @@ def _fast_wht_batch(x: torch.Tensor) -> torch.Tensor:
     return x / math.sqrt(n)
 
 
+def _fast_wht_batch_blocked(x: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Batched fast WHT applied independently to each block of width ``block_size``.
+
+    Equivalent to ``block_diag(H, H, ..., H) @ x`` where each ``H`` is a
+    ``block_size × block_size`` Walsh-Hadamard matrix. Used for partial-rotary
+    models (MiniMax M2.5/M2.7, Qwen3.6-A3B, etc.) so the RoPE-rotated prefix
+    and the content-only suffix are kept under independent rotations and don't
+    mix inside a group.
+
+    ``x.shape[1]`` must be a multiple of ``block_size``; ``block_size`` must
+    be a power of two.
+    """
+    n = x.shape[1]
+    assert n % block_size == 0, (
+        f"dim {n} not divisible by block_size {block_size}"
+    )
+    assert block_size & (block_size - 1) == 0, (
+        f"block_size {block_size} must be a power of two"
+    )
+    num_blocks = n // block_size
+    x_blocks = x.reshape(x.shape[0] * num_blocks, block_size)
+    x_blocks = _fast_wht_batch(x_blocks)
+    return x_blocks.reshape(x.shape[0], n)
+
+
 def _next_power_of_2(n: int) -> int:
     p = 1
     while p < n:
@@ -158,7 +183,8 @@ class PolarQuantTorch:
       comparable or better PPL for KV cache.
     """
 
-    def __init__(self, dim: int, bit_width: int, seed: int = 42, device: str = "cuda", rotation: str = "wht"):
+    def __init__(self, dim: int, bit_width: int, seed: int = 42, device: str = "cuda",
+                 rotation: str = "wht", rotary_dim: "int | None" = None):
         self.dim = dim
         self.bit_width = bit_width
         dev = torch.device(device)
@@ -178,17 +204,34 @@ class PolarQuantTorch:
             self.signs1 = torch.ones(dim, device=self.device)
             self.signs2 = torch.ones(dim, device=self.device)
             self.padded_dim = dim
+            self.rotary_dim = None
         else:
             # WHT rotation: D2 @ H @ D1
             self.padded_dim = _next_power_of_2(dim)
             self.signs1 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(self.device)
             self.signs2 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(self.device)
             self.cos_sin = None
+            if rotary_dim is not None and 0 < rotary_dim < dim:
+                assert rotary_dim & (rotary_dim - 1) == 0, (
+                    f"rotary_dim {rotary_dim} must be a power of two"
+                )
+                assert self.padded_dim % rotary_dim == 0, (
+                    f"rotary_dim {rotary_dim} must divide padded_dim {self.padded_dim}"
+                )
+                self.rotary_dim = rotary_dim
+            else:
+                self.rotary_dim = None
 
         # Codebook: optimal centroids for N(0, 1/dim)
         centroids_list = optimal_centroids(bit_width, dim)
         self.centroids = torch.tensor(centroids_list, dtype=torch.float32, device=self.device)
         self.boundaries = (self.centroids[:-1] + self.centroids[1:]) / 2
+
+    def _apply_wht(self, padded: torch.Tensor) -> torch.Tensor:
+        """Full-width or block-diagonal WHT based on self.rotary_dim."""
+        if self.rotary_dim is None:
+            return _fast_wht_batch(padded)
+        return _fast_wht_batch_blocked(padded, block_size=self.rotary_dim)
 
     def _rotate(self, x: torch.Tensor) -> torch.Tensor:
         """Apply forward rotation. x shape: (batch, dim)."""
@@ -202,7 +245,7 @@ class PolarQuantTorch:
         else:
             padded = x.clone()
         padded *= self.signs1.unsqueeze(0)
-        padded = _fast_wht_batch(padded)
+        padded = self._apply_wht(padded)
         padded *= self.signs2.unsqueeze(0)
         return padded[:, : self.dim]
 
@@ -218,7 +261,7 @@ class PolarQuantTorch:
         else:
             padded = y.clone()
         padded *= self.signs2.unsqueeze(0)
-        padded = _fast_wht_batch(padded)
+        padded = self._apply_wht(padded)
         padded *= self.signs1.unsqueeze(0)
         return padded[:, : self.dim]
 

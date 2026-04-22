@@ -261,6 +261,8 @@ TQ_WEIGHT_BITS=3 vllm serve google/gemma-4-26B-A4B-it
 
 The weight path implements the scalar case of HIGGS (Malinovskii et al., NAACL 2025) — see "How it works" above for the full attribution. Weight compression was seeded by @coffeecup2020's TQ3_1S proof-of-concept for llama.cpp.
 
+**Partial-rotary models** (`partial_rotary_factor < 1.0` on the HF text config — MiniMax M2.5/M2.7, Qwen3.6-A3B family) use a **block-diagonal WHT** so the RoPE-rotated head prefix and the content-only suffix stay under separate rotations inside a quantization group. Auto-detected at load time from the `VllmConfig` — `_derive_rotary_dim` resolves `partial_rotary_factor` / `rotary_pct` / `rotary_emb_fraction` aliases, both directly and inside a `rope_parameters` dict, and picks the largest power-of-two block size that divides `head_dim`. Block-diag weights route through the PolarQuant PyTorch dequant path; the Triton and CUDA kernels assume full-width WHT and are bypassed for the block-diag case (correctness over speed — a block-diag kernel variant is a follow-up).
+
 ### Results
 
 | Model | BF16 | TQ3 (3-bit) | Compression | Quality |
