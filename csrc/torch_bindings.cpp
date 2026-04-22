@@ -14,6 +14,7 @@
 #include "turbo_quant.h"
 #include "tq_weight_dequant.h"
 #include "tq_weight_gemv_bs1.h"
+#include "tq3_gemv_bs1_fwht_smem.h"
 #include <torch/extension.h>
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -82,4 +83,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "bs=1 GEMV for 3-bit weights (warp-per-OC, sm_80+, bf16)",
           py::arg("x_rot"), py::arg("packed"),
           py::arg("norms"), py::arg("codebook"));
+
+    m.def("tq3_gemv_bs1_fwht_smem", &tq3_gemv_bs1_fwht_smem,
+          "Fused bs=1 GEMV with inverse randomized WHT in SMEM (sm_80+, bf16)",
+          py::arg("x"), py::arg("packed"),
+          py::arg("norms"), py::arg("codebook"),
+          py::arg("signs1"), py::arg("signs2"));
 }

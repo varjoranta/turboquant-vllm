@@ -46,6 +46,7 @@ def build():
         str(CSRC_DIR / "turbo_quant.cu"),
         str(CSRC_DIR / "tq_weight_dequant.cu"),
         str(CSRC_DIR / "tq_weight_gemv_bs1.cu"),
+        str(CSRC_DIR / "tq3_gemv_bs1_fwht_smem.cu"),
         str(CSRC_DIR / "torch_bindings.cpp"),
     ]
 
