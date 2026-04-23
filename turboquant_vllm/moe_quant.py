@@ -167,9 +167,28 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # re-pointed at ``pool.w13`` / ``pool.w2`` at install time, so
         # writing into the pool buffers here makes the freshly
         # dequantized values visible to the base unquantized kernel.
+        #
+        # SPARSE DEQUANT: only decompress the experts ``topk_ids`` actually
+        # routes to. At MoE decode (bs=1, top-8 of 128 experts), this is a
+        # ~16× reduction in weight-dequant GPU time — the single biggest
+        # decode-throughput lever on the MoE path (nsys profile 2026-04-23
+        # showed the original full-dequant path consumed 53.9% of GPU time
+        # writing weights that were immediately discarded). Stale contents
+        # in non-active expert slots are ignored by the downstream
+        # ``fused_moe`` kernel, which routes via ``topk_ids``.
+        #
+        # Note: we pass ``topk_ids.flatten()`` directly (no ``torch.unique``)
+        # — top-k routing guarantees unique indices per token row at bs=1,
+        # and cross-row duplicates at bs>1 just cause idempotent rewrites
+        # of the same scratch slot. Using ``torch.unique`` here would break
+        # CUDA graph capture (data-dependent output shape). The sparse-dequant
+        # path currently requires ``enforce_eager=True`` on vLLM; Phase 2
+        # replaces the Python loop with a GPU-resident kernel that takes
+        # ``topk_ids`` directly and is graph-compatible.
         pool = self._pool
-        self._w13.decompress_into(pool.w13, fp32_scratch=pool.w13_fp32)
-        self._w2.decompress_into(pool.w2, fp32_scratch=pool.w2_fp32)
+        active_experts = topk_ids.flatten()
+        self._w13.decompress_experts_into(pool.w13, active_experts, fp32_scratch=pool.w13_fp32)
+        self._w2.decompress_experts_into(pool.w2, active_experts, fp32_scratch=pool.w2_fp32)
 
         return layer.base_quant_method.apply(
             layer=layer,

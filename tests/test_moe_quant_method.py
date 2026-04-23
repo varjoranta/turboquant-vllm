@@ -194,6 +194,71 @@ class TestCompressed3DDecompressInto(unittest.TestCase):
         with self.assertRaises(AssertionError):
             compressed.decompress_into(wrong)
 
+    def test_decompress_experts_into_matches_full_on_active_slots(self):
+        """Sparse decompress must produce bit-identical output at the
+        listed expert indices vs the full decompress. Contents of other
+        slots are don't-care because the downstream ``fused_moe`` kernel
+        only reads ``topk_ids`` slots.
+        """
+        data = torch.randn(4, 128, 128, dtype=torch.float32)
+        compressed = Compressed3D(data, bits=3, group_size=128)
+
+        full = compressed.decompress()
+        out = torch.empty_like(full)
+        active = torch.tensor([1, 3], dtype=torch.int64)
+        compressed.decompress_experts_into(out, active)
+
+        # Assert the active slots match the full decompress exactly.
+        self.assertTrue(
+            torch.equal(out[1], full[1]),
+            "expert 1: sparse output must match full decompress",
+        )
+        self.assertTrue(
+            torch.equal(out[3], full[3]),
+            "expert 3: sparse output must match full decompress",
+        )
+
+    def test_decompress_experts_into_deduplicates(self):
+        """Duplicate expert indices in ``active_experts`` must not cause
+        double-writes or errors. torch.unique handles this internally."""
+        data = torch.randn(4, 128, 128, dtype=torch.float32)
+        compressed = Compressed3D(data, bits=3, group_size=128)
+        full = compressed.decompress()
+        out = torch.empty_like(full)
+        active = torch.tensor([2, 2, 0, 2], dtype=torch.int64)
+        compressed.decompress_experts_into(out, active)
+        self.assertTrue(torch.equal(out[0], full[0]))
+        self.assertTrue(torch.equal(out[2], full[2]))
+
+    def test_decompress_experts_into_empty(self):
+        """Empty active list is a valid no-op (no write, no error).
+        Can happen in edge cases where a batch has zero tokens — the
+        forward should still complete."""
+        data = torch.randn(4, 128, 128, dtype=torch.float32)
+        compressed = Compressed3D(data, bits=3, group_size=128)
+        out = torch.zeros(4, 128, 128, dtype=torch.float32)
+        active = torch.empty(0, dtype=torch.int64)
+        compressed.decompress_experts_into(out, active)
+        # On GPU this leaves out untouched; on the CPU fallback path this
+        # still writes (full decompress). Either way, no error.
+        # (We don't assert on out's contents; the contract is just "no
+        # crash, slots for absent experts are not guaranteed".)
+
+    def test_decompress_experts_into_skips_out_of_range(self):
+        """Out-of-range indices must be silently skipped, not crash."""
+        data = torch.randn(4, 128, 128, dtype=torch.float32)
+        compressed = Compressed3D(data, bits=3, group_size=128)
+        out = torch.zeros(4, 128, 128, dtype=torch.float32)
+        # Mix of valid + invalid; valid ones must still be written.
+        active = torch.tensor([-1, 0, 999, 2], dtype=torch.int64)
+        compressed.decompress_experts_into(out, active)
+        full = compressed.decompress()
+        # On CPU fallback the full path writes all 4 experts; on GPU
+        # the sparse path writes only the valid ones. Verify at least
+        # the valid slots match.
+        self.assertTrue(torch.equal(out[0], full[0]))
+        self.assertTrue(torch.equal(out[2], full[2]))
+
 
 # ---------------------------------------------------------------------------
 # enable_weight_quantization → FusedMoE walker

@@ -742,6 +742,92 @@ class Compressed3D:
         if target is not out:
             out.copy_(target)
 
+    def decompress_experts_into(
+        self,
+        out: torch.Tensor,
+        active_experts: torch.Tensor,
+        fp32_scratch: torch.Tensor | None = None,
+    ) -> None:
+        """Sparse variant of ``decompress_into``: decompress ONLY the expert
+        indices listed in ``active_experts``. At MoE decode (bs=1, top-8 of
+        128 experts), this writes ~6% of the data the full variant would —
+        a 16× reduction in weight-dequant work.
+
+        The caller is responsible for the semantic contract that slots not
+        in ``active_experts`` must not be read downstream. vLLM's
+        ``fused_moe`` kernel routes through ``topk_ids`` and only touches
+        active slots, so stale contents in the other slots don't affect
+        correctness. Sparse + full dequant produce bit-identical outputs
+        for listed indices.
+
+        ``active_experts`` is a 1-D tensor of int indices; duplicates are
+        deduplicated, out-of-range values are skipped. Can be on any device
+        — we cross the CPU boundary once via ``.tolist()``, which is fine
+        at MoE-decode scale (≤32 unique experts typical).
+        """
+        assert out.shape == self.shape, (
+            f"decompress_experts_into expected shape {self.shape}, got {tuple(out.shape)}"
+        )
+        assert out.dtype == self.dtype, (
+            f"decompress_experts_into expected dtype {self.dtype}, got {out.dtype}"
+        )
+        assert out.device == self.packed.device, (
+            f"decompress_experts_into expected device {self.packed.device}, got {out.device}"
+        )
+
+        cuda_mod = _get_cuda_module()
+        if cuda_mod is None or not self.packed.is_cuda:
+            # CPU fallback: no sparse path on CPU; full decompress is fine
+            # since MoE-on-CPU isn't a production workload.
+            out.copy_(self.decompress())
+            return
+
+        if active_experts.numel() == 0:
+            return
+
+        # Deduplicate and move the (tiny) list to host. torch.unique is sorted.
+        unique_experts = torch.unique(active_experts).tolist()
+
+        n_experts, out_dim, in_dim = self.shape
+        groups_per_expert = out_dim * self.n_groups
+        kernel_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
+
+        quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
+
+        for e in unique_experts:
+            if e < 0 or e >= n_experts:
+                continue
+            expert_packed = self.packed[e * groups_per_expert : (e + 1) * groups_per_expert]
+            expert_norms = self.norms[e * out_dim : (e + 1) * out_dim]
+
+            if kernel_dtype == self.dtype:
+                target = out[e : e + 1]
+            elif fp32_scratch is not None:
+                assert fp32_scratch.shape == self.shape
+                assert fp32_scratch.dtype == kernel_dtype
+                assert fp32_scratch.device == self.packed.device
+                target = fp32_scratch[e : e + 1]
+            else:
+                target = torch.empty(
+                    1, out_dim, in_dim, dtype=kernel_dtype, device=self.packed.device
+                )
+
+            cuda_mod.weight_dequant_3d(
+                expert_packed,
+                expert_norms,
+                quantizer.signs1,
+                quantizer.signs2,
+                quantizer.centroids,
+                target,
+                self.group_size,
+                self.bits,
+                1,
+                out_dim,
+                in_dim,
+            )
+            if kernel_dtype != self.dtype:
+                out[e : e + 1].copy_(target)
+
     def decompress(self, buf: torch.Tensor | None = None) -> torch.Tensor:
         """Decompress back to (num_experts, out_dim, in_dim) at original dtype.
 
