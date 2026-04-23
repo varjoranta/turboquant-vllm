@@ -8,6 +8,7 @@ Model compression for vLLM. What this package ships today:
 - **MLX port for Apple Silicon** — loads TQ3 checkpoints through `mlx-lm` on Mac (dense + MoE). Qwen2.5-0.5B at 26 tok/s, Granite-1B MoE at 84 tok/s, Qwen3.5-35B (256 experts) fits in 19 GB on a 48 GB MacBook. [Write-up](https://varjosoft.com/70gb-on-48gb-mac.html).
 - **bs=1 Metal GEMV kernel** (v0.10.0) for TQ3 Linear + MoE SwitchLinear on Apple Silicon: SIMD-group-per-output-channel kernel via `mx.fast.metal_kernel`, fuses 3-bit unpack + codebook lookup + norm scaling + matmul into one pass. Three variants — single (dense), batched-shared-x (MoE gate/up_proj), batched-per-x (MoE down_proj).
 - **Kurtosis-aware mixed-precision** (v0.11.0): per-tensor κ profile drives TQ3 / TQ4 / FP16 assignment per tensor family. On Qwen3.6-35B-A3B, the `varjosoft/Qwen3.6-35B-A3B-TQ-apex3` checkpoint (18 GB) hits **96.5 % gsm8k-200 — +2.0 ppt over `mlx-community/Qwen3.6-35B-A3B-4bit`** at 1 GB smaller on disk. Full mixed-bits loader + TQ4 Metal kernels ship in this release.
+- **Sparse MoE dequant** (v0.12.0): the MoE apply path previously decompressed all N experts per forward even though the downstream `fused_moe` kernel only reads the active top-k. On Qwen3-30B-A3B (128 experts, top-8), 93.75% of weight-dequant GPU time was wasted work. Fixed by threading `topk_ids` through `TurboQuantFusedMoEMethod.apply()` and dequanting only the active experts. Measured A/B on H100, same enforce_eager=True both runs: **1.22 → 10.23 tok/s at bs=1 decode on Qwen3-30B-A3B-Instruct-2507 (8.4× speedup)**. Phase 1 uses a Python loop over active experts and requires `enforce_eager=True`; Phase 2 (follow-up) will add a GPU-resident kernel that preserves CUDA graph capture.
 - **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models.
 - **AWQ export** from TQ-compressed weights — ~2 min instead of hours of AWQ calibration.
 - **Legacy KV cache compression** (monkey-patch, MLA-only) for GLM-4.7/DeepSeek-V3 users on stock vLLM until upstream KV compression supports MLA.
@@ -37,6 +38,7 @@ Headline numbers:
 - **Gemma 4 26B**: ~52 GB BF16 → **~12 GB runtime VRAM** with TQ3. Scores **4.79/5** on our 20-scenario benchmark, comparable to Qwen3-235B AWQ (4.75/5) at 2.6x lower GPU cost.
 - **GLM-4.7-Flash 355B MoE**: 62.4 GB → **14.7 GB** (4.2x). Native TQ3 checkpoint with MoE expert regrouping, 13.3 GB GPU memory.
 - **Qwen3-30B**: 61 GB → **13 GB** (4.6x).
+- **Qwen3-30B-A3B-Instruct-2507 MoE decode** on H100 (v0.12.0): 1.22 → **10.23 tok/s at bs=1, 1k ctx** with sparse dequant (8.4× over v0.11.0). Requires `LLM(..., enforce_eager=True, kernel_config={"moe_backend": "triton"})`.
 
 ## Why this exists
 
