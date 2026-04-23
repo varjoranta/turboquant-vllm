@@ -9,6 +9,7 @@ Model compression for vLLM. What this package ships today:
 - **bs=1 Metal GEMV kernel** (v0.10.0) for TQ3 Linear + MoE SwitchLinear on Apple Silicon: SIMD-group-per-output-channel kernel via `mx.fast.metal_kernel`, fuses 3-bit unpack + codebook lookup + norm scaling + matmul into one pass. Three variants — single (dense), batched-shared-x (MoE gate/up_proj), batched-per-x (MoE down_proj).
 - **Kurtosis-aware mixed-precision** (v0.11.0): per-tensor κ profile drives TQ3 / TQ4 / FP16 assignment per tensor family. On Qwen3.6-35B-A3B, the `varjosoft/Qwen3.6-35B-A3B-TQ-apex3` checkpoint (18 GB) hits **96.5 % gsm8k-200 — +2.0 ppt over `mlx-community/Qwen3.6-35B-A3B-4bit`** at 1 GB smaller on disk. Full mixed-bits loader + TQ4 Metal kernels ship in this release.
 - **Sparse MoE dequant** (v0.12.0): the MoE apply path previously decompressed all N experts per forward even though the downstream `fused_moe` kernel only reads the active top-k. On Qwen3-30B-A3B (128 experts, top-8), 93.75% of weight-dequant GPU time was wasted work. Fixed by threading `topk_ids` through `TurboQuantFusedMoEMethod.apply()` and dequanting only the active experts. Measured A/B on H100, same enforce_eager=True both runs: **1.22 → 10.23 tok/s at bs=1 decode on Qwen3-30B-A3B-Instruct-2507 (8.4× speedup)**. Phase 1 uses a Python loop over active experts and requires `enforce_eager=True`; Phase 2 (follow-up) will add a GPU-resident kernel that preserves CUDA graph capture.
+- **Block-diagonal WHT CUDA path** (v0.13.0): partial-rotary models (Qwen3.6-35B-A3B, MiniMax M2.5/M2.7) have `rotary_dim < head_dim`, so their WHT is block-diagonal rather than full-width. Before v0.13 those projections fell through to a Python-side decompress loop. The CUDA `tq_weight_dequant` kernel now takes a `block_size` parameter and templates the butterfly on `BLOCK_SIZE < GROUP_SIZE` — same warp-shuffle path, restricted to each sub-block. Measured A/B on Qwen3.6-35B-A3B-TQ3 (256 experts, `partial_rotary_factor=0.25`), single RTX PRO 6000 Blackwell (sm_120): **1.84 → 18.2 tok/s at 1k ctx (10.1× speedup)**, 1.82 → 17.5 at 4k, 1.83 → 16.4 at 8k.
 - **Expert pruning** via [REAP](https://arxiv.org/abs/2510.13999) saliency scoring for MoE models.
 - **AWQ export** from TQ-compressed weights — ~2 min instead of hours of AWQ calibration.
 - **Legacy KV cache compression** (monkey-patch, MLA-only) for GLM-4.7/DeepSeek-V3 users on stock vLLM until upstream KV compression supports MLA.
@@ -39,6 +40,7 @@ Headline numbers:
 - **GLM-4.7-Flash 355B MoE**: 62.4 GB → **14.7 GB** (4.2x). Native TQ3 checkpoint with MoE expert regrouping, 13.3 GB GPU memory.
 - **Qwen3-30B**: 61 GB → **13 GB** (4.6x).
 - **Qwen3-30B-A3B-Instruct-2507 MoE decode** on H100 (v0.12.0): 1.22 → **10.23 tok/s at bs=1, 1k ctx** with sparse dequant (8.4× over v0.11.0). Requires `LLM(..., enforce_eager=True, kernel_config={"moe_backend": "triton"})`.
+- **Qwen3.6-35B-A3B MoE decode** on RTX PRO 6000 Blackwell (v0.13.0): 1.84 → **18.2 tok/s at bs=1, 1k ctx** with block-diag CUDA dequant (10.1× over v0.12.0). Partial-rotary model; same compression, same harness.
 
 ## Why this exists
 
@@ -91,6 +93,7 @@ GLM-4.7 355B: native TQ3 checkpoint verified (14.7 GB, 4.2x compression). Full q
 | GLM-4.7-Flash 355B | **MLA** | Works (native TQ3 ckpt) | **Works** | **Only place TurboQuant KV works on MLA today** — #38479 does not cover MLA |
 | DeepSeek-V3 | **MLA** | Pending (larger disk) | Works | Same: MLA requires the legacy monkey-patch path |
 | Qwen3.5-35B-A3B | MoE + GatedDeltaNet + GQA | Works (as of varjoranta/turboquant-vllm#15) | Untested | Hybrid architecture; weight quant validated via @gaby's fixes |
+| Qwen3.6-35B-A3B | MoE + GatedDeltaNet + partial-rotary GQA | Works (v0.13.0) | Untested | Block-diag CUDA path; 18.2 tok/s at bs=1 on RTX PRO 6000 Blackwell |
 | Qwen3-30B-A3B | MoE + GQA | Works | Works | Full CUDA graph capture, 123 tok/s at c=1 on A100 (matching BF16 baseline) |
 | gpt-oss-20b | Alternating full/sliding window + sinks | Works | Not yet | Sliding window + attention sinks need pass-through support in the KV path |
 
@@ -263,7 +266,7 @@ TQ_WEIGHT_BITS=3 vllm serve google/gemma-4-26B-A4B-it
 
 The weight path implements the scalar case of HIGGS (Malinovskii et al., NAACL 2025) — see "How it works" above for the full attribution. Weight compression was seeded by @coffeecup2020's TQ3_1S proof-of-concept for llama.cpp.
 
-**Partial-rotary models** (`partial_rotary_factor < 1.0` on the HF text config — MiniMax M2.5/M2.7, Qwen3.6-A3B family) use a **block-diagonal WHT** so the RoPE-rotated head prefix and the content-only suffix stay under separate rotations inside a quantization group. Auto-detected at load time from the `VllmConfig` — `_derive_rotary_dim` resolves `partial_rotary_factor` / `rotary_pct` / `rotary_emb_fraction` aliases, both directly and inside a `rope_parameters` dict, and picks the largest power-of-two block size that divides `head_dim`. Block-diag weights route through the PolarQuant PyTorch dequant path; the Triton and CUDA kernels assume full-width WHT and are bypassed for the block-diag case (correctness over speed — a block-diag kernel variant is a follow-up).
+**Partial-rotary models** (`partial_rotary_factor < 1.0` on the HF text config — MiniMax M2.5/M2.7, Qwen3.6-A3B family) use a **block-diagonal WHT** so the RoPE-rotated head prefix and the content-only suffix stay under separate rotations inside a quantization group. Auto-detected at load time from the `VllmConfig` — `_derive_rotary_dim` resolves `partial_rotary_factor` / `rotary_pct` / `rotary_emb_fraction` aliases, both directly and inside a `rope_parameters` dict, and picks the largest power-of-two block size that divides `head_dim`. The CUDA `tq_weight_dequant` kernel (v0.13.0+) dispatches on `(group_size, bits, block_size)` for the curated set `{(128, 2/3/4, 64), (128, 3, 32), (256, 3, 128/64)}` that covers the shipped partial-rotary models; combos outside the set fall through to the PolarQuant PyTorch dequant path. The Triton FWHT-on-input and rotate-input fast paths still assume full-width WHT.
 
 ### Two paths: this plugin vs upstream vLLM
 
