@@ -21,6 +21,12 @@
 // norms: (out_dim, n_groups) float32
 // signs1, signs2: (group_size,) float32 -- random sign vectors for WHT
 // centroids: (n_centroids,) float32
+// `block_size` selects the WHT width the butterfly unrolls within each group.
+// Defaults to group_size (full-width WHT). A smaller block_size < group_size
+// runs an independent WHT per sub-block of block_size elements (block-
+// diagonal WHT), needed by partial-rotary models (Qwen3.6-35B-A3B,
+// MiniMax M2.5/M2.7). block_size must be a power of two that divides
+// group_size.
 void tq_weight_dequant(
     torch::Tensor packed_weight,
     torch::Tensor norms,
@@ -31,7 +37,8 @@ void tq_weight_dequant(
     int64_t group_size,
     int64_t bits,
     int64_t out_dim,
-    int64_t in_dim);
+    int64_t in_dim,
+    int64_t block_size);
 
 // Batch dequant for MoE expert weights.
 // Same as above but operates on 3D tensors:
@@ -49,7 +56,8 @@ void tq_weight_dequant_3d(
     int64_t bits,
     int64_t n_experts,
     int64_t out_dim,
-    int64_t in_dim);
+    int64_t in_dim,
+    int64_t block_size);
 
 // Sparse batch dequant for MoE expert weights — decompresses only the
 // experts listed in `active_expert_ids`. Single kernel launch; safe for
@@ -75,4 +83,5 @@ void tq_weight_dequant_sparse_3d(
     int64_t bits,
     int64_t n_experts,
     int64_t out_dim,
-    int64_t in_dim);
+    int64_t in_dim,
+    int64_t block_size);

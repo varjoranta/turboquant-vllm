@@ -513,10 +513,30 @@ class TurboQuantWrapper(nn.Module):
             return output, None
         return output
 
+    # Supported block-diag (group_size, bits, block_size) combos in the
+    # CUDA kernel's dispatch table. Kept in sync with csrc/tq_weight_dequant.cu.
+    _SUPPORTED_BLOCK_DIAG_COMBOS = frozenset({
+        (128, 2, 64), (128, 3, 64), (128, 4, 64),
+        (128, 3, 32),
+        (256, 3, 128), (256, 3, 64),
+    })
+
+    @property
+    def _block_size(self) -> int:
+        return self.rotary_dim if self.rotary_dim is not None else self.group_size
+
     def _can_use_full_wht_kernels(self) -> bool:
-        # Triton and CUDA kernels assume full-width WHT on input; block-diag
-        # compression would produce incorrect output through them.
+        # The FWHT-on-input Triton kernel + the separate rotate_input path
+        # assume a full-width WHT and don't have a block-diag variant yet.
         return self.rotary_dim is None
+
+    def _can_use_cuda_dequant_kernel(self) -> bool:
+        # The C++ dequant kernel supports full-width WHT OR a curated set of
+        # block-diag combos. Block-diag input via the gemv-bs1 fast path is
+        # separate and still requires full-width (see _can_use_full_wht_kernels).
+        if self.rotary_dim is None:
+            return True
+        return (self.group_size, self.bits, self._block_size) in self._SUPPORTED_BLOCK_DIAG_COMBOS
 
     def _forward_gpu(self, x: torch.Tensor) -> torch.Tensor:
         """Fullgraph-dynamo-clean forward for GPU (Triton or CUDA backends).
@@ -542,8 +562,10 @@ class TurboQuantWrapper(nn.Module):
             except (ValueError, RuntimeError):
                 return fallback(*args, **kwargs)
 
-        # CUDA C++ extension path — called via the compiled .so.
-        if _cuda_mod is not None and self._can_use_full_wht_kernels():
+        # CUDA C++ extension path — handles full-width WHT and the curated
+        # set of block-diag (partial-rotary) combos listed in
+        # _SUPPORTED_BLOCK_DIAG_COMBOS.
+        if _cuda_mod is not None and self._can_use_cuda_dequant_kernel():
             output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
             w_deq = torch.empty(self.out_features, self.in_features, dtype=output_dtype, device=x.device)
             _cuda_mod.weight_dequant(
@@ -557,6 +579,7 @@ class TurboQuantWrapper(nn.Module):
                 self.bits,
                 self.out_features,
                 self.in_features,
+                self._block_size,
             )
 
             if w_deq.dtype != x.dtype:
@@ -738,6 +761,7 @@ class Compressed3D:
             n_experts,
             out_dim,
             in_dim,
+            self.group_size,  # block_size = group_size (MoE MLPs don't use rotary)
         )
         if target is not out:
             out.copy_(target)
@@ -796,6 +820,7 @@ class Compressed3D:
                 quantizer.signs1, quantizer.signs2, quantizer.centroids,
                 active_experts, out,
                 self.group_size, self.bits, n_experts, out_dim, in_dim,
+                self.group_size,  # block_size = group_size (MoE MLPs, no rotary)
             )
             return
 
@@ -821,6 +846,7 @@ class Compressed3D:
                 expert_packed, expert_norms,
                 quantizer.signs1, quantizer.signs2, quantizer.centroids,
                 target, self.group_size, self.bits, 1, out_dim, in_dim,
+                self.group_size,
             )
             if kernel_dtype != self.dtype:
                 out[e : e + 1].copy_(target)
@@ -853,6 +879,7 @@ class Compressed3D:
                 n_experts,
                 out_dim,
                 in_dim,
+                self.group_size,
             )
             return output.to(self.dtype)
 
