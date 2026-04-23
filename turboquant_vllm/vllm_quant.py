@@ -215,18 +215,17 @@ def register():
             # Gate registration on the arch requirement so apply()'s fast-path
             # check collapses to a single hasattr() rather than a per-call
             # cudaGetDeviceProperties query.
-            arch_ok = (
-                torch.cuda.is_available()
-                and torch.cuda.get_device_capability(weight.device)[0] >= 8
-            )
+            arch_ok = torch.cuda.is_available() and torch.cuda.get_device_capability(weight.device)[0] >= 8
             if bits == 3 and group_size == 128 and arch_ok:
                 bytes_per_group = group_size * bits // 8
                 layer.register_buffer(
-                    "tq_packed_bs1", packed.view(out_dim * n_groups, bytes_per_group),
+                    "tq_packed_bs1",
+                    packed.view(out_dim * n_groups, bytes_per_group),
                 )
                 layer.register_buffer("tq_norms_bf16", norms.to(torch.bfloat16))
                 layer.register_buffer(
-                    "tq_centroids_bf16", quantizer.centroids.to(torch.bfloat16),
+                    "tq_centroids_bf16",
+                    quantizer.centroids.to(torch.bfloat16),
                 )
             layer.tq_in_features = in_dim
             layer.tq_out_features = out_dim
@@ -259,19 +258,19 @@ def register():
             # graph. Dynamo traces the model once (batch >> 1 on
             # profile_run) and would specialize a Python-level M==1 branch
             # against that shape, so the branch must live inside the op.
-            if (
-                bias is None
-                and self.bits == 3
-                and x.dtype == torch.bfloat16
-                and hasattr(layer, "tq_packed_bs1")
-            ):
+            if bias is None and self.bits == 3 and x.dtype == torch.bfloat16 and hasattr(layer, "tq_packed_bs1"):
                 return torch.ops.turboquant.tq3_apply(
                     x,
-                    layer.tq_packed_weight, layer.tq_norms,
-                    layer.tq_signs1, layer.tq_signs2, layer.tq_centroids,
-                    layer.tq_packed_bs1, layer.tq_norms_bf16,
+                    layer.tq_packed_weight,
+                    layer.tq_norms,
+                    layer.tq_signs1,
+                    layer.tq_signs2,
+                    layer.tq_centroids,
+                    layer.tq_packed_bs1,
+                    layer.tq_norms_bf16,
                     layer.tq_centroids_bf16,
-                    self.group_size, self.bits,
+                    self.group_size,
+                    self.bits,
                 )
 
             if layer._tq_primary_fn is not None:

@@ -11,6 +11,7 @@ Covers:
   wrappers go through PolarQuantTorch dequant (skipping Triton / CUDA kernels
   that hardcode a full-width WHT)
 """
+
 from __future__ import annotations
 
 import math
@@ -77,10 +78,10 @@ class TestPolarQuantTorchBlockDiagonal:
     @pytest.mark.parametrize(
         "dim,rotary_dim",
         [
-            (128, 64),    # MiniMax M2.7 head_dim=128, factor=0.5
-            (128, 32),    # hypothetical factor=0.25 on head_dim=128
-            (256, 64),    # Qwen3.6-A3B head_dim=256, factor=0.25
-            (256, 128),   # factor=0.5 on head_dim=256
+            (128, 64),  # MiniMax M2.7 head_dim=128, factor=0.5
+            (128, 32),  # hypothetical factor=0.25 on head_dim=128
+            (256, 64),  # Qwen3.6-A3B head_dim=256, factor=0.25
+            (256, 128),  # factor=0.5 on head_dim=256
         ],
     )
     def test_rotate_inverse_round_trip(self, dim, rotary_dim):
@@ -98,16 +99,20 @@ class TestPolarQuantTorchBlockDiagonal:
         x[:, :rotary_dim] = torch.randn(4, rotary_dim)
         y = pq._rotate(x.clone())
         torch.testing.assert_close(
-            y[:, rotary_dim:], torch.zeros(4, dim - rotary_dim),
-            rtol=0.0, atol=1e-6,
+            y[:, rotary_dim:],
+            torch.zeros(4, dim - rotary_dim),
+            rtol=0.0,
+            atol=1e-6,
         )
 
         x2 = torch.zeros(4, dim)
         x2[:, rotary_dim:] = torch.randn(4, dim - rotary_dim)
         y2 = pq._rotate(x2.clone())
         torch.testing.assert_close(
-            y2[:, :rotary_dim], torch.zeros(4, rotary_dim),
-            rtol=0.0, atol=1e-6,
+            y2[:, :rotary_dim],
+            torch.zeros(4, rotary_dim),
+            rtol=0.0,
+            atol=1e-6,
         )
 
     def test_rotary_dim_gte_dim_folds_to_none(self):
@@ -154,7 +159,9 @@ class TestDeriveRotaryDim:
 
     def test_factor_in_rope_parameters_dict(self):
         mc = self._make_config(
-            head_dim=128, factor_name="partial_rotary_factor", factor=0.5,
+            head_dim=128,
+            factor_name="partial_rotary_factor",
+            factor=0.5,
             in_rope_params=True,
         )
         assert _derive_rotary_dim(mc) == 64
@@ -195,19 +202,18 @@ class TestTurboQuantWrapperBlockDiagonal:
         w_orig = original.weight.data.clone()
 
         wrapper = TurboQuantWrapper(
-            original, bits=3, group_size=128, rotary_dim=64,
+            original,
+            bits=3,
+            group_size=128,
+            rotary_dim=64,
         )
         assert wrapper.rotary_dim == 64
 
         x = torch.randn(4, in_features) * 0.05
         out = wrapper(x)
         ref = x @ w_orig.T
-        rel_err = (
-            torch.linalg.norm(out - ref) / torch.linalg.norm(ref)
-        ).item()
-        assert rel_err < 0.25, (
-            f"TQ3 block-diag forward rel_err {rel_err:.3f} — should be ≤ 0.25"
-        )
+        rel_err = (torch.linalg.norm(out - ref) / torch.linalg.norm(ref)).item()
+        assert rel_err < 0.25, f"TQ3 block-diag forward rel_err {rel_err:.3f} — should be ≤ 0.25"
 
     def test_rotary_dim_routes_through_polarquant(self, monkeypatch):
         """``self._can_use_full_wht_kernels()`` must return False when
@@ -216,7 +222,10 @@ class TestTurboQuantWrapperBlockDiagonal:
         torch.manual_seed(0)
         original = nn.Linear(128, 256, bias=False)
         wrapper = TurboQuantWrapper(
-            original, bits=3, group_size=128, rotary_dim=64,
+            original,
+            bits=3,
+            group_size=128,
+            rotary_dim=64,
         )
         assert not wrapper._can_use_full_wht_kernels()
 

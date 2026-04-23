@@ -61,14 +61,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("cache"), py::arg("norms"), py::arg("output"),
           py::arg("block_table"), py::arg("seq_len"));
 
-    // Weight dequantization kernels
+    // Weight dequantization kernels. block_size=group_size runs full-width
+    // WHT (back-compat). block_size < group_size runs block-diagonal WHT
+    // per sub-block — needed for partial-rotary models (Qwen3.6, MiniMax).
     m.def("weight_dequant", &tq_weight_dequant,
           "Fused weight dequant: packed indices + norms + codebook → full matrix",
           py::arg("packed_weight"), py::arg("norms"),
           py::arg("signs1"), py::arg("signs2"),
           py::arg("centroids"), py::arg("output"),
           py::arg("group_size"), py::arg("bits"),
-          py::arg("out_dim"), py::arg("in_dim"));
+          py::arg("out_dim"), py::arg("in_dim"),
+          py::arg("block_size"));
 
     m.def("weight_dequant_3d", &tq_weight_dequant_3d,
           "Fused weight dequant for MoE expert tensors (3D)",
@@ -76,7 +79,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("signs1"), py::arg("signs2"),
           py::arg("centroids"), py::arg("output"),
           py::arg("group_size"), py::arg("bits"),
-          py::arg("n_experts"), py::arg("out_dim"), py::arg("in_dim"));
+          py::arg("n_experts"), py::arg("out_dim"), py::arg("in_dim"),
+          py::arg("block_size"));
+
+    m.def("weight_dequant_sparse_3d", &tq_weight_dequant_sparse_3d,
+          "Sparse MoE dequant: decompress only listed active_expert_ids",
+          py::arg("packed_weight"), py::arg("norms"),
+          py::arg("signs1"), py::arg("signs2"),
+          py::arg("centroids"), py::arg("active_expert_ids"),
+          py::arg("output"),
+          py::arg("group_size"), py::arg("bits"),
+          py::arg("n_experts"), py::arg("out_dim"), py::arg("in_dim"),
+          py::arg("block_size"));
 
     m.def("weight_dequant_sparse_3d", &tq_weight_dequant_sparse_3d,
           "Sparse MoE dequant: decompress only listed active_expert_ids",

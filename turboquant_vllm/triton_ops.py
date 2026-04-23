@@ -716,7 +716,9 @@ try:
     # custom op keeps Dynamo opaque: each size-specific capture re-runs the
     # internal branch with the actual shape.
     @torch.library.custom_op(
-        "turboquant::tq3_apply", mutates_args=(), device_types=("cuda",),
+        "turboquant::tq3_apply",
+        mutates_args=(),
+        device_types=("cuda",),
     )
     def _tq3_apply_op(
         x: torch.Tensor,
@@ -733,33 +735,60 @@ try:
     ) -> torch.Tensor:
         if x.dim() == 2 and x.shape[0] == 1 and bits == 3:
             from turboquant_vllm.weight_quant import _get_cuda_module
+
             cuda_mod = _get_cuda_module()
             gemv = getattr(cuda_mod, "tq3_gemv_bs1", None) if cuda_mod else None
             if gemv is not None:
                 x_rot = rotate_input(
-                    x.float(), signs1, signs2, group_size,
+                    x.float(),
+                    signs1,
+                    signs2,
+                    group_size,
                 ).to(torch.bfloat16)
                 out = gemv(x_rot.view(-1), packed_bs1, norms_bf16, centroids_bf16)
                 return out.view(1, -1)
         return _tq_fwht_input_gemm_impl(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            group_size=group_size, bits=bits, bias=None,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            group_size=group_size,
+            bits=bits,
+            bias=None,
         )
 
     @_tq3_apply_op.register_fake
-    def _(x, packed_weight, norms, signs1, signs2, centroids,
-          packed_bs1, norms_bf16, centroids_bf16, group_size, bits):
+    def _(x, packed_weight, norms, signs1, signs2, centroids, packed_bs1, norms_bf16, centroids_bf16, group_size, bits):
         N = norms.shape[0]
         return x.new_empty((*x.shape[:-1], N))
 
     def tq3_apply(  # type: ignore[no-redef]
-        x, packed_weight, norms, signs1, signs2, centroids,
-        packed_bs1, norms_bf16, centroids_bf16,
-        group_size, bits,
+        x,
+        packed_weight,
+        norms,
+        signs1,
+        signs2,
+        centroids,
+        packed_bs1,
+        norms_bf16,
+        centroids_bf16,
+        group_size,
+        bits,
     ):
         return torch.ops.turboquant.tq3_apply(
-            x, packed_weight, norms, signs1, signs2, centroids,
-            packed_bs1, norms_bf16, centroids_bf16, group_size, bits,
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            packed_bs1,
+            norms_bf16,
+            centroids_bf16,
+            group_size,
+            bits,
         )
 
     # Public callables that dynamo treats as opaque ops. Keyword args are

@@ -31,10 +31,12 @@ def _resolve_cutlass_path() -> Path:
     candidates = []
     if env:
         candidates.append(Path(env))
-    candidates.extend([
-        _repo_root / "third_party" / "cutlass",
-        Path("/workspace/cutlass"),
-    ])
+    candidates.extend(
+        [
+            _repo_root / "third_party" / "cutlass",
+            Path("/workspace/cutlass"),
+        ]
+    )
     for p in candidates:
         if (p / "include" / "cute" / "tensor.hpp").exists():
             return p
@@ -76,11 +78,7 @@ def build():
 
     cutlass_path = _resolve_cutlass_path()
 
-    sources = sorted(
-        str(p)
-        for p in FLUTE_CSRC_DIR.iterdir()
-        if p.suffix in (".cu", ".cpp")
-    )
+    sources = sorted(str(p) for p in FLUTE_CSRC_DIR.iterdir() if p.suffix in (".cu", ".cpp"))
     if not sources:
         raise FileNotFoundError(f"No .cu or .cpp files in {FLUTE_CSRC_DIR}")
 
@@ -95,9 +93,9 @@ def build():
         # and Blackwell (SM100/120) need a separate WGMMA/TMA path; until
         # that's ported, don't emit code for SM90+ or FLUTE's template
         # asserts fail on Hopper-specific cute instantiations.
-        "-gencode=arch=compute_80,code=sm_80",   # A100
-        "-gencode=arch=compute_86,code=sm_86",   # A10/A40/RTX 3090
-        "-gencode=arch=compute_89,code=sm_89",   # L40S, RTX 4090
+        "-gencode=arch=compute_80,code=sm_80",  # A100
+        "-gencode=arch=compute_86,code=sm_86",  # A10/A40/RTX 3090
+        "-gencode=arch=compute_89,code=sm_89",  # L40S, RTX 4090
     ]
 
     include_paths = [

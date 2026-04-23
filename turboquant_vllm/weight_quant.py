@@ -124,16 +124,15 @@ def _get_quantizer(
     if dev.type == "cuda" and dev.index is None:
         dev = torch.device("cuda", torch.cuda.current_device())
     normalized_device = str(dev)
-    effective_rotary_dim = (
-        rotary_dim
-        if (rotary_dim is not None and rotary_dim < group_size)
-        else None
-    )
+    effective_rotary_dim = rotary_dim if (rotary_dim is not None and rotary_dim < group_size) else None
     key = (group_size, bits, normalized_device, effective_rotary_dim)
     quantizer = _quantizers.get(key)
     if quantizer is None:
         quantizer = PolarQuantTorch(
-            group_size, bits, seed=42, device=normalized_device,
+            group_size,
+            bits,
+            seed=42,
+            device=normalized_device,
             rotary_dim=effective_rotary_dim,
         )
         _quantizers[key] = quantizer
@@ -141,7 +140,10 @@ def _get_quantizer(
     # Defensive fallback in case a stale/mutated cache entry has mismatched device.
     if str(quantizer.device) != normalized_device:
         quantizer = PolarQuantTorch(
-            group_size, bits, seed=42, device=normalized_device,
+            group_size,
+            bits,
+            seed=42,
+            device=normalized_device,
             rotary_dim=effective_rotary_dim,
         )
         _quantizers[key] = quantizer
@@ -174,18 +176,12 @@ def _derive_rotary_dim(model_config) -> "int | None":
         except (AttributeError, TypeError, ValueError):
             head_dim = None
     if head_dim is None:
-        hf = getattr(model_config, "hf_text_config", None) or getattr(
-            model_config, "hf_config", None
-        )
+        hf = getattr(model_config, "hf_text_config", None) or getattr(model_config, "hf_config", None)
         head_dim = getattr(hf, "head_dim", None) if hf else None
     if not head_dim:
         return None
 
-    cfg = (
-        getattr(model_config, "hf_text_config", None)
-        or getattr(model_config, "hf_config", None)
-        or model_config
-    )
+    cfg = getattr(model_config, "hf_text_config", None) or getattr(model_config, "hf_config", None) or model_config
     factor = None
     for name in _PARTIAL_ROTARY_ALIASES:
         factor = getattr(cfg, name, None)
@@ -364,7 +360,9 @@ class TurboQuantWrapper(nn.Module):
         # helper does a dict lookup and Python object construction that
         # vLLM 0.19's fullgraph dynamo compile cannot trace.
         _pq = _get_quantizer(
-            group_size, bits, str(original.weight.device),
+            group_size,
+            bits,
+            str(original.weight.device),
             rotary_dim=rotary_dim,
         )
         self.register_buffer("tq_signs1", _pq.signs1)
@@ -415,7 +413,10 @@ class TurboQuantWrapper(nn.Module):
             # match the rotary_dim the forward path will dequant with —
             # both paths share the cached quantizer via _get_quantizer.
             quantizer = _get_quantizer(
-                group_size, bits, str(weight.device), rotary_dim=rotary_dim,
+                group_size,
+                bits,
+                str(weight.device),
+                rotary_dim=rotary_dim,
             )
             indices, norms_raw = quantizer.quantize(grouped, norm_correction=True)
             packed = pack_indices(indices, bits)
@@ -578,7 +579,9 @@ class TurboQuantWrapper(nn.Module):
         indices = unpack_indices(self.packed_weight, self.bits, self.group_size)
         norms_flat = self.norms.reshape(-1)
         quantizer = _get_quantizer(
-            self.group_size, self.bits, str(x.device),
+            self.group_size,
+            self.bits,
+            str(x.device),
             rotary_dim=self.rotary_dim,
         )
         w_groups = quantizer.dequantize(indices, norms_flat)
@@ -788,14 +791,20 @@ class Compressed3D:
         if sparse_fn is not None:
             # Kernel writes the output dtype directly — no intermediate
             # scratch, no host sync, CUDA-graph capturable at fixed top_k.
-            assert active_experts.dtype == torch.int32, (
-                "active_experts must be int32 (cast once in the caller)"
-            )
+            assert active_experts.dtype == torch.int32, "active_experts must be int32 (cast once in the caller)"
             sparse_fn(
-                self.packed, self.norms,
-                quantizer.signs1, quantizer.signs2, quantizer.centroids,
-                active_experts, out,
-                self.group_size, self.bits, n_experts, out_dim, in_dim,
+                self.packed,
+                self.norms,
+                quantizer.signs1,
+                quantizer.signs2,
+                quantizer.centroids,
+                active_experts,
+                out,
+                self.group_size,
+                self.bits,
+                n_experts,
+                out_dim,
+                in_dim,
             )
             return
 
@@ -814,13 +823,19 @@ class Compressed3D:
             elif fp32_scratch is not None:
                 target = fp32_scratch[e : e + 1]
             else:
-                target = torch.empty(
-                    1, out_dim, in_dim, dtype=kernel_dtype, device=self.packed.device
-                )
+                target = torch.empty(1, out_dim, in_dim, dtype=kernel_dtype, device=self.packed.device)
             cuda_mod.weight_dequant_3d(
-                expert_packed, expert_norms,
-                quantizer.signs1, quantizer.signs2, quantizer.centroids,
-                target, self.group_size, self.bits, 1, out_dim, in_dim,
+                expert_packed,
+                expert_norms,
+                quantizer.signs1,
+                quantizer.signs2,
+                quantizer.centroids,
+                target,
+                self.group_size,
+                self.bits,
+                1,
+                out_dim,
+                in_dim,
             )
             if kernel_dtype != self.dtype:
                 out[e : e + 1].copy_(target)
@@ -1136,8 +1151,11 @@ def _replace_linear_layers(
 
         rotation = learned_rotations.get(name) if learned_rotations else None
         wrapper = TurboQuantWrapper(
-            module, bits=tensor_bits, group_size=group_size,
-            rotation=rotation, rotary_dim=rotary_dim,
+            module,
+            bits=tensor_bits,
+            group_size=group_size,
+            rotation=rotation,
+            rotary_dim=rotary_dim,
         )
         setattr(parent, attr_name, wrapper)
 
@@ -1380,8 +1398,8 @@ def patch_vllm_loader(**replace_kwargs) -> None:
         rotary_dim = _derive_rotary_dim(model_config)
         if rotary_dim is not None:
             logger.info(
-                "TurboQuant: partial_rotary detected — using block-diag WHT "
-                "with block_size=%d", rotary_dim,
+                "TurboQuant: partial_rotary detected — using block-diag WHT with block_size=%d",
+                rotary_dim,
             )
         logger.info("Applying TurboQuant weight compression...")
         count = _replace_linear_layers(model, rotary_dim=rotary_dim, **replace_kwargs)

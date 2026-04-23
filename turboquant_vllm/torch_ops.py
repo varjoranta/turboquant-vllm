@@ -108,12 +108,8 @@ def _fast_wht_batch_blocked(x: torch.Tensor, block_size: int) -> torch.Tensor:
     be a power of two.
     """
     n = x.shape[1]
-    assert n % block_size == 0, (
-        f"dim {n} not divisible by block_size {block_size}"
-    )
-    assert block_size & (block_size - 1) == 0, (
-        f"block_size {block_size} must be a power of two"
-    )
+    assert n % block_size == 0, f"dim {n} not divisible by block_size {block_size}"
+    assert block_size & (block_size - 1) == 0, f"block_size {block_size} must be a power of two"
     num_blocks = n // block_size
     x_blocks = x.reshape(x.shape[0] * num_blocks, block_size)
     x_blocks = _fast_wht_batch(x_blocks)
@@ -183,8 +179,15 @@ class PolarQuantTorch:
       comparable or better PPL for KV cache.
     """
 
-    def __init__(self, dim: int, bit_width: int, seed: int = 42, device: str = "cuda",
-                 rotation: str = "wht", rotary_dim: "int | None" = None):
+    def __init__(
+        self,
+        dim: int,
+        bit_width: int,
+        seed: int = 42,
+        device: str = "cuda",
+        rotation: str = "wht",
+        rotary_dim: "int | None" = None,
+    ):
         self.dim = dim
         self.bit_width = bit_width
         dev = torch.device(device)
@@ -212,9 +215,7 @@ class PolarQuantTorch:
             self.signs2 = (torch.randint(0, 2, (self.padded_dim,), generator=gen) * 2 - 1).float().to(self.device)
             self.cos_sin = None
             if rotary_dim is not None and 0 < rotary_dim < dim:
-                assert rotary_dim & (rotary_dim - 1) == 0, (
-                    f"rotary_dim {rotary_dim} must be a power of two"
-                )
+                assert rotary_dim & (rotary_dim - 1) == 0, f"rotary_dim {rotary_dim} must be a power of two"
                 assert self.padded_dim % rotary_dim == 0, (
                     f"rotary_dim {rotary_dim} must divide padded_dim {self.padded_dim}"
                 )

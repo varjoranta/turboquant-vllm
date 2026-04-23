@@ -20,10 +20,10 @@ from turboquant_vllm.weight_quant import pack_indices
 
 # Match Qwen3-8B / Qwen3.5-35B-A3B linear shapes.
 SHAPES = [
-    ("tiny",         128,    32),
-    ("q/k/v/o_proj", 4096,   4096),
-    ("gate/up_proj", 4096,   12288),
-    ("down_proj",    12288,  4096),
+    ("tiny", 128, 32),
+    ("q/k/v/o_proj", 4096, 4096),
+    ("gate/up_proj", 4096, 12288),
+    ("down_proj", 12288, 4096),
 ]
 
 
@@ -36,8 +36,8 @@ def build_case(rng: np.random.Generator, K: int, OC: int):
         bits=3,
     ).numpy()
     codebook_np = np.sort(rng.standard_normal(8).astype(np.float32))
-    norms_np = (rng.standard_normal((OC, n_groups)).astype(np.float32) * 0.1)
-    x_np = (rng.standard_normal(K).astype(np.float32) * 0.5)
+    norms_np = rng.standard_normal((OC, n_groups)).astype(np.float32) * 0.1
+    x_np = rng.standard_normal(K).astype(np.float32) * 0.5
 
     # Reference computed in fp16 throughout to match the kernel's storage.
     cb_fp16 = mx.array(codebook_np).astype(mx.float16).astype(mx.float32)
@@ -45,7 +45,7 @@ def build_case(rng: np.random.Generator, K: int, OC: int):
     x_fp16 = mx.array(x_np).astype(mx.float16).astype(mx.float32)
     indices_mx = mx.array(indices_3d.astype(np.int32))
 
-    w_g = cb_fp16[indices_mx] * norms_fp16[:, :, None]   # (OC, n_groups, 128) fp32
+    w_g = cb_fp16[indices_mx] * norms_fp16[:, :, None]  # (OC, n_groups, 128) fp32
     out_ref = (w_g.reshape(OC, K) @ x_fp16.reshape(K, 1)).reshape(OC)
     out_ref_np = np.asarray(out_ref).astype(np.float32)
 
@@ -57,7 +57,7 @@ def run_case(name: str, K: int, OC: int) -> dict:
     packed_np, codebook_np, norms_np, x_np, out_ref_np = build_case(rng, K, OC)
 
     # Move to MLX in float16 (kernel storage type).
-    packed = mx.array(packed_np)                                         # uint8
+    packed = mx.array(packed_np)  # uint8
     codebook = mx.array(codebook_np).astype(mx.float16)
     norms = mx.array(norms_np).astype(mx.float16)
     x_rot = mx.array(x_np).astype(mx.float16)
@@ -98,32 +98,38 @@ def bench_reference(K: int, OC: int) -> float:
 
     def step():
         # Same shape as existing path: dequant → matmul.
-        w = codebook[indices]                        # (OC, n_groups, 128) fp16
-        w = w * norms[:, :, None]                    # apply norm
-        w = w.reshape(OC, K)                         # (OC, K)
-        return w @ x.reshape(K, 1)                   # (OC, 1)
+        w = codebook[indices]  # (OC, n_groups, 128) fp16
+        w = w * norms[:, :, None]  # apply norm
+        w = w.reshape(OC, K)  # (OC, K)
+        return w @ x.reshape(K, 1)  # (OC, 1)
 
     for _ in range(10):
-        y = step(); mx.eval(y)
+        y = step()
+        mx.eval(y)
     t0 = time.perf_counter()
     iters = 100
     for _ in range(iters):
-        y = step(); mx.eval(y)
+        y = step()
+        mx.eval(y)
     return (time.perf_counter() - t0) / iters * 1e6
 
 
 def main() -> None:
     print(f"Device: {mx.default_device()}")
     print()
-    print(f"{'shape':14s} {'K':>5s} {'OC':>5s}  {'max_abs':>8s} {'max_rel':>8s}  "
-          f"{'kernel µs':>10s} {'ref µs':>10s} {'speedup':>8s}")
+    print(
+        f"{'shape':14s} {'K':>5s} {'OC':>5s}  {'max_abs':>8s} {'max_rel':>8s}  "
+        f"{'kernel µs':>10s} {'ref µs':>10s} {'speedup':>8s}"
+    )
     for name, K, OC in SHAPES:
         r = run_case(name, K, OC)
         ref_us = bench_reference(K, OC)
         spd = ref_us / r["us"] if r["us"] > 0 else 0
-        print(f"  {r['name']:14s} {r['K']:5d} {r['OC']:5d}  "
-              f"{r['max_abs']:8.4f} {r['max_rel']:8.4f}  "
-              f"{r['us']:10.1f} {ref_us:10.1f} {spd:7.2f}x")
+        print(
+            f"  {r['name']:14s} {r['K']:5d} {r['OC']:5d}  "
+            f"{r['max_abs']:8.4f} {r['max_rel']:8.4f}  "
+            f"{r['us']:10.1f} {ref_us:10.1f} {spd:7.2f}x"
+        )
         assert r["max_rel"] < 0.05, f"{name}: max_rel={r['max_rel']} > 5%"
     print("\nPASS")
 
