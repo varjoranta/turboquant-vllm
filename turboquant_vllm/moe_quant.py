@@ -168,25 +168,15 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         # writing into the pool buffers here makes the freshly
         # dequantized values visible to the base unquantized kernel.
         #
-        # SPARSE DEQUANT: only decompress the experts ``topk_ids`` actually
-        # routes to. At MoE decode (bs=1, top-8 of 128 experts), this is a
-        # ~16× reduction in weight-dequant GPU time — the single biggest
-        # decode-throughput lever on the MoE path (nsys profile 2026-04-23
-        # showed the original full-dequant path consumed 53.9% of GPU time
-        # writing weights that were immediately discarded). Stale contents
-        # in non-active expert slots are ignored by the downstream
-        # ``fused_moe`` kernel, which routes via ``topk_ids``.
-        #
-        # Note: we pass ``topk_ids.flatten()`` directly (no ``torch.unique``)
-        # — top-k routing guarantees unique indices per token row at bs=1,
-        # and cross-row duplicates at bs>1 just cause idempotent rewrites
-        # of the same scratch slot. Using ``torch.unique`` here would break
-        # CUDA graph capture (data-dependent output shape). The sparse-dequant
-        # path currently requires ``enforce_eager=True`` on vLLM; Phase 2
-        # replaces the Python loop with a GPU-resident kernel that takes
-        # ``topk_ids`` directly and is graph-compatible.
+        # Sparse dequant: only decompress experts ``topk_ids`` routes to.
+        # Unused slots in pool.w13/w2 contain stale values; ``fused_moe``
+        # routes via ``topk_ids`` and never reads them. ``topk_ids`` is
+        # int32-per-row-unique from top-k routing, so cross-row duplicates
+        # at bs>1 just cause idempotent rewrites.
         pool = self._pool
         active_experts = topk_ids.flatten()
+        if active_experts.dtype != torch.int32:
+            active_experts = active_experts.to(torch.int32)
         self._w13.decompress_experts_into(pool.w13, active_experts, fp32_scratch=pool.w13_fp32)
         self._w2.decompress_experts_into(pool.w2, active_experts, fp32_scratch=pool.w2_fp32)
 
