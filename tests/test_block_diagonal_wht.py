@@ -218,7 +218,7 @@ class TestTurboQuantWrapperBlockDiagonal:
         wrapper = TurboQuantWrapper(
             original, bits=3, group_size=128, rotary_dim=64,
         )
-        assert not wrapper._can_use_full_wht_kernels()
+        assert not wrapper._full_wht_ok
 
         wrapper_full = TurboQuantWrapper(original, bits=3, group_size=128)
-        assert wrapper_full._can_use_full_wht_kernels()
+        assert wrapper_full._full_wht_ok

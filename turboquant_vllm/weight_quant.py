@@ -339,6 +339,14 @@ class TurboQuantWrapper(nn.Module):
         self.out_features = original.out_features
         self._has_learned_rotation = rotation is not None
         self.rotary_dim = rotary_dim
+        # Per-forward predicates memoised once — all inputs are immutable after ctor
+        # and forward() is on the hot path (called per linear per token at decode).
+        self._block_size_cached = rotary_dim if rotary_dim is not None else group_size
+        self._cuda_dequant_ok = (
+            rotary_dim is None
+            or (group_size, bits, self._block_size_cached) in self._SUPPORTED_BLOCK_DIAG_COMBOS
+        )
+        self._full_wht_ok = rotary_dim is None
 
         # vLLM's Linear subclasses return either `output` or a
         # `(output, output_bias)` tuple depending on the `return_bias`
@@ -521,23 +529,6 @@ class TurboQuantWrapper(nn.Module):
         (256, 3, 128), (256, 3, 64),
     })
 
-    @property
-    def _block_size(self) -> int:
-        return self.rotary_dim if self.rotary_dim is not None else self.group_size
-
-    def _can_use_full_wht_kernels(self) -> bool:
-        # The FWHT-on-input Triton kernel + the separate rotate_input path
-        # assume a full-width WHT and don't have a block-diag variant yet.
-        return self.rotary_dim is None
-
-    def _can_use_cuda_dequant_kernel(self) -> bool:
-        # The C++ dequant kernel supports full-width WHT OR a curated set of
-        # block-diag combos. Block-diag input via the gemv-bs1 fast path is
-        # separate and still requires full-width (see _can_use_full_wht_kernels).
-        if self.rotary_dim is None:
-            return True
-        return (self.group_size, self.bits, self._block_size) in self._SUPPORTED_BLOCK_DIAG_COMBOS
-
     def _forward_gpu(self, x: torch.Tensor) -> torch.Tensor:
         """Fullgraph-dynamo-clean forward for GPU (Triton or CUDA backends).
 
@@ -545,7 +536,7 @@ class TurboQuantWrapper(nn.Module):
         helpers, or method calls on non-tensor Python objects that do dict
         lookups / string conversions. vLLM 0.19 AOT-compiles this path.
         """
-        if _triton_available and x.is_cuda and self._can_use_full_wht_kernels():
+        if _triton_available and x.is_cuda and self._full_wht_ok:
             # Pad input if in_features was not a multiple of group_size
             if x.shape[-1] != self.padded_in:
                 x = torch.nn.functional.pad(x, (0, self.padded_in - x.shape[-1]))
@@ -565,7 +556,7 @@ class TurboQuantWrapper(nn.Module):
         # CUDA C++ extension path — handles full-width WHT and the curated
         # set of block-diag (partial-rotary) combos listed in
         # _SUPPORTED_BLOCK_DIAG_COMBOS.
-        if _cuda_mod is not None and self._can_use_cuda_dequant_kernel():
+        if _cuda_mod is not None and self._cuda_dequant_ok:
             output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
             w_deq = torch.empty(self.out_features, self.in_features, dtype=output_dtype, device=x.device)
             _cuda_mod.weight_dequant(
@@ -579,7 +570,7 @@ class TurboQuantWrapper(nn.Module):
                 self.bits,
                 self.out_features,
                 self.in_features,
-                self._block_size,
+                self._block_size_cached,
             )
 
             if w_deq.dtype != x.dtype:
@@ -761,7 +752,7 @@ class Compressed3D:
             n_experts,
             out_dim,
             in_dim,
-            self.group_size,  # block_size = group_size (MoE MLPs don't use rotary)
+            self.group_size,
         )
         if target is not out:
             out.copy_(target)
@@ -820,13 +811,12 @@ class Compressed3D:
                 quantizer.signs1, quantizer.signs2, quantizer.centroids,
                 active_experts, out,
                 self.group_size, self.bits, n_experts, out_dim, in_dim,
-                self.group_size,  # block_size = group_size (MoE MLPs, no rotary)
+                self.group_size,
             )
             return
 
         # Legacy fallback (wheel built without sparse kernel): scalar loop
-        # via the full 3D kernel at n_experts=1. Breaks CUDA graphs; requires
-        # enforce_eager=True on vLLM.
+        # via the full 3D kernel at n_experts=1.
         kernel_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
         groups_per_expert = out_dim * self.n_groups
         for e in torch.unique(active_experts).tolist():

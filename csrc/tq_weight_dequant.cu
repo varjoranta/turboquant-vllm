@@ -56,13 +56,9 @@ static inline int packed_group_bytes_for(int64_t bits, int64_t group_size) {
 }
 
 
-// ---------------------------------------------------------------------------
-// Unified dequant kernel: templated on output type, group size, bits, and
-// block size. BLOCK_SIZE < GROUP_SIZE runs the butterfly as an independent
-// WHT per BLOCK_SIZE sub-block within each group — matches block-diagonal
-// WHT used for partial-rotary models (Qwen3.6-35B-A3B, MiniMax M2.5/M2.7).
-// Default BLOCK_SIZE == GROUP_SIZE preserves the original full-width WHT.
-// ---------------------------------------------------------------------------
+// BLOCK_SIZE < GROUP_SIZE runs the butterfly as an independent WHT per
+// BLOCK_SIZE sub-block within each group (block-diagonal WHT, used by
+// partial-rotary models).
 
 template <typename OutputT, int GROUP_SIZE, int BITS, int BLOCK_SIZE = GROUP_SIZE>
 __global__ void tq_weight_dequant_kernel(
@@ -228,7 +224,6 @@ void tq_weight_dequant(
         else                                            LAUNCH(float, GS, B, BS)
 
     if (block_size == group_size) {
-        // Default full-width WHT path (back-compat with pre-block-diag callers).
         if      (group_size == 64  && bits == 2) DISPATCH(64, 2, 64)
         else if (group_size == 64  && bits == 3) DISPATCH(64, 3, 64)
         else if (group_size == 64  && bits == 4) DISPATCH(64, 4, 64)
@@ -240,9 +235,6 @@ void tq_weight_dequant(
         else if (group_size == 256 && bits == 4) DISPATCH(256, 4, 256)
         else TORCH_CHECK(false, "Unsupported group_size/bits combo");
     } else {
-        // Block-diag WHT (partial-rotary models): Qwen3.6 wants block_size=64
-        // inside group_size=128; MiniMax M2.5/M2.7 want block_size=32 inside
-        // group_size=128. Only the combos we ship are enumerated.
         if      (group_size == 128 && bits == 3 && block_size == 64)  DISPATCH(128, 3, 64)
         else if (group_size == 128 && bits == 4 && block_size == 64)  DISPATCH(128, 4, 64)
         else if (group_size == 128 && bits == 2 && block_size == 64)  DISPATCH(128, 2, 64)
@@ -259,15 +251,8 @@ void tq_weight_dequant(
 }
 
 
-// ---------------------------------------------------------------------------
-// Sparse MoE kernel — decompress only listed active experts
-// ---------------------------------------------------------------------------
-//
-// Same decode / butterfly / norm logic as tq_weight_dequant_kernel, but the
-// grid's X axis indexes into `active_expert_ids` instead of directly into
-// all experts' rows. Reads packed/norms from the expert's full-tensor
-// offset, writes into the expert's slot in the 3D output. Output slots for
-// non-active experts are left untouched.
+// Sparse MoE variant: grid's X axis indexes into `active_expert_ids`;
+// output slots for non-active experts are left untouched.
 
 template <typename OutputT, int GROUP_SIZE, int BITS, int BLOCK_SIZE = GROUP_SIZE>
 __global__ void tq_weight_dequant_sparse_3d_kernel(
