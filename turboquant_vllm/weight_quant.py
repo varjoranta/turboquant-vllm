@@ -772,6 +772,16 @@ class Compressed3D:
             return
 
         n_experts, out_dim, in_dim = self.shape
+
+        # At prefill, topk_ids.flatten() scales with batch*top_k and quickly
+        # exceeds n_experts — the sparse-kernel grid ((N*out_dim, n_groups))
+        # would overflow CUDA's grid.x limit (~2.1B blocks) and sparse work
+        # isn't a win when we're covering every expert anyway. Full dequant
+        # is strictly faster + safer in that regime.
+        if active_experts.numel() >= n_experts:
+            self.decompress_into(out, fp32_scratch=fp32_scratch)
+            return
+
         quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
 
         sparse_fn = getattr(cuda_mod, "weight_dequant_sparse_3d", None)
