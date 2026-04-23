@@ -440,7 +440,8 @@ class TestFusedMoEWalkerInstallation(unittest.TestCase):
         w13_bits = model.block_0._tq_w13_weight.bits
         w2_bits = model.block_0._tq_w2_weight.bits
         self.assertNotEqual(
-            w13_bits, w2_bits,
+            w13_bits,
+            w2_bits,
             f"expected independent bit widths for w13/w2 under kurtosis_aware; "
             f"got w13_bits={w13_bits}, w2_bits={w2_bits} (same = side-independence broken)",
         )

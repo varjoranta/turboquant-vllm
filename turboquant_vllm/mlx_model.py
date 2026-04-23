@@ -92,7 +92,9 @@ class TurboQuantMLXLinear(nn.Module):
         # a layer quantized at 4-bit ships 64 bytes/group, at 3-bit 48 bytes/group.
         self.packed_weight = packed_weight
         self._indices_grouped = unpack_indices_mlx(
-            packed_weight, bits=state.bits, dim=self.padded_in,
+            packed_weight,
+            bits=state.bits,
+            dim=self.padded_in,
         ).reshape(self.out_features * self.n_groups, self.group_size)
 
     def __call__(self, x: mx.array) -> mx.array:
@@ -103,23 +105,24 @@ class TurboQuantMLXLinear(nn.Module):
         # codebook lookup + norm + matmul into one pass. Dispatch on bit
         # width — TQ3 uses 48-byte groups / 8-entry codebook, TQ4 uses
         # 64-byte groups / 16-entry codebook.
-        use_fast_path = (
-            x_flat.shape[0] == 1
-            and x_flat.dtype == mx.float16
-            and self.quant_state.bits in (3, 4)
-        )
+        use_fast_path = x_flat.shape[0] == 1 and x_flat.dtype == mx.float16 and self.quant_state.bits in (3, 4)
         if use_fast_path:
-            x_padded = (
-                mx.pad(x_flat, [(0, 0), (0, self.padded_in - self.in_features)])
-                if self._pad_needed else x_flat
+            x_padded = mx.pad(x_flat, [(0, 0), (0, self.padded_in - self.in_features)]) if self._pad_needed else x_flat
+            x_rot = (
+                rht_on_last_dim_mlx(
+                    x_padded,
+                    self.quant_state.signs1,
+                    self.quant_state.signs2,
+                    self.n_groups,
+                    self.group_size,
+                )
+                .reshape(self.padded_in)
+                .astype(mx.float16)
             )
-            x_rot = rht_on_last_dim_mlx(
-                x_padded, self.quant_state.signs1, self.quant_state.signs2,
-                self.n_groups, self.group_size,
-            ).reshape(self.padded_in).astype(mx.float16)
             bytes_per_group = 48 if self.quant_state.bits == 3 else 64
             packed_view = self.packed_weight.reshape(
-                self.out_features * self.n_groups, bytes_per_group,
+                self.out_features * self.n_groups,
+                bytes_per_group,
             )
             gemv = tq3_gemv_bs1_mlx if self.quant_state.bits == 3 else tq4_gemv_bs1_mlx
             out_vec = gemv(
@@ -222,18 +225,12 @@ class TurboQuantMLXSwitchLinear(nn.Module):
 
         ids_flat = indices.reshape(-1).astype(mx.uint32)
         K_active = ids_flat.size
-        use_fast_path = (
-            x.dtype == mx.float16 and self.quant_state.bits in (3, 4)
-        )
+        use_fast_path = x.dtype == mx.float16 and self.quant_state.bits in (3, 4)
 
         # TQ3 shared-x fused-gather: gate_proj / up_proj path with
         # fused kernel that indexes into _packed_per_expert directly,
         # skipping the 400 µs/call mx.take overhead.
-        if (
-            use_fast_path
-            and self.quant_state.bits == 3
-            and x_rot.size == self.padded_in
-        ):
+        if use_fast_path and self.quant_state.bits == 3 and x_rot.size == self.padded_in:
             x_rot_flat = x_rot.reshape(self.padded_in).astype(mx.float16)
             out_flat = tq3_gemv_bs1_moe_fused_mlx(
                 x_rot_flat,
@@ -252,10 +249,7 @@ class TurboQuantMLXSwitchLinear(nn.Module):
 
         if use_fast_path and x_rot.size == self.padded_in:
             x_rot_flat = x_rot.reshape(self.padded_in).astype(mx.float16)
-            gemv = (
-                tq3_gemv_bs1_batched_mlx if self.quant_state.bits == 3
-                else tq4_gemv_bs1_batched_mlx
-            )
+            gemv = tq3_gemv_bs1_batched_mlx if self.quant_state.bits == 3 else tq4_gemv_bs1_batched_mlx
             out_flat = gemv(
                 x_rot_flat,
                 active_packed,
@@ -267,10 +261,7 @@ class TurboQuantMLXSwitchLinear(nn.Module):
             return out_flat.reshape(*indices.shape, 1, self.out_features)
         if use_fast_path and x_rot.size == K_active * self.padded_in:
             x_rot_per_k = x_rot.reshape(K_active, self.padded_in).astype(mx.float16)
-            gemv = (
-                tq3_gemv_bs1_batched_per_x_mlx if self.quant_state.bits == 3
-                else tq4_gemv_bs1_batched_per_x_mlx
-            )
+            gemv = tq3_gemv_bs1_batched_per_x_mlx if self.quant_state.bits == 3 else tq4_gemv_bs1_batched_per_x_mlx
             out_flat = gemv(
                 x_rot_per_k,
                 active_packed,

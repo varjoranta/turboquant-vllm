@@ -37,9 +37,7 @@ def build_switch_linear(in_f: int, out_f: int, n_experts: int, group_size: int =
     packed_flat = packed_torch.numpy().reshape(n_experts * out_f * n_groups, 48)
     packed = mx.array(packed_flat)
 
-    norms = mx.array(
-        rng.standard_normal((n_experts * out_f, n_groups)).astype(np.float32) * 0.1
-    )
+    norms = mx.array(rng.standard_normal((n_experts * out_f, n_groups)).astype(np.float32) * 0.1)
 
     centroids = mx.array(np.sort(rng.standard_normal(8).astype(np.float32)))
     signs1 = mx.array(rng.choice([-1.0, 1.0], size=group_size).astype(np.float32))
@@ -64,11 +62,13 @@ def build_switch_linear(in_f: int, out_f: int, n_experts: int, group_size: int =
 
 def time_forward(layer, x, indices, iters: int = 50, warmup: int = 10) -> float:
     for _ in range(warmup):
-        y = layer(x, indices); mx.eval(y)
+        y = layer(x, indices)
+        mx.eval(y)
     t0 = time.perf_counter()
     for _ in range(iters):
-        y = layer(x, indices); mx.eval(y)
-    return (time.perf_counter() - t0) / iters * 1e3   # ms
+        y = layer(x, indices)
+        mx.eval(y)
+    return (time.perf_counter() - t0) / iters * 1e3  # ms
 
 
 def main() -> None:
@@ -103,7 +103,7 @@ def main() -> None:
         fast_ms = time_forward(layer, x_fast, indices)
         slow_ms = time_forward(layer, x_slow, indices)
         spd = slow_ms / fast_ms if fast_ms > 0 else 0.0
-        print(f"  {name:22s} {fast_ms*1000:10.1f} {slow_ms*1000:10.1f} {spd:7.2f}x")
+        print(f"  {name:22s} {fast_ms * 1000:10.1f} {slow_ms * 1000:10.1f} {spd:7.2f}x")
 
     # Aggregate per-token projection: gate + up + down per layer × num_layers.
     # Qwen3.5-35B-A3B has 28 layers (architecture-typical).
@@ -118,7 +118,7 @@ def main() -> None:
     per_token_ms = NUM_LAYERS * (2 * gateup_ms + down_ms)  # gate + up + down per layer
     print()
     print(f"Per-MoE-layer: {2 * gateup_ms + down_ms:.1f} ms (kernel path, gate+up+down)")
-    print(f"Projected per-token MoE-only: {per_token_ms:.0f} ms = {1000/per_token_ms:.2f} tok/s")
+    print(f"Projected per-token MoE-only: {per_token_ms:.0f} ms = {1000 / per_token_ms:.2f} tok/s")
     print("(attention + norms + sampling additional, not measured here)")
 
 

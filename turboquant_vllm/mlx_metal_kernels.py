@@ -368,10 +368,10 @@ def _gemv_moe_fused_kernel():
 
 def tq3_gemv_bs1_moe_fused_mlx(
     x_rot: mx.array,
-    packed_per_expert: mx.array,   # (num_experts, OC*n_groups, 48) uint8
-    norms: mx.array,               # (num_experts, OC, n_groups) or (num_experts, OC*n_groups) half
+    packed_per_expert: mx.array,  # (num_experts, OC*n_groups, 48) uint8
+    norms: mx.array,  # (num_experts, OC, n_groups) or (num_experts, OC*n_groups) half
     codebook: mx.array,
-    indices: mx.array,             # (K_active,) uint32
+    indices: mx.array,  # (K_active,) uint32
 ) -> mx.array:
     """TQ3 MoE GEMV that gathers active experts inside the kernel.
 
@@ -602,10 +602,8 @@ def tq3_gemv_bs1_mlx(
 
     OC = norms.shape[0]
     n_groups = norms.shape[1]
-    assert x_rot.size == n_groups * 128, f"K={x_rot.size} != n_groups*128={n_groups*128}"
-    assert packed.shape[0] == OC * n_groups, (
-        f"packed.shape[0]={packed.shape[0]} != OC*n_groups={OC * n_groups}"
-    )
+    assert x_rot.size == n_groups * 128, f"K={x_rot.size} != n_groups*128={n_groups * 128}"
+    assert packed.shape[0] == OC * n_groups, f"packed.shape[0]={packed.shape[0]} != OC*n_groups={OC * n_groups}"
 
     OC_arg = mx.array([OC], dtype=mx.uint32)
     ng_arg = mx.array([n_groups], dtype=mx.uint32)
@@ -613,8 +611,8 @@ def tq3_gemv_bs1_mlx(
     kernel = _gemv_kernel()
     out = kernel(
         inputs=[x_rot, packed, norms, codebook, OC_arg, ng_arg],
-        grid=(32, OC, 1),         # one SIMD-group per output channel
-        threadgroup=(32, 1, 1),   # one SIMD-group per threadgroup
+        grid=(32, OC, 1),  # one SIMD-group per output channel
+        threadgroup=(32, 1, 1),  # one SIMD-group per threadgroup
         output_shapes=[(OC,)],
         output_dtypes=[mx.float16],
     )[0]

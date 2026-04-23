@@ -11,7 +11,6 @@ Usage: python tests/bench_real_model_tps.py [model_path]
 from __future__ import annotations
 
 import argparse
-import sys
 import time
 from pathlib import Path
 
@@ -83,8 +82,10 @@ def main() -> None:
     orig_call = embed.__class__.__call__
 
     for label, dtype in [("fp16 (kernel ON)", mx.float16), ("fp32 (fallback)", mx.float32)]:
+
         def patched(self, x, _dtype=dtype):
             return orig_call(self, x).astype(_dtype)
+
         embed.__class__.__call__ = patched
 
         print(f"=== {label} ===")
