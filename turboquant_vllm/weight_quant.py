@@ -558,6 +558,7 @@ class TurboQuantWrapper(nn.Module):
                 self.bits,
                 self.out_features,
                 self.in_features,
+                self.group_size,  # block_size
             )
 
             if w_deq.dtype != x.dtype:
@@ -741,6 +742,7 @@ class Compressed3D:
             n_experts,
             out_dim,
             in_dim,
+            self.group_size,  # block_size — full-width WHT for MoE experts
         )
         if target is not out:
             out.copy_(target)
@@ -805,6 +807,7 @@ class Compressed3D:
                 n_experts,
                 out_dim,
                 in_dim,
+                self.group_size,  # block_size — full-width WHT for MoE experts
             )
             return
 
@@ -836,6 +839,7 @@ class Compressed3D:
                 1,
                 out_dim,
                 in_dim,
+                self.group_size,  # block_size — full-width WHT for MoE experts
             )
             if kernel_dtype != self.dtype:
                 out[e : e + 1].copy_(target)
@@ -868,6 +872,7 @@ class Compressed3D:
                 n_experts,
                 out_dim,
                 in_dim,
+                self.group_size,  # block_size — full-width WHT for MoE experts
             )
             return output.to(self.dtype)
 
