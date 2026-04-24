@@ -545,8 +545,7 @@ class TurboQuantWrapper(nn.Module):
 
         # CUDA C++ extension path — called via the compiled .so.
         if _cuda_mod is not None and self._can_use_full_wht_kernels():
-            output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
-            w_deq = torch.empty(self.out_features, self.in_features, dtype=output_dtype, device=x.device)
+            w_deq = torch.empty(self.out_features, self.in_features, dtype=x.dtype, device=x.device)
             _cuda_mod.weight_dequant(
                 self.packed_weight,
                 self.norms,
@@ -561,8 +560,6 @@ class TurboQuantWrapper(nn.Module):
                 self.group_size,  # block_size
             )
 
-            if w_deq.dtype != x.dtype:
-                w_deq = w_deq.to(x.dtype)
             output = torch.matmul(x, w_deq.t())
             if self.bias is not None:
                 output = output + self.bias
@@ -718,17 +715,6 @@ class Compressed3D:
             return
 
         n_experts, out_dim, in_dim = self.shape
-        kernel_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
-        if kernel_dtype == self.dtype:
-            target = out
-        elif fp32_scratch is not None:
-            assert fp32_scratch.shape == self.shape
-            assert fp32_scratch.dtype == kernel_dtype
-            assert fp32_scratch.device == self.packed.device
-            target = fp32_scratch
-        else:
-            target = torch.empty(self.shape, dtype=kernel_dtype, device=self.packed.device)
-
         quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
         cuda_mod.weight_dequant_3d(
             self.packed,
@@ -736,7 +722,7 @@ class Compressed3D:
             quantizer.signs1,
             quantizer.signs2,
             quantizer.centroids,
-            target,
+            out,
             self.group_size,
             self.bits,
             n_experts,
@@ -744,8 +730,6 @@ class Compressed3D:
             in_dim,
             self.group_size,  # block_size — full-width WHT for MoE experts
         )
-        if target is not out:
-            out.copy_(target)
 
     def decompress_experts_into(
         self,
