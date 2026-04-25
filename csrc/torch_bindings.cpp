@@ -92,15 +92,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("n_experts"), py::arg("out_dim"), py::arg("in_dim"),
           py::arg("block_size"));
 
-    m.def("weight_dequant_sparse_3d", &tq_weight_dequant_sparse_3d,
-          "Sparse MoE dequant: decompress only listed active_expert_ids",
-          py::arg("packed_weight"), py::arg("norms"),
-          py::arg("signs1"), py::arg("signs2"),
-          py::arg("centroids"), py::arg("active_expert_ids"),
-          py::arg("output"),
-          py::arg("group_size"), py::arg("bits"),
-          py::arg("n_experts"), py::arg("out_dim"), py::arg("in_dim"));
-
     m.def("tq3_gemv_bs1", &tq3_gemv_bs1,
           "bs=1 GEMV for 3-bit weights (warp-per-OC, sm_80+, bf16)",
           py::arg("x_rot"), py::arg("packed"),
