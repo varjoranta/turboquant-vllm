@@ -116,6 +116,37 @@ def _fast_wht_batch_blocked(x: torch.Tensor, block_size: int) -> torch.Tensor:
     return x_blocks.reshape(x.shape[0], n)
 
 
+def forward_rotate_batched(
+    x: torch.Tensor,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    group_size: int,
+    block_size: int | None = None,
+) -> torch.Tensor:
+    """Apply forward rotation ``D2 @ H @ D1`` to each ``group_size``-wide slice of ``x``.
+
+    ``x`` is reshaped to (-1, group_size); ``signs1`` and ``signs2`` are
+    (group_size,) sign vectors that broadcast over the batch dimension.
+
+    ``block_size`` selects the WHT width. ``None`` or ``>= group_size`` means
+    full-width WHT. Passing ``block_size < group_size`` runs a block-diagonal
+    WHT — used by partial-rotary models so the rotated head prefix and the
+    unrotated suffix don't mix inside a quantization group.
+
+    Returns the same shape as ``x``. The transform identity is
+    ``y = D2 * fwht(D1 * x)`` per group — i.e. the matrix transpose of
+    the inverse rotation that ``_build_rotation_matrix`` encodes in
+    ``triton_ops.py``.
+    """
+    grouped = x.reshape(-1, group_size) * signs1
+    if block_size is None or block_size >= group_size:
+        grouped = _fast_wht_batch(grouped)
+    else:
+        grouped = _fast_wht_batch_blocked(grouped, block_size=block_size)
+    grouped.mul_(signs2)
+    return grouped.reshape(x.shape)
+
+
 def _next_power_of_2(n: int) -> int:
     p = 1
     while p < n:

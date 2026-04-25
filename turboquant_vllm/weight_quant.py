@@ -19,7 +19,7 @@ import os
 import torch
 import torch.nn as nn
 
-from turboquant_vllm.torch_ops import PolarQuantTorch
+from turboquant_vllm.torch_ops import PolarQuantTorch, forward_rotate_batched
 
 try:
     from vllm.logger import init_logger
@@ -34,6 +34,7 @@ _cuda_available = None
 _triton_available = None
 _tq_fused_gemm_fn = None
 _tq_fwht_input_fn = None
+_tq3_gemv_bs1_available = False
 
 
 def _ensure_triton_backends() -> bool:
@@ -84,7 +85,7 @@ def _get_cuda_module():
     Must be called from ``TurboQuantWrapper.__init__`` (pre-compile), not
     ``forward`` (which vLLM 0.19 compiles in fullgraph mode).
     """
-    global _cuda_mod, _cuda_available
+    global _cuda_mod, _cuda_available, _tq3_gemv_bs1_available
     if _cuda_available is not None:
         return _cuda_mod if _cuda_available else None
     try:
@@ -93,7 +94,11 @@ def _get_cuda_module():
         _cuda_mod = build()
         if hasattr(_cuda_mod, "weight_dequant"):
             _cuda_available = True
-            logger.info("CUDA weight dequant kernel loaded")
+            _tq3_gemv_bs1_available = hasattr(_cuda_mod, "tq3_gemv_bs1")
+            logger.info(
+                "CUDA weight dequant kernel loaded (fused tq3_gemv_bs1: %s)",
+                _tq3_gemv_bs1_available,
+            )
             return _cuda_mod
         else:
             _cuda_available = False
@@ -429,6 +434,11 @@ class TurboQuantWrapper(nn.Module):
 
         self.register_buffer("packed_weight", packed)
         self.register_buffer("norms", norms)
+        # bf16 caches for the fused tq3_gemv_bs1 path. The norm tensor is small
+        # (out_features × n_groups), so the extra ~50% memory cost is
+        # negligible relative to the packed weights themselves.
+        self.register_buffer("norms_bf16", norms.to(torch.bfloat16).contiguous())
+        self.register_buffer("tq_centroids_bf16", self.tq_centroids.to(torch.bfloat16).contiguous())
 
         if original.bias is not None:
             bias_data = original.bias.data
@@ -480,6 +490,7 @@ class TurboQuantWrapper(nn.Module):
 
         wrapper.register_buffer("packed_weight", packed_weight)
         wrapper.register_buffer("norms", norms)
+        wrapper.register_buffer("norms_bf16", norms.to(torch.bfloat16).contiguous())
         wrapper.bias = nn.Parameter(bias) if bias is not None else None
 
         # `from_packed` is invoked by `load_tq3_model`, which builds an HF
@@ -496,6 +507,7 @@ class TurboQuantWrapper(nn.Module):
         wrapper.register_buffer("tq_signs1", _pq.signs1)
         wrapper.register_buffer("tq_signs2", _pq.signs2)
         wrapper.register_buffer("tq_centroids", _pq.centroids)
+        wrapper.register_buffer("tq_centroids_bf16", _pq.centroids.to(torch.bfloat16).contiguous())
 
         original_bytes = out_features * in_features * 2  # FP16 equivalent
         compressed_bytes = packed_weight.numel() + norms.numel() * norms.element_size()
@@ -545,11 +557,41 @@ class TurboQuantWrapper(nn.Module):
                 return fallback(*args, **kwargs)
 
         # CUDA C++ extension path — handles both full-width and block-diagonal
-        # WHT via the block_size parameter, so partial-rotary q/k_proj layers
-        # use this path instead of falling through to _forward_cpu.
+        # WHT via the block_size parameter.
         if _cuda_mod is not None:
-            w_deq = torch.empty(self.out_features, self.in_features, dtype=x.dtype, device=x.device)
             block_size = self.rotary_dim if self.rotary_dim is not None else self.group_size
+
+            # Fused bs=1 GEMV path — skips materializing the full weight matrix.
+            # Read packed weights and accumulate into output in a single pass.
+            # Currently only the 3-bit kernel is built; bs>1 falls through.
+            if (
+                self.bits == 3
+                and _tq3_gemv_bs1_available
+                and x.dim() == 2
+                and x.shape[0] == 1
+                and x.dtype == torch.bfloat16
+            ):
+                if x.shape[-1] != self.padded_in:
+                    x = torch.nn.functional.pad(x, (0, self.padded_in - x.shape[-1]))
+                x_rot = forward_rotate_batched(
+                    x,
+                    self.tq_signs1,
+                    self.tq_signs2,
+                    self.group_size,
+                    block_size=self.rotary_dim,
+                )
+                packed_flat = self.packed_weight.view(self.out_features * self.n_groups, -1)
+                output = _cuda_mod.tq3_gemv_bs1(
+                    x_rot[0].contiguous(),
+                    packed_flat,
+                    self.norms_bf16,
+                    self.tq_centroids_bf16,
+                ).unsqueeze(0)
+                if self.bias is not None:
+                    output.add_(self.bias)
+                return output
+
+            w_deq = torch.empty(self.out_features, self.in_features, dtype=x.dtype, device=x.device)
             _cuda_mod.weight_dequant(
                 self.packed_weight,
                 self.norms,
