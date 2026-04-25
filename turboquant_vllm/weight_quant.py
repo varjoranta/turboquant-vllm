@@ -515,8 +515,9 @@ class TurboQuantWrapper(nn.Module):
         return output
 
     def _can_use_full_wht_kernels(self) -> bool:
-        # Triton and CUDA kernels assume full-width WHT on input; block-diag
-        # compression would produce incorrect output through them.
+        # Triton kernels assume full-width WHT on input. CUDA kernels accept a
+        # block_size parameter and handle both full-width and block-diagonal
+        # rotations, so they aren't gated by this — see _forward_gpu.
         return self.rotary_dim is None
 
     def _forward_gpu(self, x: torch.Tensor) -> torch.Tensor:
@@ -543,10 +544,12 @@ class TurboQuantWrapper(nn.Module):
             except (ValueError, RuntimeError):
                 return fallback(*args, **kwargs)
 
-        # CUDA C++ extension path — called via the compiled .so.
-        if _cuda_mod is not None and self._can_use_full_wht_kernels():
-            output_dtype = torch.float16 if x.dtype == torch.float16 else torch.float32
-            w_deq = torch.empty(self.out_features, self.in_features, dtype=output_dtype, device=x.device)
+        # CUDA C++ extension path — handles both full-width and block-diagonal
+        # WHT via the block_size parameter, so partial-rotary q/k_proj layers
+        # use this path instead of falling through to _forward_cpu.
+        if _cuda_mod is not None:
+            w_deq = torch.empty(self.out_features, self.in_features, dtype=x.dtype, device=x.device)
+            block_size = self.rotary_dim if self.rotary_dim is not None else self.group_size
             _cuda_mod.weight_dequant(
                 self.packed_weight,
                 self.norms,
@@ -558,11 +561,9 @@ class TurboQuantWrapper(nn.Module):
                 self.bits,
                 self.out_features,
                 self.in_features,
-                self.group_size,  # block_size
+                block_size,
             )
 
-            if w_deq.dtype != x.dtype:
-                w_deq = w_deq.to(x.dtype)
             output = torch.matmul(x, w_deq.t())
             if self.bias is not None:
                 output = output + self.bias
@@ -697,15 +698,11 @@ class Compressed3D:
         ``out`` must have ``shape == self.shape`` and ``dtype == self.dtype``,
         and must be on the same device as ``self.packed``. Used by the
         TurboQuant MoE quant method's ``apply()`` hot path to avoid
-        per-forward bf16 allocation.
-
-        For bfloat16 targets the CUDA kernel's output dtype is float32,
-        so we need an intermediate fp32 buffer. The caller can pass a
-        pre-allocated ``fp32_scratch`` to avoid the per-call allocation
-        (critical under CUDA graph capture, where each ephemeral
-        allocation is baked into the replayed graph). If None, a fresh
-        fp32 buffer is allocated per call.
+        per-forward bf16 allocation. The CUDA kernel writes bf16/fp16 directly,
+        so ``fp32_scratch`` is unused — kept as a no-op kwarg for API
+        compatibility with callers that still pass it.
         """
+        del fp32_scratch  # unused — kept for API back-compat
         assert out.shape == self.shape, f"decompress_into expected shape {self.shape}, got {tuple(out.shape)}"
         assert out.dtype == self.dtype, f"decompress_into expected dtype {self.dtype}, got {out.dtype}"
         assert out.device == self.packed.device, (
@@ -718,17 +715,6 @@ class Compressed3D:
             return
 
         n_experts, out_dim, in_dim = self.shape
-        kernel_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
-        if kernel_dtype == self.dtype:
-            target = out
-        elif fp32_scratch is not None:
-            assert fp32_scratch.shape == self.shape
-            assert fp32_scratch.dtype == kernel_dtype
-            assert fp32_scratch.device == self.packed.device
-            target = fp32_scratch
-        else:
-            target = torch.empty(self.shape, dtype=kernel_dtype, device=self.packed.device)
-
         quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
         cuda_mod.weight_dequant_3d(
             self.packed,
@@ -736,7 +722,7 @@ class Compressed3D:
             quantizer.signs1,
             quantizer.signs2,
             quantizer.centroids,
-            target,
+            out,
             self.group_size,
             self.bits,
             n_experts,
@@ -744,8 +730,6 @@ class Compressed3D:
             in_dim,
             self.group_size,  # block_size — full-width WHT for MoE experts
         )
-        if target is not out:
-            out.copy_(target)
 
     def decompress_experts_into(
         self,
@@ -814,26 +798,19 @@ class Compressed3D:
         # Legacy fallback (wheel built without sparse kernel): scalar loop
         # via the full 3D kernel at n_experts=1. Breaks CUDA graphs; requires
         # enforce_eager=True on vLLM.
-        kernel_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
         groups_per_expert = out_dim * self.n_groups
         for e in torch.unique(active_experts).tolist():
             if e < 0 or e >= n_experts:
                 continue
             expert_packed = self.packed[e * groups_per_expert : (e + 1) * groups_per_expert]
             expert_norms = self.norms[e * out_dim : (e + 1) * out_dim]
-            if kernel_dtype == self.dtype:
-                target = out[e : e + 1]
-            elif fp32_scratch is not None:
-                target = fp32_scratch[e : e + 1]
-            else:
-                target = torch.empty(1, out_dim, in_dim, dtype=kernel_dtype, device=self.packed.device)
             cuda_mod.weight_dequant_3d(
                 expert_packed,
                 expert_norms,
                 quantizer.signs1,
                 quantizer.signs2,
                 quantizer.centroids,
-                target,
+                out[e : e + 1],
                 self.group_size,
                 self.bits,
                 1,
@@ -841,8 +818,6 @@ class Compressed3D:
                 in_dim,
                 self.group_size,  # block_size — full-width WHT for MoE experts
             )
-            if kernel_dtype != self.dtype:
-                out[e : e + 1].copy_(target)
 
     def decompress(self, buf: torch.Tensor | None = None) -> torch.Tensor:
         """Decompress back to (num_experts, out_dim, in_dim) at original dtype.
@@ -854,11 +829,10 @@ class Compressed3D:
         n_experts, out_dim, in_dim = self.shape
 
         if cuda_mod is not None and self.packed.is_cuda:
-            output_dtype = torch.float16 if self.dtype == torch.float16 else torch.float32
-            if buf is not None and buf.shape == (n_experts, out_dim, in_dim) and buf.dtype == output_dtype:
+            if buf is not None and buf.shape == (n_experts, out_dim, in_dim) and buf.dtype == self.dtype:
                 output = buf
             else:
-                output = torch.empty(n_experts, out_dim, in_dim, dtype=output_dtype, device=self.packed.device)
+                output = torch.empty(n_experts, out_dim, in_dim, dtype=self.dtype, device=self.packed.device)
             quantizer = _get_quantizer(self.group_size, self.bits, str(self.packed.device))
             cuda_mod.weight_dequant_3d(
                 self.packed,
@@ -874,7 +848,7 @@ class Compressed3D:
                 in_dim,
                 self.group_size,  # block_size — full-width WHT for MoE experts
             )
-            return output.to(self.dtype)
+            return output
 
         # Fallback: chunked PyTorch (8 experts at a time)
         output_dtype = self.dtype
