@@ -64,6 +64,31 @@ def test_forward_rotate_block_diag_isolation() -> None:
     assert block1.abs().max() < 1e-6, f"block 1 contaminated: {block1.abs().max().item()}"
 
 
+def test_forward_rotate_preserves_dtype_when_signs_match_x() -> None:
+    """If signs are pre-cast to x's dtype, output dtype matches x.
+
+    Regression test: passing fp32 signs against bf16 x auto-promotes the
+    result to fp32 (PyTorch type-promotion rules), and downstream kernels
+    with strict dtype checks (e.g. tq3_gemv_bs1 requires bf16 input) will
+    reject the promoted tensor at runtime. Callers must hand in dtype-
+    matched signs.
+    """
+    torch.manual_seed(4)
+    group_size = 128
+    pq = PolarQuantTorch(dim=group_size, bit_width=3, device="cpu")
+
+    x_bf16 = torch.randn(1, group_size, dtype=torch.bfloat16)
+    s1_bf16 = pq.signs1.to(torch.bfloat16)
+    s2_bf16 = pq.signs2.to(torch.bfloat16)
+    out = forward_rotate_batched(x_bf16, s1_bf16, s2_bf16, group_size, block_size=None)
+    assert out.dtype == torch.bfloat16
+
+    # And the canary: with fp32 signs against bf16 x, output IS promoted to
+    # fp32. This is the surprise that broke `_forward_gpu` on first GPU run.
+    out_promoted = forward_rotate_batched(x_bf16, pq.signs1, pq.signs2, group_size, block_size=None)
+    assert out_promoted.dtype == torch.float32
+
+
 def test_forward_rotate_preserves_shape_with_extra_groups() -> None:
     """Multi-group input — output shape preserved, each group rotated independently."""
     torch.manual_seed(3)

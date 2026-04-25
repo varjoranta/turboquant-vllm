@@ -434,11 +434,13 @@ class TurboQuantWrapper(nn.Module):
 
         self.register_buffer("packed_weight", packed)
         self.register_buffer("norms", norms)
-        # bf16 caches for the fused tq3_gemv_bs1 path. The norm tensor is small
-        # (out_features × n_groups), so the extra ~50% memory cost is
-        # negligible relative to the packed weights themselves.
+        # bf16 caches for the fused tq3_gemv_bs1 path. signs match the
+        # activation dtype so forward_rotate_batched doesn't auto-promote
+        # the result to fp32 (the kernel rejects non-bf16 input).
         self.register_buffer("norms_bf16", norms.to(torch.bfloat16).contiguous())
         self.register_buffer("tq_centroids_bf16", self.tq_centroids.to(torch.bfloat16).contiguous())
+        self.register_buffer("tq_signs1_bf16", self.tq_signs1.to(torch.bfloat16).contiguous())
+        self.register_buffer("tq_signs2_bf16", self.tq_signs2.to(torch.bfloat16).contiguous())
 
         if original.bias is not None:
             bias_data = original.bias.data
@@ -508,6 +510,8 @@ class TurboQuantWrapper(nn.Module):
         wrapper.register_buffer("tq_signs2", _pq.signs2)
         wrapper.register_buffer("tq_centroids", _pq.centroids)
         wrapper.register_buffer("tq_centroids_bf16", _pq.centroids.to(torch.bfloat16).contiguous())
+        wrapper.register_buffer("tq_signs1_bf16", _pq.signs1.to(torch.bfloat16).contiguous())
+        wrapper.register_buffer("tq_signs2_bf16", _pq.signs2.to(torch.bfloat16).contiguous())
 
         original_bytes = out_features * in_features * 2  # FP16 equivalent
         compressed_bytes = packed_weight.numel() + norms.numel() * norms.element_size()
@@ -575,8 +579,8 @@ class TurboQuantWrapper(nn.Module):
                     x = torch.nn.functional.pad(x, (0, self.padded_in - x.shape[-1]))
                 x_rot = forward_rotate_batched(
                     x,
-                    self.tq_signs1,
-                    self.tq_signs2,
+                    self.tq_signs1_bf16,
+                    self.tq_signs2_bf16,
                     self.group_size,
                     block_size=self.rotary_dim,
                 )
