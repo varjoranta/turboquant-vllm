@@ -63,6 +63,19 @@ def _ensure_triton_backends() -> bool:
     return _triton_available
 
 
+def _select_tq_fns(out_features: int):
+    """Pick (primary, fallback) Triton kernels for a layer's output width.
+
+    FWHT-on-input wins for large output dims (saves N inverse rotations);
+    dequant-GEMM wins for small layers (lower fixed overhead). Crossover
+    measured ~4K output features on H100. Caller must have invoked
+    ``_ensure_triton_backends()`` first.
+    """
+    if out_features >= 4096:
+        return _tq_fwht_input_fn, _tq_fused_gemm_fn
+    return _tq_fused_gemm_fn, _tq_fwht_input_fn
+
+
 def _resolve_module(root, dotted_path: str):
     """Navigate a module tree by dotted path, returning the final attribute."""
     obj = root
@@ -429,37 +442,7 @@ class TurboQuantWrapper(nn.Module):
 
         self.register_buffer("packed_weight", packed)
         self.register_buffer("norms", norms)
-
-        # Pre-allocate per-instance state read by the fullgraph-compiled
-        # forward path. Selecting the kernel and the dequant scratch
-        # buffer at init keeps CUDA-graph captures stable across replays:
-        # without these, _forward_gpu's torch.empty + try/except path
-        # caused 2,226 cudaGraphInstantiateWithFlags calls and 14M
-        # cudaLaunchKernel invocations on Qwen3.6-35B-A3B-TQ3
-        # (nsys-post-v013-profile-2026-04-24.md).
-        self._pad_amount = self.padded_in - in_dim
-        if _triton_available and self.rotary_dim is None:
-            # Triton fast path. Choice is constant per layer — FWHT-on-input
-            # wins for large output dims, dequant-GEMM for small. Crossover
-            # ~4K output features on H100.
-            self._tq_primary_fn = (
-                _tq_fwht_input_fn if self.out_features >= 4096 else _tq_fused_gemm_fn
-            )
-        else:
-            self._tq_primary_fn = None
-            # Partial-rotary or no-Triton path: pre-allocate the dequant
-            # scratch as a buffer so CUDA-graph replays see a stable pointer.
-            if _cuda_mod is not None:
-                self.register_buffer(
-                    "_w_deq_scratch",
-                    torch.empty(
-                        self.out_features,
-                        self.in_features,
-                        dtype=weight.dtype,
-                        device=weight.device,
-                    ),
-                    persistent=False,
-                )
+        self._init_forward_state(weight.dtype, weight.device)
 
         if original.bias is not None:
             bias_data = original.bias.data
@@ -528,34 +511,38 @@ class TurboQuantWrapper(nn.Module):
         wrapper.register_buffer("tq_signs1", _pq.signs1)
         wrapper.register_buffer("tq_signs2", _pq.signs2)
         wrapper.register_buffer("tq_centroids", _pq.centroids)
-
-        # Mirror __init__: select kernel and pre-allocate scratch at init.
-        # See the matching block in __init__ for rationale.
-        wrapper._pad_amount = wrapper.padded_in - in_features
-        wrapper.rotary_dim = None
-        if _triton_available:
-            wrapper._tq_primary_fn = (
-                _tq_fwht_input_fn if wrapper.out_features >= 4096 else _tq_fused_gemm_fn
-            )
-        else:
-            wrapper._tq_primary_fn = None
-            if _cuda_mod is not None:
-                wrapper.register_buffer(
-                    "_w_deq_scratch",
-                    torch.empty(
-                        wrapper.out_features,
-                        wrapper.in_features,
-                        dtype=compute_dtype,
-                        device=packed_weight.device,
-                    ),
-                    persistent=False,
-                )
+        wrapper._init_forward_state(compute_dtype, packed_weight.device)
 
         original_bytes = out_features * in_features * 2  # FP16 equivalent
         compressed_bytes = packed_weight.numel() + norms.numel() * norms.element_size()
         wrapper._ratio = original_bytes / max(compressed_bytes, 1)
 
         return wrapper
+
+    def _init_forward_state(self, compute_dtype: torch.dtype, device) -> None:
+        """Bind kernel choice + dequant scratch + pad amount as instance state.
+
+        Called from ``__init__`` and ``from_packed`` after buffer registration.
+        Keeps ``_forward_gpu`` free of per-call decisions so vLLM 0.19's CUDA
+        graph capture sees stable buffer pointers and no Python branches.
+        """
+        self._pad_amount = self.padded_in - self.in_features
+        self._w_deq_scratch = None
+        if _triton_available and self.rotary_dim is None:
+            self._tq_primary_fn, _ = _select_tq_fns(self.out_features)
+        else:
+            self._tq_primary_fn = None
+            if _cuda_mod is not None:
+                self.register_buffer(
+                    "_w_deq_scratch",
+                    torch.empty(
+                        self.out_features,
+                        self.in_features,
+                        dtype=compute_dtype,
+                        device=device,
+                    ),
+                    persistent=False,
+                )
 
     def forward(self, x: torch.Tensor):
         # Trivial dispatch that dynamo can specialize on x.is_cuda when

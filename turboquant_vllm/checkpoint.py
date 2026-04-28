@@ -526,6 +526,7 @@ def load_tq3_model(checkpoint_dir: str, device: str = "cuda"):
             bits=tensor_bits,
             group_size=group_size,
             bias=bias,
+            compute_dtype=meta_module.weight.dtype,
         )
 
         parent, attr = _resolve_parent_and_attr(model, mod_path)

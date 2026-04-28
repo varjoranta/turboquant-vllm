@@ -169,8 +169,7 @@ def register():
                 _ensure_triton_backends,
                 _get_cuda_module,
                 _get_quantizer,
-                _tq_fused_gemm_fn,
-                _tq_fwht_input_fn,
+                _select_tq_fns,
                 _triton_available,
                 pack_indices,
                 padded_size,
@@ -235,8 +234,7 @@ def register():
             _ensure_triton_backends()
             _get_cuda_module()
             if _triton_available:
-                layer._tq_primary_fn = _tq_fwht_input_fn if out_dim >= 4096 else _tq_fused_gemm_fn
-                layer._tq_fallback_fn = _tq_fused_gemm_fn if out_dim >= 4096 else _tq_fwht_input_fn
+                layer._tq_primary_fn, layer._tq_fallback_fn = _select_tq_fns(out_dim)
             else:
                 layer._tq_primary_fn = None
 
