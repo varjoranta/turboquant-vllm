@@ -430,6 +430,37 @@ class TurboQuantWrapper(nn.Module):
         self.register_buffer("packed_weight", packed)
         self.register_buffer("norms", norms)
 
+        # Pre-allocate per-instance state read by the fullgraph-compiled
+        # forward path. Selecting the kernel and the dequant scratch
+        # buffer at init keeps CUDA-graph captures stable across replays:
+        # without these, _forward_gpu's torch.empty + try/except path
+        # caused 2,226 cudaGraphInstantiateWithFlags calls and 14M
+        # cudaLaunchKernel invocations on Qwen3.6-35B-A3B-TQ3
+        # (nsys-post-v013-profile-2026-04-24.md).
+        self._pad_amount = self.padded_in - in_dim
+        if _triton_available and self.rotary_dim is None:
+            # Triton fast path. Choice is constant per layer — FWHT-on-input
+            # wins for large output dims, dequant-GEMM for small. Crossover
+            # ~4K output features on H100.
+            self._tq_primary_fn = (
+                _tq_fwht_input_fn if self.out_features >= 4096 else _tq_fused_gemm_fn
+            )
+        else:
+            self._tq_primary_fn = None
+            # Partial-rotary or no-Triton path: pre-allocate the dequant
+            # scratch as a buffer so CUDA-graph replays see a stable pointer.
+            if _cuda_mod is not None:
+                self.register_buffer(
+                    "_w_deq_scratch",
+                    torch.empty(
+                        self.out_features,
+                        self.in_features,
+                        dtype=weight.dtype,
+                        device=weight.device,
+                    ),
+                    persistent=False,
+                )
+
         if original.bias is not None:
             bias_data = original.bias.data
             if bias_data.ndim > 1:
@@ -463,6 +494,7 @@ class TurboQuantWrapper(nn.Module):
         bits: int = 3,
         group_size: int = 128,
         bias: torch.Tensor | None = None,
+        compute_dtype: torch.dtype = torch.bfloat16,
     ):
         """Create a TurboQuantWrapper from pre-packed data (native TQ3 checkpoint).
 
@@ -497,6 +529,28 @@ class TurboQuantWrapper(nn.Module):
         wrapper.register_buffer("tq_signs2", _pq.signs2)
         wrapper.register_buffer("tq_centroids", _pq.centroids)
 
+        # Mirror __init__: select kernel and pre-allocate scratch at init.
+        # See the matching block in __init__ for rationale.
+        wrapper._pad_amount = wrapper.padded_in - in_features
+        wrapper.rotary_dim = None
+        if _triton_available:
+            wrapper._tq_primary_fn = (
+                _tq_fwht_input_fn if wrapper.out_features >= 4096 else _tq_fused_gemm_fn
+            )
+        else:
+            wrapper._tq_primary_fn = None
+            if _cuda_mod is not None:
+                wrapper.register_buffer(
+                    "_w_deq_scratch",
+                    torch.empty(
+                        wrapper.out_features,
+                        wrapper.in_features,
+                        dtype=compute_dtype,
+                        device=packed_weight.device,
+                    ),
+                    persistent=False,
+                )
+
         original_bytes = out_features * in_features * 2  # FP16 equivalent
         compressed_bytes = packed_weight.numel() + norms.numel() * norms.element_size()
         wrapper._ratio = original_bytes / max(compressed_bytes, 1)
@@ -526,29 +580,30 @@ class TurboQuantWrapper(nn.Module):
         Must NOT contain logger calls, calls to @torch._dynamo.disable'd
         helpers, or method calls on non-tensor Python objects that do dict
         lookups / string conversions. vLLM 0.19 AOT-compiles this path.
-        """
-        if _triton_available and x.is_cuda and self._can_use_full_wht_kernels():
-            # Pad input if in_features was not a multiple of group_size
-            if x.shape[-1] != self.padded_in:
-                x = torch.nn.functional.pad(x, (0, self.padded_in - x.shape[-1]))
-            args = (x, self.packed_weight, self.norms, self.tq_signs1, self.tq_signs2, self.tq_centroids)
-            kwargs = dict(group_size=self.group_size, bits=self.bits, bias=self.bias)
 
-            # FWHT-on-input wins for large output dims (saves N inverse rotations).
-            # Dequant-GEMM wins for small layers (lower fixed overhead).
-            # Crossover ~4K output features on H100.
-            primary = _tq_fwht_input_fn if self.out_features >= 4096 else _tq_fused_gemm_fn
-            fallback = _tq_fused_gemm_fn if self.out_features >= 4096 else _tq_fwht_input_fn
-            try:
-                return primary(*args, **kwargs)
-            except (ValueError, RuntimeError):
-                return fallback(*args, **kwargs)
+        Per-call state — kernel choice, pad amount, scratch buffer — is
+        captured at __init__ time so CUDA-graph replay sees stable values.
+        """
+        if self._tq_primary_fn is not None and x.is_cuda:
+            if self._pad_amount:
+                x = torch.nn.functional.pad(x, (0, self._pad_amount))
+            return self._tq_primary_fn(
+                x,
+                self.packed_weight,
+                self.norms,
+                self.tq_signs1,
+                self.tq_signs2,
+                self.tq_centroids,
+                group_size=self.group_size,
+                bits=self.bits,
+                bias=self.bias,
+            )
 
         # CUDA C++ extension path — handles both full-width and block-diagonal
         # WHT via the block_size parameter, so partial-rotary q/k_proj layers
         # use this path instead of falling through to _forward_cpu.
-        if _cuda_mod is not None:
-            w_deq = torch.empty(self.out_features, self.in_features, dtype=x.dtype, device=x.device)
+        if _cuda_mod is not None and x.is_cuda:
+            w_deq = self._w_deq_scratch
             block_size = self.rotary_dim if self.rotary_dim is not None else self.group_size
             _cuda_mod.weight_dequant(
                 self.packed_weight,
