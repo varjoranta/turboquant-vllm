@@ -220,7 +220,20 @@ try:
         )
 
     @_tq_cuda_dequant_gemm_op.register_fake
-    def _(x, packed_weight, norms, signs1, signs2, centroids, bias, group_size, bits, out_features, in_features, block_size):
+    def _(
+        x,
+        packed_weight,
+        norms,
+        signs1,
+        signs2,
+        centroids,
+        bias,
+        group_size,
+        bits,
+        out_features,
+        in_features,
+        block_size,
+    ):
         del packed_weight, norms, signs1, signs2, centroids, bias, group_size, bits, in_features, block_size
         return x.new_empty((*x.shape[:-1], out_features))
 
