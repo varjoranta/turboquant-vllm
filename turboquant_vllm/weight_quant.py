@@ -34,6 +34,7 @@ _cuda_available = None
 _triton_available = None
 _tq_fused_gemm_fn = None
 _tq_fwht_input_fn = None
+_tq_cuda_dequant_gemm_fn = None
 
 
 def _ensure_triton_backends() -> bool:
@@ -149,6 +150,83 @@ def _get_quantizer(
         _quantizers[key] = quantizer
 
     return quantizer
+
+
+def _tq_cuda_dequant_gemm_impl(
+    x: torch.Tensor,
+    packed_weight: torch.Tensor,
+    norms: torch.Tensor,
+    signs1: torch.Tensor,
+    signs2: torch.Tensor,
+    centroids: torch.Tensor,
+    bias: torch.Tensor | None,
+    group_size: int,
+    bits: int,
+    out_features: int,
+    in_features: int,
+    block_size: int,
+) -> torch.Tensor:
+    """CUDA fallback path wrapped for torch.compile compatibility."""
+    w_deq = torch.empty(out_features, in_features, dtype=x.dtype, device=x.device)
+    _cuda_mod.weight_dequant(
+        packed_weight,
+        norms,
+        signs1,
+        signs2,
+        centroids,
+        w_deq,
+        group_size,
+        bits,
+        out_features,
+        in_features,
+        block_size,
+    )
+    output = torch.matmul(x, w_deq.t())
+    if bias is not None:
+        output = output + bias
+    return output
+
+
+try:
+
+    @torch.library.custom_op("turboquant::tq_cuda_dequant_gemm", mutates_args=(), device_types=("cuda",))
+    def _tq_cuda_dequant_gemm_op(
+        x: torch.Tensor,
+        packed_weight: torch.Tensor,
+        norms: torch.Tensor,
+        signs1: torch.Tensor,
+        signs2: torch.Tensor,
+        centroids: torch.Tensor,
+        bias: torch.Tensor | None,
+        group_size: int,
+        bits: int,
+        out_features: int,
+        in_features: int,
+        block_size: int,
+    ) -> torch.Tensor:
+        return _tq_cuda_dequant_gemm_impl(
+            x,
+            packed_weight,
+            norms,
+            signs1,
+            signs2,
+            centroids,
+            bias,
+            group_size,
+            bits,
+            out_features,
+            in_features,
+            block_size,
+        )
+
+    @_tq_cuda_dequant_gemm_op.register_fake
+    def _(x, packed_weight, norms, signs1, signs2, centroids, bias, group_size, bits, out_features, in_features, block_size):
+        del packed_weight, norms, signs1, signs2, centroids, bias, group_size, bits, in_features, block_size
+        return x.new_empty((*x.shape[:-1], out_features))
+
+    _tq_cuda_dequant_gemm_fn = _tq_cuda_dequant_gemm_op
+except Exception:
+    _tq_cuda_dequant_gemm_fn = None
 
 
 _PARTIAL_ROTARY_ALIASES = (
@@ -547,27 +625,22 @@ class TurboQuantWrapper(nn.Module):
         # CUDA C++ extension path — handles both full-width and block-diagonal
         # WHT via the block_size parameter, so partial-rotary q/k_proj layers
         # use this path instead of falling through to _forward_cpu.
-        if _cuda_mod is not None:
-            w_deq = torch.empty(self.out_features, self.in_features, dtype=x.dtype, device=x.device)
+        if _cuda_mod is not None and _tq_cuda_dequant_gemm_fn is not None:
             block_size = self.rotary_dim if self.rotary_dim is not None else self.group_size
-            _cuda_mod.weight_dequant(
+            return _tq_cuda_dequant_gemm_fn(
+                x,
                 self.packed_weight,
                 self.norms,
                 self.tq_signs1,
                 self.tq_signs2,
                 self.tq_centroids,
-                w_deq,
+                self.bias,
                 self.group_size,
                 self.bits,
                 self.out_features,
                 self.in_features,
                 block_size,
             )
-
-            output = torch.matmul(x, w_deq.t())
-            if self.bias is not None:
-                output = output + self.bias
-            return output
 
         # PolarQuantTorch fallback — honors self.rotary_dim via _apply_wht.
         return self._forward_cpu(x)
