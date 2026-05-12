@@ -18,6 +18,7 @@ serializes closure-defined classes by value, transitively pulling in
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import torch
@@ -65,7 +66,13 @@ if LinearBase is not None:
     class TurboQuantConfig(QuantizationConfig):
         """Config for TurboQuant weight quantization (TQ3/TQ4)."""
 
-        def __init__(self, bits: int = 3, group_size: int = 128, sensitive_bits: int | None = None):
+        def __init__(
+            self,
+            bits: int = 3,
+            group_size: int = 128,
+            sensitive_bits: int | None = None,
+            native_packed: bool = False,
+        ):
             super().__init__()
             if bits not in (2, 3, 4):
                 raise ValueError(f"turboquant bits must be 2, 3, or 4; got {bits}")
@@ -76,11 +83,12 @@ if LinearBase is not None:
             self.bits = bits
             self.group_size = group_size
             self.sensitive_bits = sensitive_bits
+            self.native_packed = native_packed
 
         def __repr__(self) -> str:
             return (
                 f"TurboQuantConfig(bits={self.bits}, group_size={self.group_size}, "
-                f"sensitive_bits={self.sensitive_bits})"
+                f"sensitive_bits={self.sensitive_bits}, native_packed={self.native_packed})"
             )
 
         def get_name(self) -> str:
@@ -102,7 +110,13 @@ if LinearBase is not None:
             bits = cls.get_from_keys_or(config, ["bits"], 3)
             group_size = cls.get_from_keys_or(config, ["group_size"], 128)
             sensitive_bits = cls.get_from_keys_or(config, ["sensitive_bits"], None)
-            return cls(bits=bits, group_size=group_size, sensitive_bits=sensitive_bits)
+            native_packed = config.get("format") == "tq3_native"
+            return cls(
+                bits=bits,
+                group_size=group_size,
+                sensitive_bits=sensitive_bits,
+                native_packed=native_packed,
+            )
 
         def get_quant_method(self, layer: nn.Module, prefix: str) -> "QuantizeMethodBase | None":
             if isinstance(layer, LinearBase):
@@ -115,6 +129,7 @@ if LinearBase is not None:
                         self.bits,
                         self.group_size,
                         layer.moe_config,
+                        native_packed=self.native_packed,
                     )
             except ImportError:
                 pass
@@ -192,9 +207,10 @@ if LinearBase is not None:
                 padded_size,
             )
 
-            weight = layer.weight.data
             bits = self.bits
             group_size = self.group_size
+
+            weight = layer.weight.data
 
             out_dim, in_dim = weight.shape
             padded_in, n_groups = padded_size(in_dim, group_size)
@@ -384,6 +400,116 @@ def _materialize_and_process(
     method._do_compress(layer)
 
 
+def _finalize_native_packed_moe(
+    layer,
+    method,
+    param_shapes,
+    param_dtypes,
+):
+    """Bind native packed MoE tensors directly to Compressed3D objects."""
+    global _shared_moe_scratch_pool
+
+    from turboquant_vllm.moe_quant import (
+        _HAS_FUSED_MOE,
+        TurboQuantFusedMoEMethod,
+        TurboQuantFusedMoEScratchPool,
+        _collect_meta_tensors,
+    )
+    from turboquant_vllm.weight_quant import Compressed3D, packed_group_bytes, padded_size
+
+    def _bind_real_weight_param(name: str, tensor: torch.Tensor) -> None:
+        real_param = torch.nn.Parameter(tensor, requires_grad=False)
+        if hasattr(layer, name):
+            delattr(layer, name)
+        layer.register_parameter(name, real_param)
+
+    def _normalize_packed_layout(packed: torch.Tensor, shape: tuple[int, int, int]) -> torch.Tensor:
+        n_experts, out_dim, in_dim = shape
+        total_rows = n_experts * out_dim
+        _, n_groups = padded_size(in_dim, method.group_size)
+        pgb = packed_group_bytes(method.bits, method.group_size)
+
+        if packed.ndim != 2:
+            raise ValueError(f"Expected 2D packed tensor for shape {shape}, got {tuple(packed.shape)}")
+        if packed.shape == (total_rows * n_groups, pgb):
+            return packed
+        if packed.shape == (total_rows, n_groups * pgb):
+            return packed.reshape(total_rows * n_groups, pgb)
+        raise ValueError(
+            "Unsupported native packed layout for "
+            f"{shape}: got {tuple(packed.shape)}, expected "
+            f"({total_rows * n_groups}, {pgb}) or ({total_rows}, {n_groups * pgb})"
+        )
+
+    w13_c = Compressed3D.from_packed(
+        _normalize_packed_layout(getattr(layer, "w13_weight_tq_packed").data, param_shapes["w13_weight"]),
+        getattr(layer, "w13_weight_tq_norms").data,
+        shape=param_shapes["w13_weight"],
+        dtype=param_dtypes["w13_weight"],
+        bits=method.bits,
+        group_size=method.group_size,
+    )
+    w2_c = Compressed3D.from_packed(
+        _normalize_packed_layout(getattr(layer, "w2_weight_tq_packed").data, param_shapes["w2_weight"]),
+        getattr(layer, "w2_weight_tq_norms").data,
+        shape=param_shapes["w2_weight"],
+        dtype=param_dtypes["w2_weight"],
+        bits=method.bits,
+        group_size=method.group_size,
+    )
+
+    method._w13_c = w13_c
+    method._w2_c = w2_c
+    setattr(layer, "_tq_w13_weight", w13_c)
+    setattr(layer, "_tq_w2_weight", w2_c)
+
+    if _shared_moe_scratch_pool is None:
+        _shared_moe_scratch_pool = TurboQuantFusedMoEScratchPool(w13_c, w2_c)
+    else:
+        _shared_moe_scratch_pool.assert_matches(w13_c, w2_c)
+
+    pool = _shared_moe_scratch_pool
+    method._pool = pool
+    _bind_real_weight_param("w13_weight", pool.w13)
+    _bind_real_weight_param("w2_weight", pool.w2)
+
+    method._unquant.process_weights_after_loading(layer)
+    # vLLM's MoE post-processing may replace the parameter objects while
+    # setting up the kernel/runtime layout. Re-bind the final parameters to
+    # real CUDA tensors here so later flashinfer packing never sees meta.
+    _bind_real_weight_param("w13_weight", pool.w13)
+    _bind_real_weight_param("w2_weight", pool.w2)
+    if _HAS_FUSED_MOE and hasattr(layer, "_replace_quant_method"):
+        layer.base_quant_method = method._unquant
+        layer._replace_quant_method(
+            TurboQuantFusedMoEMethod(layer.moe_config, w13_c, w2_c, pool)
+        )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        meta_hits = []
+        meta_hits.extend(_collect_meta_tensors(layer.w13_weight, "layer.w13_weight"))
+        meta_hits.extend(_collect_meta_tensors(layer.w2_weight, "layer.w2_weight"))
+        meta_hits.extend(_collect_meta_tensors(getattr(layer, "expert_map", None), "layer.expert_map"))
+        meta_hits.extend(_collect_meta_tensors(getattr(layer, "base_quant_method", None), "layer.base_quant_method"))
+        if meta_hits:
+            raise RuntimeError(
+                "TurboQuant detected meta tensors after native MoE finalize: "
+                + "; ".join(meta_hits[:20])
+            )
+
+    for name in (
+        "w13_weight_tq_packed",
+        "w13_weight_tq_norms",
+        "w2_weight_tq_packed",
+        "w2_weight_tq_norms",
+    ):
+        if hasattr(layer, name):
+            delattr(layer, name)
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
 
     class TurboQuantOnlineMoEMethod(FusedMoEMethodBase):
@@ -397,10 +523,11 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
 
         uses_meta_device: bool = True
 
-        def __init__(self, bits: int, group_size: int, moe_config: Any):
+        def __init__(self, bits: int, group_size: int, moe_config: Any, native_packed: bool = False):
             super().__init__(moe_config)
             self.bits = bits
             self.group_size = group_size
+            self.native_packed = native_packed
             self._unquant = UnquantizedFusedMoEMethod(moe_config)
             self._pool = None
             self._w13_c = None
@@ -436,6 +563,81 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                             setattr(meta_param, attr, getattr(param, attr))
                     delattr(layer, name)
                     layer.register_parameter(name, meta_param)
+
+            if self.native_packed:
+                from turboquant_vllm.weight_quant import packed_group_bytes, padded_size
+
+                num_experts, w13_out_dim, w13_in_dim = param_shapes["w13_weight"]
+                _, w2_out_dim, w2_in_dim = param_shapes["w2_weight"]
+                _, w13_groups = padded_size(w13_in_dim, self.group_size)
+                _, w2_groups = padded_size(w2_in_dim, self.group_size)
+                pgb = packed_group_bytes(self.bits, self.group_size)
+                native_required = {
+                    "w13_weight_tq_packed",
+                    "w13_weight_tq_norms",
+                    "w2_weight_tq_packed",
+                    "w2_weight_tq_norms",
+                }
+                native_loaded: set[str] = set()
+                native_finalized = [False]
+
+                def _register_native_packed_param(name: str, shape: tuple[int, ...], dtype: torch.dtype):
+                    param = torch.nn.Parameter(
+                        torch.empty(shape, device="meta", dtype=dtype),
+                        requires_grad=False,
+                    )
+
+                    def _loader(_param, loaded_weight, **_kwargs):
+                        target_device = loaded_weight.device
+                        if torch.cuda.is_available() and target_device.type != "cuda":
+                            target_device = torch.device("cuda", torch.cuda.current_device())
+                        materialized = loaded_weight.to(device=target_device, copy=(loaded_weight.device != target_device))
+                        real_param = torch.nn.Parameter(materialized, requires_grad=False)
+                        real_param.weight_loader = _loader
+                        delattr(layer, name)
+                        layer.register_parameter(name, real_param)
+                        native_loaded.add(name)
+                        if not native_finalized[0] and native_loaded >= native_required:
+                            native_finalized[0] = True
+                            _finalize_native_packed_moe(
+                                layer,
+                                self,
+                                {
+                                    "w13_weight": param_shapes["w13_weight"],
+                                    "w2_weight": param_shapes["w2_weight"],
+                                },
+                                {
+                                    "w13_weight": param_dtypes["w13_weight"],
+                                    "w2_weight": param_dtypes["w2_weight"],
+                                },
+                            )
+                        del loaded_weight
+                        return True
+
+                    param.weight_loader = _loader
+                    layer.register_parameter(name, param)
+
+                _register_native_packed_param(
+                    "w13_weight_tq_packed",
+                    (num_experts * w13_out_dim, w13_groups * pgb),
+                    torch.uint8,
+                )
+                _register_native_packed_param(
+                    "w13_weight_tq_norms",
+                    (num_experts * w13_out_dim, w13_groups),
+                    torch.float32,
+                )
+                _register_native_packed_param(
+                    "w2_weight_tq_packed",
+                    (num_experts * w2_out_dim, w2_groups * pgb),
+                    torch.uint8,
+                )
+                _register_native_packed_param(
+                    "w2_weight_tq_norms",
+                    (num_experts * w2_out_dim, w2_groups),
+                    torch.float32,
+                )
+                return
 
             # Custom per-module buffering — bypass initialize_online_processing.
             # vLLM's online processing (CopyCounter) doesn't reliably
@@ -514,6 +716,22 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                 torch.cuda.empty_cache()
 
         def process_weights_after_loading(self, layer: nn.Module) -> None:
+            if self.native_packed:
+                if not hasattr(layer, "_tq_w13_weight"):
+                    _finalize_native_packed_moe(
+                        layer,
+                        self,
+                        {
+                            "w13_weight": tuple(layer.w13_weight.shape),
+                            "w2_weight": tuple(layer.w2_weight.shape),
+                        },
+                        {
+                            "w13_weight": layer.w13_weight.dtype,
+                            "w2_weight": layer.w2_weight.dtype,
+                        },
+                    )
+                return
+
             # Compression handled by _materialize_and_process (triggered
             # by buffering loader). This guard handles the global sweep.
             if not hasattr(layer, "_tq_w13_weight"):
@@ -526,17 +744,20 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
             return self._unquant.get_fused_moe_quant_config(layer)
 
         def apply(self, layer: nn.Module, x: torch.Tensor, **kwargs) -> torch.Tensor:
-            # Decompress into shared scratch pool, then delegate to
-            # the unquantized method which has the MoE kernel.
-            if self._pool is not None and self._w13_c is not None:
-                self._w13_c.decompress_into(
-                    self._pool.w13,
-                    fp32_scratch=self._pool.w13_fp32,
+            if self._pool is None or self._w13_c is None or self._w2_c is None:
+                raise AssertionError(
+                    "TurboQuantOnlineMoEMethod.apply requires compressed MoE weights and scratch pool. "
+                    "Expected process_weights_after_loading to initialize the fallback state."
                 )
-                self._w2_c.decompress_into(
-                    self._pool.w2,
-                    fp32_scratch=self._pool.w2_fp32,
-                )
+
+            self._w13_c.decompress_into(
+                self._pool.w13,
+                fp32_scratch=self._pool.w13_fp32,
+            )
+            self._w2_c.decompress_into(
+                self._pool.w2,
+                fp32_scratch=self._pool.w2_fp32,
+            )
             return self._unquant.apply(layer, x, **kwargs)
 
 else:
@@ -570,6 +791,218 @@ _FP8_LEFTOVER_SCALE_SUFFIXES = (
     ".weight_scale",
     ".input_scale",
 )
+
+_EXPERT_INDEX_PATTERN = re.compile(r"^(.+?)\.experts\.(\d+)\.(.+)$")
+_NATIVE_MOE_PROJ_FUSION = {
+    "gate_proj": "w13_weight",
+    "up_proj": "w13_weight",
+    "down_proj": "w2_weight",
+    "w1": "w13_weight",
+    "w3": "w13_weight",
+    "w2": "w2_weight",
+}
+_NATIVE_MOE_PROJ_ORDER = {
+    "gate_proj": 0,
+    "up_proj": 1,
+    "down_proj": 0,
+    "w1": 0,
+    "w3": 1,
+    "w2": 0,
+}
+_NATIVE_MOE_REQUIRED_ORDERS = {
+    "w13_weight": {0, 1},
+    "w2_weight": {0},
+}
+
+
+def _resolve_module(root, dotted_path: str):
+    obj = root
+    for part in dotted_path.split("."):
+        try:
+            obj = getattr(obj, part)
+        except (AttributeError, TypeError):
+            obj = obj[int(part)]
+    return obj
+
+
+def _resolve_parent_and_attr(root, dotted_path: str):
+    parts = dotted_path.split(".")
+    parent = _resolve_module(root, ".".join(parts[:-1])) if len(parts) > 1 else root
+    return parent, parts[-1]
+
+
+def _collect_meta_params(model) -> dict[str, tuple[nn.Module, str, torch.Tensor]]:
+    meta_params: dict[str, tuple[nn.Module, str, torch.Tensor]] = {}
+    for name, param in model.named_parameters():
+        try:
+            owner, attr = _resolve_parent_and_attr(model, name)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            continue
+        meta_params[name] = (owner, attr, param)
+    for name, buf in model.named_buffers():
+        try:
+            owner, attr = _resolve_parent_and_attr(model, name)
+        except (AttributeError, IndexError, TypeError, ValueError):
+            continue
+        meta_params[name] = (owner, attr, buf)
+    return meta_params
+
+
+def _regroup_native_moe_packed_tensors(
+    model,
+    packed_pairs: dict[str, dict[str, torch.Tensor]],
+) -> list[tuple[str, torch.Tensor]]:
+    """Regroup native per-expert TQ3 tensors into fused vLLM MoE targets."""
+    meta_params = _collect_meta_params(model)
+
+    regroup_map: dict[str, list[tuple[int, int, str]]] = {}
+    direct_targets: list[tuple[str, torch.Tensor]] = []
+    handled: set[str] = set()
+
+    for base_name, tensors in packed_pairs.items():
+        if "packed" not in tensors or "norms" not in tensors:
+            continue
+
+        if base_name in meta_params:
+            _, attr, meta_param = meta_params[base_name]
+            if len(meta_param.shape) == 3:
+                direct_targets.append((f"{base_name}_tq_packed", tensors["packed"]))
+                direct_targets.append((f"{base_name}_tq_norms", tensors["norms"]))
+                handled.add(base_name)
+                continue
+
+        match = _EXPERT_INDEX_PATTERN.match(base_name)
+        if not match:
+            continue
+
+        container_path = match.group(1) + ".experts"
+        expert_idx = int(match.group(2))
+        proj_suffix = match.group(3)
+        proj_name = proj_suffix.split(".")[0]
+        target_name = _NATIVE_MOE_PROJ_FUSION.get(proj_name)
+        if target_name is None:
+            continue
+
+        target_key = f"{container_path}.{target_name}"
+        if target_key not in meta_params:
+            continue
+
+        regroup_map.setdefault(target_key, []).append((_NATIVE_MOE_PROJ_ORDER[proj_name], expert_idx, base_name))
+        handled.add(base_name)
+
+    for target_key, entries in regroup_map.items():
+        _, _, meta_param = meta_params[target_key]
+        if len(meta_param.shape) != 3:
+            continue
+
+        n_experts_expected = meta_param.shape[0]
+        entries.sort()
+        expert_data: dict[int, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
+        for order, expert_idx, base_name in entries:
+            del order
+            tensors = packed_pairs.get(base_name)
+            if tensors is None:
+                continue
+            if expert_idx not in expert_data:
+                expert_data[expert_idx] = ([], [])
+            expert_data[expert_idx][0].append(tensors["packed"])
+            expert_data[expert_idx][1].append(tensors["norms"])
+
+        if len(expert_data) != n_experts_expected:
+            logger.warning(
+                "Native TQ3 MoE regroup skipped %s: model expects %d experts, saw %d",
+                target_key,
+                n_experts_expected,
+                len(expert_data),
+            )
+            continue
+
+        all_packed = []
+        all_norms = []
+        for expert_idx in sorted(expert_data):
+            packed_parts, norm_parts = expert_data[expert_idx]
+            all_packed.append(torch.cat(packed_parts, dim=0) if len(packed_parts) > 1 else packed_parts[0])
+            all_norms.append(torch.cat(norm_parts, dim=0) if len(norm_parts) > 1 else norm_parts[0])
+
+        direct_targets.append((f"{target_key}_tq_packed", torch.cat(all_packed, dim=0)))
+        direct_targets.append((f"{target_key}_tq_norms", torch.cat(all_norms, dim=0)))
+
+    return direct_targets
+
+
+def _maybe_flush_native_moe_target(
+    model,
+    base_name: str,
+    tensors: dict[str, torch.Tensor],
+    meta_params: dict[str, tuple[nn.Module, str, torch.Tensor]],
+    target_state: dict[str, dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]]],
+) -> list[tuple[str, torch.Tensor]]:
+    """Incrementally regroup one completed native MoE expert tensor pair.
+
+    This keeps memory bounded to roughly one fused MoE target at a time
+    instead of retaining every expert tensor in the checkpoint until the
+    iterator is exhausted.
+    """
+    if "packed" not in tensors or "norms" not in tensors:
+        return []
+
+    if base_name in meta_params:
+        _, _, meta_param = meta_params[base_name]
+        if len(meta_param.shape) == 3:
+            return [
+                (f"{base_name}_tq_packed", tensors["packed"]),
+                (f"{base_name}_tq_norms", tensors["norms"]),
+            ]
+
+    match = _EXPERT_INDEX_PATTERN.match(base_name)
+    if not match:
+        return []
+
+    container_path = match.group(1) + ".experts"
+    expert_idx = int(match.group(2))
+    proj_suffix = match.group(3)
+    proj_name = proj_suffix.split(".")[0]
+    target_name = _NATIVE_MOE_PROJ_FUSION.get(proj_name)
+    if target_name is None:
+        return []
+
+    target_key = f"{container_path}.{target_name}"
+    meta_entry = meta_params.get(target_key)
+    if meta_entry is None:
+        return []
+
+    _, _, meta_param = meta_entry
+    if len(meta_param.shape) != 3:
+        return []
+
+    order = _NATIVE_MOE_PROJ_ORDER[proj_name]
+    expert_map = target_state.setdefault(target_key, {})
+    expert_parts = expert_map.setdefault(expert_idx, {})
+    expert_parts[order] = (tensors["packed"], tensors["norms"])
+
+    required_orders = _NATIVE_MOE_REQUIRED_ORDERS[target_name]
+    n_experts_expected = meta_param.shape[0]
+    if len(expert_map) != n_experts_expected:
+        return []
+    if any(set(parts) != required_orders for parts in expert_map.values()):
+        return []
+
+    all_packed = []
+    all_norms = []
+    for idx in range(n_experts_expected):
+        parts = expert_map[idx]
+        packed_parts = [parts[o][0] for o in sorted(required_orders)]
+        norm_parts = [parts[o][1] for o in sorted(required_orders)]
+        all_packed.append(torch.cat(packed_parts, dim=0) if len(packed_parts) > 1 else packed_parts[0])
+        all_norms.append(torch.cat(norm_parts, dim=0) if len(norm_parts) > 1 else norm_parts[0])
+
+    del target_state[target_key]
+    packed_out = torch.cat(all_packed, dim=0)
+    norms_out = torch.cat(all_norms, dim=0)
+    return [
+        (f"{target_key}_tq_packed", packed_out),
+        (f"{target_key}_tq_norms", norms_out),
+    ]
 
 
 def _patch_weight_name_remapping():
@@ -631,19 +1064,53 @@ def _patch_weight_name_remapping():
             tq_cfg = _json.load(f)
         bits = tq_cfg.get("bits", 3)
         group_size = tq_cfg.get("group_size", 128)
+        native_packed = tq_cfg.get("format") == "tq3_native"
         logger.info(
             "TQ3 native checkpoint (bits=%d, group_size=%d): single-pass decompress-on-load",
             bits,
             group_size,
         )
-
         pending_packed: dict[str, torch.Tensor] = {}
         pending_norms: dict[str, torch.Tensor] = {}
+        pending_moe_pairs: dict[str, dict[str, torch.Tensor]] = {}
+        moe_meta_params = _collect_meta_params(model) if native_packed else {}
+        moe_target_state: dict[str, dict[int, dict[int, tuple[torch.Tensor, torch.Tensor]]]] = {}
         decompressed = 0
+        yielded_native_moe = 0
         skipped_fp8_scales = 0
 
         for name, tensor in _original_get_all_weights(self, model_config, model):
-            if name.endswith(".weight.tq_packed"):
+            if name.endswith(".tq_packed") and ".experts." in name:
+                base = name[: -len(".tq_packed")]
+                pending_moe_pairs.setdefault(base, {})["packed"] = tensor
+                if "norms" in pending_moe_pairs[base]:
+                    ready_tensors = pending_moe_pairs.pop(base)
+                    for out_name, out_tensor in _maybe_flush_native_moe_target(
+                        model,
+                        base,
+                        ready_tensors,
+                        moe_meta_params,
+                        moe_target_state,
+                    ):
+                        yielded_native_moe += 1
+                        yield out_name, out_tensor
+                continue
+            elif name.endswith(".tq_norms") and ".experts." in name:
+                base = name[: -len(".tq_norms")]
+                pending_moe_pairs.setdefault(base, {})["norms"] = tensor
+                if "packed" in pending_moe_pairs[base]:
+                    ready_tensors = pending_moe_pairs.pop(base)
+                    for out_name, out_tensor in _maybe_flush_native_moe_target(
+                        model,
+                        base,
+                        ready_tensors,
+                        moe_meta_params,
+                        moe_target_state,
+                    ):
+                        yielded_native_moe += 1
+                        yield out_name, out_tensor
+                continue
+            elif name.endswith(".weight.tq_packed"):
                 base = name[: -len(".tq_packed")]
                 pending_packed[base] = tensor
             elif name.endswith(".weight.tq_norms"):
@@ -682,15 +1149,26 @@ def _patch_weight_name_remapping():
         if decompressed > 0:
             logger.info("TQ3 decompression complete: %d tensors", decompressed)
         if skipped_fp8_scales > 0:
-            logger.info(
-                "TQ3 native: dropped %d FP8 leftover scale tensors",
-                skipped_fp8_scales,
-            )
+                logger.info(
+                    "TQ3 native: dropped %d FP8 leftover scale tensors",
+                    skipped_fp8_scales,
+                )
 
         for base in pending_packed:
             logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
         for base in pending_norms:
             logger.warning("Orphaned .tq_norms without .tq_packed: %s", base)
+        for base, tensors in pending_moe_pairs.items():
+            if "packed" not in tensors or "norms" not in tensors:
+                logger.warning("Orphaned native MoE packed pair: %s", base)
+        for target_key, expert_map in moe_target_state.items():
+            _, _, meta_param = moe_meta_params[target_key]
+            logger.warning(
+                "Incomplete native MoE regroup for %s: expected %d experts, saw %d",
+                target_key,
+                meta_param.shape[0],
+                len(expert_map),
+            )
 
     DefaultModelLoader.get_all_weights = _decompress_get_all_weights
     logger.info("TQ3 decompress-on-load hook installed on DefaultModelLoader.get_all_weights")

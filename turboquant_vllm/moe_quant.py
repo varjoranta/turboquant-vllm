@@ -10,7 +10,10 @@ Installed by ``weight_quant._replace_linear_layers`` Phase 2A.
 
 from __future__ import annotations
 
+import logging
 import torch
+
+logger = logging.getLogger(__name__)
 
 try:
     from vllm.model_executor.custom_op import CustomOp
@@ -56,8 +59,12 @@ class TurboQuantFusedMoEScratchPool:
         bf16_dtype = w13_compressed.dtype
         self.w13 = torch.zeros(w13_compressed.shape, dtype=bf16_dtype, device=device)
         self.w2 = torch.zeros(w2_compressed.shape, dtype=bf16_dtype, device=device)
-        self.w13_fp32 = torch.zeros(w13_compressed.shape, dtype=torch.float32, device=device)
-        self.w2_fp32 = torch.zeros(w2_compressed.shape, dtype=torch.float32, device=device)
+        # The CUDA sparse expert dequant path writes directly into the
+        # destination dtype and ignores fp32 scratch. Keep these as
+        # lazy/optional placeholders so we don't reserve another full
+        # pair of expert buffers on every model by default.
+        self.w13_fp32 = None
+        self.w2_fp32 = None
         self.shape_w13 = w13_compressed.shape
         self.shape_w2 = w2_compressed.shape
 
@@ -88,6 +95,40 @@ else:
 
     def _register_custom_op(cls):
         return cls
+
+
+def _collect_meta_tensors(obj, prefix: str, depth: int = 0, max_depth: int = 2) -> list[str]:
+    """Collect a small debug summary of meta tensors reachable from an object."""
+    hits: list[str] = []
+    if obj is None or depth > max_depth:
+        return hits
+    if isinstance(obj, torch.Tensor):
+        if obj.is_meta:
+            hits.append(f"{prefix}: shape={tuple(obj.shape)} dtype={obj.dtype}")
+        return hits
+    if isinstance(obj, (list, tuple)):
+        for idx, item in enumerate(obj):
+            hits.extend(_collect_meta_tensors(item, f"{prefix}[{idx}]", depth + 1, max_depth))
+        return hits
+    if isinstance(obj, dict):
+        for key, item in obj.items():
+            hits.extend(_collect_meta_tensors(item, f"{prefix}.{key}", depth + 1, max_depth))
+        return hits
+    for name in dir(obj):
+        if name.startswith("__"):
+            continue
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        if isinstance(value, torch.Tensor):
+            if value.is_meta:
+                hits.append(f"{prefix}.{name}: shape={tuple(value.shape)} dtype={value.dtype}")
+        elif depth < max_depth and hasattr(value, "__dict__"):
+            hits.extend(_collect_meta_tensors(value, f"{prefix}.{name}", depth + 1, max_depth))
+    return hits
 
 
 @_register_custom_op

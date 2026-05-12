@@ -1085,6 +1085,10 @@ def _replace_linear_layers(
         # Skip modules already compressed by per-layer streaming compression
         if isinstance(module, TurboQuantWrapper):
             continue
+        # Skip layers already packed by an earlier per-layer quantization path.
+        # Re-wrapping them would try to quantize an empty placeholder weight.
+        if hasattr(module, "tq_packed_weight") and hasattr(module, "tq_norms"):
+            continue
         if not isinstance(module, nn.Linear):
             # Check for vLLM parallel linears: have weight + input_size/output_size
             if not (
