@@ -481,9 +481,7 @@ def _finalize_native_packed_moe(
     _bind_real_weight_param("w2_weight", pool.w2)
     if _HAS_FUSED_MOE and hasattr(layer, "_replace_quant_method"):
         layer.base_quant_method = method._unquant
-        layer._replace_quant_method(
-            TurboQuantFusedMoEMethod(layer.moe_config, w13_c, w2_c, pool)
-        )
+        layer._replace_quant_method(TurboQuantFusedMoEMethod(layer.moe_config, w13_c, w2_c, pool))
 
     if logger.isEnabledFor(logging.DEBUG):
         meta_hits = []
@@ -493,8 +491,7 @@ def _finalize_native_packed_moe(
         meta_hits.extend(_collect_meta_tensors(getattr(layer, "base_quant_method", None), "layer.base_quant_method"))
         if meta_hits:
             raise RuntimeError(
-                "TurboQuant detected meta tensors after native MoE finalize: "
-                + "; ".join(meta_hits[:20])
+                "TurboQuant detected meta tensors after native MoE finalize: " + "; ".join(meta_hits[:20])
             )
 
     for name in (
@@ -591,7 +588,9 @@ if UnquantizedFusedMoEMethod is not None and LinearBase is not None:
                         target_device = loaded_weight.device
                         if torch.cuda.is_available() and target_device.type != "cuda":
                             target_device = torch.device("cuda", torch.cuda.current_device())
-                        materialized = loaded_weight.to(device=target_device, copy=(loaded_weight.device != target_device))
+                        materialized = loaded_weight.to(
+                            device=target_device, copy=(loaded_weight.device != target_device)
+                        )
                         real_param = torch.nn.Parameter(materialized, requires_grad=False)
                         real_param.weight_loader = _loader
                         delattr(layer, name)
@@ -1149,10 +1148,10 @@ def _patch_weight_name_remapping():
         if decompressed > 0:
             logger.info("TQ3 decompression complete: %d tensors", decompressed)
         if skipped_fp8_scales > 0:
-                logger.info(
-                    "TQ3 native: dropped %d FP8 leftover scale tensors",
-                    skipped_fp8_scales,
-                )
+            logger.info(
+                "TQ3 native: dropped %d FP8 leftover scale tensors",
+                skipped_fp8_scales,
+            )
 
         for base in pending_packed:
             logger.warning("Orphaned .tq_packed without .tq_norms: %s", base)
