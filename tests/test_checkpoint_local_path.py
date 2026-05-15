@@ -46,6 +46,39 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
                     )
         self.assertIn("No .safetensors shards", str(ctx.exception))
 
+    def test_trust_remote_code_is_forwarded_to_config_and_tokenizer(self):
+        """Remote-code models need the same trust flag for config and tokenizer loading."""
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        dummy = mock.Mock()
+        dummy.save_pretrained = mock.Mock()
+        config_from_pretrained = mock.Mock(return_value=dummy)
+        tokenizer_from_pretrained = mock.Mock(return_value=dummy)
+
+        with tempfile.TemporaryDirectory() as outdir:
+            with (
+                mock.patch("transformers.AutoConfig.from_pretrained", config_from_pretrained),
+                mock.patch("transformers.AutoTokenizer.from_pretrained", tokenizer_from_pretrained),
+                mock.patch("huggingface_hub.HfApi.list_repo_files", return_value=[]),
+            ):
+                with self.assertRaises(FileNotFoundError):
+                    save_tq3_checkpoint(
+                        model_id="fake-org/remote-code-model",
+                        output_dir=outdir,
+                        bits=3,
+                        group_size=8,
+                        trust_remote_code=True,
+                    )
+
+        config_from_pretrained.assert_called_once_with(
+            "fake-org/remote-code-model",
+            trust_remote_code=True,
+        )
+        tokenizer_from_pretrained.assert_called_once_with(
+            "fake-org/remote-code-model",
+            trust_remote_code=True,
+        )
+
     def test_local_path_does_not_touch_hf_hub(self):
         """Pass a local dir and verify HF Hub is not touched and local source shards are not deleted."""
         from turboquant_vllm.checkpoint import save_tq3_checkpoint

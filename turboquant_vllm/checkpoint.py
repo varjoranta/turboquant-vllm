@@ -270,6 +270,7 @@ def save_tq3_checkpoint(
     group_size: int = 128,
     sensitive_bits: int | None = None,
     max_shard_bytes: int = 5 * 1024 * 1024 * 1024,
+    trust_remote_code: bool = False,
 ):
     """Convert a HuggingFace checkpoint to native TQ3 packed format.
 
@@ -284,6 +285,7 @@ def save_tq3_checkpoint(
         group_size: Group size (default 128).
         sensitive_bits: Higher precision bits for o_proj/down_proj (default None = uniform).
         max_shard_bytes: Max bytes per output shard (default 5 GB).
+        trust_remote_code: Pass through to Transformers config/tokenizer loaders.
     """
     from safetensors import safe_open
     from safetensors.torch import save_file
@@ -300,8 +302,8 @@ def save_tq3_checkpoint(
     else:
         logger.info("Downloading config and tokenizer for %s...", model_id)
     logger.info("Saving config and tokenizer to %s", output_dir)
-    config = AutoConfig.from_pretrained(model_id)
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
     source_has_quantized_weights = _source_has_quantized_weights(config)
     # Do NOT inject quantization_config into config.json — vLLM
     # treats models with quantization_config differently during
