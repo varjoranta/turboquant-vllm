@@ -19,6 +19,41 @@ Model compression for vLLM. What this package ships today:
 
 > **Weight compression is also going upstream**: [vllm-project/vllm#39970](https://github.com/vllm-project/vllm/pull/39970) adds the Linear-only weight-compression path as `--quantization turboquant` (scalar HIGGS). Opened 2026-04-16, awaiting maintainer triage. Once merged, upstream vLLM will have the weight path; MoE compression stays here until the follow-up upstream PR lands.
 
+## Architecture at a glance
+
+The components above are not as orthogonal as the bullet list suggests; they layer roughly:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│ User-facing CLI                                                        │
+│   vllm serve <model> --quantization turboquant                         │
+│   (or: TQ_WEIGHT_BITS=3 vllm serve <model>)                            │
+├────────────────────────────────────────────────────────────────────────┤
+│ Algorithm layer                                                        │
+│   WHT rotation → Lloyd-Max codebook → per-group norm correction        │
+│   ├ Uniform 3/4-bit:   weight_quant.py        (eventually #39970)      │
+│   └ Kurtosis-mixed:    mixed_bits.py          (plugin)                 │
+├────────────────────────────────────────────────────────────────────────┤
+│ Storage layer                                                          │
+│   ├ On-the-fly:        compress at load                                │
+│   └ Native packed:     save_tq3_checkpoint() → HF artifact             │
+│       └ MoE: per-expert OR pre-fused (Qwen3.6-style)                   │
+├────────────────────────────────────────────────────────────────────────┤
+│ Runtime kernels                                                        │
+│   ├ Linear:    bs=1 CUDA GEMV │ Triton fused-dequant-GEMM              │
+│   ├ MoE:       sparse expert dequant (only active top-k decompressed)  │
+│   ├ Apple:     Metal SIMD-group GEMV                                   │
+│   └ KV cache:  PolarQuant store/decode (legacy monkey-patch, MLA-only) │
+├────────────────────────────────────────────────────────────────────────┤
+│ Production tools                                                       │
+│   ├ Expert pruning (REAP)                                              │
+│   ├ AWQ export from TQ-compressed dense weights                        │
+│   └ MLX port (loads TQ3 checkpoints on Apple Silicon)                  │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Read this top-down: the **algorithm** is one paragraph of math, the **storage** is either runtime-compressed or pre-baked into an HF artifact, and the **runtime kernels** decide whether you get bf16-baseline speed (CUDA bs=1 + Triton + sparse MoE) or just the memory savings. **Production tools** are independent — use them or skip them.
+
 ## Quick start
 
 ```python
