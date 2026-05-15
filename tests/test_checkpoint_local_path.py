@@ -32,10 +32,22 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
         dummy.save_pretrained = mock.Mock()
 
         with tempfile.TemporaryDirectory() as outdir:
+            raw_config_path = os.path.join(outdir, "raw_config.json")
+            with open(raw_config_path, "w") as f:
+                import json
+
+                json.dump({"model_type": "bert"}, f)
+
+            def fake_hf_hub_download(*_args, filename, **_kwargs):
+                if filename == "config.json":
+                    return raw_config_path
+                raise FileNotFoundError(filename)
+
             with (
                 mock.patch("transformers.AutoConfig.from_pretrained", return_value=dummy),
                 mock.patch("transformers.AutoTokenizer.from_pretrained", return_value=dummy),
                 mock.patch("huggingface_hub.HfApi.list_repo_files", return_value=[]),
+                mock.patch("huggingface_hub.hf_hub_download", side_effect=fake_hf_hub_download),
             ):
                 with self.assertRaises(FileNotFoundError) as ctx:
                     save_tq3_checkpoint(
@@ -56,10 +68,22 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
         tokenizer_from_pretrained = mock.Mock(return_value=dummy)
 
         with tempfile.TemporaryDirectory() as outdir:
+            raw_config_path = os.path.join(outdir, "raw_config.json")
+            with open(raw_config_path, "w") as f:
+                import json
+
+                json.dump({"model_type": "bert"}, f)
+
+            def fake_hf_hub_download(*_args, filename, **_kwargs):
+                if filename == "config.json":
+                    return raw_config_path
+                raise FileNotFoundError(filename)
+
             with (
                 mock.patch("transformers.AutoConfig.from_pretrained", config_from_pretrained),
                 mock.patch("transformers.AutoTokenizer.from_pretrained", tokenizer_from_pretrained),
                 mock.patch("huggingface_hub.HfApi.list_repo_files", return_value=[]),
+                mock.patch("huggingface_hub.hf_hub_download", side_effect=fake_hf_hub_download),
             ):
                 with self.assertRaises(FileNotFoundError):
                     save_tq3_checkpoint(
@@ -241,6 +265,56 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
             self.assertTrue(os.path.exists(copied_path), "Expected custom local JSON config to be copied")
             with open(copied_path) as f:
                 self.assertEqual(json.load(f), custom_json)
+
+    def test_config_json_preserves_raw_source_fields_except_quantization_config(self):
+        """Model-specific raw config fields must survive AutoConfig round-trips."""
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
+            from safetensors.torch import save_file
+
+            save_file(
+                {"model.layers.0.mlp.fake.weight": torch.randn(8, 8)},
+                os.path.join(srcdir, "model-00001-of-00001.safetensors"),
+            )
+
+            import json
+
+            raw_config = {
+                "model_type": "bert",
+                "vocab_size": 10,
+                "compress_ratios": [0, 0, 4, 128, 4],
+                "num_hash_layers": 3,
+                "rope_scaling": {
+                    "type": "yarn",
+                    "factor": 16,
+                    "original_max_position_embeddings": 65536,
+                },
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "weight_block_size": [128, 128],
+                },
+            }
+            with open(os.path.join(srcdir, "config.json"), "w") as f:
+                json.dump(raw_config, f)
+            with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
+                json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
+            with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
+                f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
+
+            save_tq3_checkpoint(
+                model_id=srcdir,
+                output_dir=outdir,
+                bits=3,
+                group_size=8,
+            )
+
+            with open(os.path.join(outdir, "config.json")) as f:
+                out_config = json.load(f)
+            self.assertEqual(out_config["compress_ratios"], raw_config["compress_ratios"])
+            self.assertEqual(out_config["num_hash_layers"], raw_config["num_hash_layers"])
+            self.assertEqual(out_config["rope_scaling"], raw_config["rope_scaling"])
+            self.assertNotIn("quantization_config", out_config)
 
     def test_quantized_source_config_with_int_weight_raises_before_float_conversion(self):
         """Quantized non-float source weights must fail without a dequant sidecar."""

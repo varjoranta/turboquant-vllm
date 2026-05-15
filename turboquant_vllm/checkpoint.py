@@ -89,6 +89,24 @@ def _source_has_quantized_weights(config) -> bool:
     )
 
 
+def _write_raw_source_config_json(source_config_path: str, output_dir: str) -> None:
+    """Write source config.json verbatim, minus source quantization metadata.
+
+    Some model-specific fields are not preserved by AutoConfig round-trips.
+    DeepSeek V4, for example, needs the raw per-layer compress_ratios list for
+    vLLM's native model code; Transformers normalizes that into compress_rates.
+    """
+    with open(source_config_path) as f:
+        source_config = json.load(f)
+    source_config.pop("quantization_config", None)
+
+    dst = os.path.join(output_dir, "config.json")
+    with open(dst, "w") as f:
+        json.dump(source_config, f, indent=2)
+        f.write("\n")
+    logger.info("Wrote raw source config.json without quantization_config")
+
+
 def _has_source_quant_sidecar(tensor_name: str, tensor_names: set[str]) -> bool:
     """Return True when a weight has a source quantization scale sidecar."""
     if not tensor_name.endswith(".weight"):
@@ -317,6 +335,13 @@ def save_tq3_checkpoint(
             config.quantization_config = None
     config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
+    if is_local:
+        source_config_path = os.path.join(model_id, "config.json")
+    else:
+        from huggingface_hub import hf_hub_download
+
+        source_config_path = hf_hub_download(repo_id=model_id, filename="config.json")
+    _write_raw_source_config_json(source_config_path, output_dir)
     if is_local:
         copied_json = 0
         for filename in sorted(os.listdir(model_id)):
