@@ -43,6 +43,7 @@ Headline numbers:
 - **Qwen3-30B-A3B-Instruct-2507 MoE decode** on H100 (v0.12.0): 1.22 → **10.23 tok/s at bs=1, 1k ctx** with sparse dequant (8.4× over v0.11.0). As of [#35](https://github.com/varjoranta/turboquant-vllm/pull/35) the CUDA sparse-dequant kernel removes the `enforce_eager=True` requirement; `kernel_config={"moe_backend": "triton"}` is still needed.
 - **Qwen3.6-35B-A3B MoE decode** on RTX PRO 6000 Blackwell (v0.13.0): 1.84 → **18.2 tok/s at bs=1, 1k ctx** with block-diag CUDA dequant (10.1× over v0.12.0). Partial-rotary model; same compression, same harness.
 - **Qwen3.6-35B-A3B native MoE** on A100 80GB (v0.13.5): **16.0 tok/s graphs-on, 9.81 tok/s eager** at bs=1. End-to-end load (`.experts.gate_up_proj.tq_packed` pre-fused per layer), pass through vLLM 0.20.2 FlashInfer CUTLASS MoE backend, generate, run in both eager and CUDA-graphs modes. Multimodal name-mapper supported. Compressed checkpoint **~16 GB on disk** vs ~70 GB BF16 source (4.4× compression). Throughput reproduced across 4 independent runs (16.02 / 15.94 / 15.88 / 16.0 tok/s graphs-on).
+- **Qwen3.6-27B dense hybrid** on RTX PRO 6000 96GB (v0.13.5): **14.46 tok/s graphs-on, 13.93 tok/s eager** at bs=1. Same plugin code as the MoE 35B-A3B above, different architecture path. 64-layer hybrid: 16 full-attention + 48 GatedDeltaNet linear-attention (plus a 1-layer MTP module). **Graphs-vs-eager delta is only 4% here** (vs 1.6× on MoE) — DeltaNet linear-attention has fewer per-step kernel launches than MoE expert dispatch, so CUDA graphs amortize less. Compressed checkpoint **15.37 GB** vs ~54 GB BF16 (3.6× compression). Cross-arch validated: same checkpoint runs at 5.4 tok/s eager on A100 80GB (sm_80), confirming Blackwell (sm_120) gives ~2.6× over Ampere for this dense+hybrid model. End-to-end save_tq3 → load → generate → eager + graphs-on bench all clean.
 
 ## Why this exists
 
@@ -96,6 +97,7 @@ GLM-4.7 355B: native TQ3 checkpoint verified (14.7 GB, 4.2x compression). Full q
 | DeepSeek-V3 | **MLA** | Pending (larger disk) | Works | Same: MLA requires the legacy monkey-patch path |
 | Qwen3.5-35B-A3B | MoE + GatedDeltaNet + GQA | Works (as of varjoranta/turboquant-vllm#15) | Untested | Hybrid architecture; weight quant validated via @gaby's fixes |
 | Qwen3.6-35B-A3B | MoE + GatedDeltaNet + partial-rotary GQA | Works (v0.13.5 native MoE + v0.13.0 block-diag) | Untested | Pre-fused expert layout supported (`.experts.gate_up_proj`); 16 tok/s graphs-on A100 80GB / 18.2 tok/s on RTX PRO 6000 |
+| Qwen3.6-27B | Dense hybrid: 16 full-attention + 48 GatedDeltaNet | Works (v0.13.5) | Untested | Sister model of 35B-A3B (dense path instead of MoE); 14.46 tok/s graphs-on RTX PRO 6000 96GB, 5.4 tok/s eager A100 80GB; 15.4 GB compressed (3.6×) |
 | Qwen3-30B-A3B | MoE + GQA | Works | Works | Full CUDA graph capture, 123 tok/s at c=1 on A100 (matching BF16 baseline) |
 | gpt-oss-20b | Alternating full/sliding window + sinks | Works | Not yet | Sliding window + attention sinks need pass-through support in the KV path |
 
