@@ -40,11 +40,16 @@ def _cuda_version_tuple():
     import torch
 
     v = getattr(torch.version, "cuda", None) or "0.0"
+    parts = v.split(".")
     try:
-        major, minor = v.split(".")[:2]
-        return (int(major), int(minor))
-    except ValueError:
+        major = int(parts[0])
+    except (TypeError, ValueError):
         return (0, 0)
+    try:
+        minor = int(parts[1]) if len(parts) > 1 else 0
+    except (TypeError, ValueError):
+        minor = 0
+    return (major, minor)
 
 
 def _detect_local_arches() -> list[str]:

@@ -227,6 +227,7 @@ def _prepare_calibration_data(
     device: torch.device,
 ) -> list[torch.Tensor]:
     """Load and tokenize calibration samples."""
+    synthetic_texts = ["The quick brown fox jumps over the lazy dog. " * 20] * num_samples
     try:
         from datasets import load_dataset
 
@@ -240,7 +241,11 @@ def _prepare_calibration_data(
                 texts.append(text[: max_length * 4])  # rough char limit
     except Exception as e:
         logger.warning("Could not load %s dataset: %s. Using synthetic data.", dataset_name, e)
-        texts = ["The quick brown fox jumps over the lazy dog. " * 20] * num_samples
+        texts = synthetic_texts
+
+    if not texts:
+        logger.warning("Dataset %s yielded no usable calibration samples. Using synthetic data.", dataset_name)
+        texts = synthetic_texts
 
     # Batch tokenize for efficiency
     batch = tokenizer(
