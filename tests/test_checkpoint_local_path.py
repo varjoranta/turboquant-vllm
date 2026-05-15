@@ -209,6 +209,260 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
             with open(copied_path) as f:
                 self.assertEqual(json.load(f), custom_json)
 
+    def test_quantized_source_config_with_int_weight_raises_before_float_conversion(self):
+        """Quantized non-float source weights must fail without a dequant sidecar."""
+        from turboquant_vllm.checkpoint import UnsupportedQuantizedSourceError, save_tq3_checkpoint
+
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
+            from safetensors.torch import save_file
+
+            save_file(
+                {"model.layers.0.mlp.fake.weight": torch.randint(-8, 8, (8, 8), dtype=torch.int8)},
+                os.path.join(srcdir, "model-00001-of-00001.safetensors"),
+            )
+
+            import json
+
+            with open(os.path.join(srcdir, "config.json"), "w") as f:
+                json.dump(
+                    {
+                        "model_type": "bert",
+                        "vocab_size": 10,
+                        "quantization_config": {
+                            "quant_method": "fp8",
+                            "fmt": "e4m3",
+                            "weight_block_size": [128, 128],
+                        },
+                    },
+                    f,
+                )
+            with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
+                json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
+            with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
+                f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
+
+            with self.assertRaises(UnsupportedQuantizedSourceError) as ctx:
+                save_tq3_checkpoint(
+                    model_id=srcdir,
+                    output_dir=outdir,
+                    bits=3,
+                    group_size=8,
+                )
+
+        self.assertIn("source config advertises quantized weights", str(ctx.exception))
+
+    def test_weight_scale_sidecar_raises_before_float_conversion(self):
+        """A .weight + .scale pair is a source-quantized tensor layout."""
+        from turboquant_vllm.checkpoint import UnsupportedQuantizedSourceError, save_tq3_checkpoint
+
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
+            from safetensors.torch import save_file
+
+            save_file(
+                {
+                    "model.layers.0.mlp.fake.weight": torch.randint(-8, 8, (8, 8), dtype=torch.int8),
+                    "model.layers.0.mlp.fake.scale": torch.ones(1, 1, dtype=torch.float32),
+                },
+                os.path.join(srcdir, "model-00001-of-00001.safetensors"),
+            )
+
+            import json
+
+            with open(os.path.join(srcdir, "config.json"), "w") as f:
+                json.dump({"model_type": "bert", "vocab_size": 10}, f)
+            with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
+                json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
+            with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
+                f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
+
+            with self.assertRaises(UnsupportedQuantizedSourceError) as ctx:
+                save_tq3_checkpoint(
+                    model_id=srcdir,
+                    output_dir=outdir,
+                    bits=3,
+                    group_size=8,
+                )
+
+        self.assertIn("found sibling .scale tensor", str(ctx.exception))
+
+    def test_fp8_scale_sidecar_is_dequantized_for_skipped_weight(self):
+        """Supported FP8 source weights are dequantized before storing skipped tensors."""
+        from safetensors.torch import load_file, save_file
+
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
+            weight_fp32 = torch.ones(128, 128, dtype=torch.float32)
+            scale_fp32 = torch.full((1, 1), 2.0, dtype=torch.float32)
+            save_file(
+                {
+                    "model.layers.0.attn.compressor.wkv.weight": weight_fp32.to(torch.float8_e4m3fn),
+                    "model.layers.0.attn.compressor.wkv.scale": scale_fp32.to(torch.float8_e8m0fnu),
+                },
+                os.path.join(srcdir, "model-00001-of-00001.safetensors"),
+            )
+
+            import json
+
+            with open(os.path.join(srcdir, "config.json"), "w") as f:
+                json.dump(
+                    {
+                        "model_type": "bert",
+                        "vocab_size": 10,
+                        "quantization_config": {
+                            "quant_method": "fp8",
+                            "fmt": "e4m3",
+                            "weight_block_size": [128, 128],
+                        },
+                    },
+                    f,
+                )
+            with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
+                json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
+            with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
+                f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
+
+            save_tq3_checkpoint(
+                model_id=srcdir,
+                output_dir=outdir,
+                bits=3,
+                group_size=128,
+            )
+
+            loaded = {}
+            for fname in os.listdir(outdir):
+                if fname.endswith(".safetensors"):
+                    loaded.update(load_file(os.path.join(outdir, fname)))
+
+        name = "model.layers.0.attn.compressor.wkv.weight"
+        self.assertIn(name, loaded)
+        self.assertNotIn("model.layers.0.attn.compressor.wkv.scale", loaded)
+        self.assertEqual(loaded[name].dtype, torch.float16)
+        self.assertTrue(torch.allclose(loaded[name].float(), torch.full((128, 128), 2.0), atol=0, rtol=0))
+
+    def test_fp8_block_dequant_accepts_raw_ue8m0_uint8_scale(self):
+        """Some loaders expose UE8M0 sidecars as raw uint8 exponent bytes."""
+        from turboquant_vllm.checkpoint import _dequant_fp8_block_weight
+
+        weight = torch.ones(2, 2, dtype=torch.float32).to(torch.float8_e4m3fn)
+        scale = torch.full((1, 1), 128, dtype=torch.uint8)
+
+        out = _dequant_fp8_block_weight("model.layers.0.attn.wq.weight", weight, scale, (128, 128))
+
+        self.assertTrue(torch.allclose(out, torch.full((2, 2), 2.0), atol=0, rtol=0))
+
+    def test_mxfp4_scale_sidecar_is_dequantized_before_storage(self):
+        """Supported MXFP4 source expert weights are unpacked before TQ handling."""
+        from safetensors.torch import load_file, save_file
+
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
+            # Low nibble 0x2 -> 1.0, high nibble 0xB -> -1.5.
+            packed = torch.full((4, 16), 0xB2, dtype=torch.uint8)
+            # Raw E8M0 exponent 128 means scale 2 ** (128 - 127) == 2.
+            scale = torch.full((4, 1), 128, dtype=torch.uint8)
+            save_file(
+                {
+                    "model.layers.0.ffn.experts.0.w1.weight": packed,
+                    "model.layers.0.ffn.experts.0.w1.scale": scale,
+                },
+                os.path.join(srcdir, "model-00001-of-00001.safetensors"),
+            )
+
+            import json
+
+            with open(os.path.join(srcdir, "config.json"), "w") as f:
+                json.dump(
+                    {
+                        "model_type": "bert",
+                        "vocab_size": 10,
+                        "expert_dtype": "fp4",
+                        "quantization_config": {
+                            "quant_method": "fp8",
+                            "fmt": "e4m3",
+                            "scale_fmt": "ue8m0",
+                            "weight_block_size": [128, 128],
+                        },
+                    },
+                    f,
+                )
+            with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
+                json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
+            with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
+                f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
+
+            save_tq3_checkpoint(
+                model_id=srcdir,
+                output_dir=outdir,
+                bits=3,
+                group_size=128,
+            )
+
+            loaded = {}
+            for fname in os.listdir(outdir):
+                if fname.endswith(".safetensors"):
+                    loaded.update(load_file(os.path.join(outdir, fname)))
+
+        name = "model.layers.0.ffn.experts.0.w1.weight"
+        expected_row = torch.tensor([2.0, -3.0] * 16, dtype=torch.float32)
+        expected = expected_row.repeat(4, 1)
+        self.assertIn(name, loaded)
+        self.assertNotIn("model.layers.0.ffn.experts.0.w1.scale", loaded)
+        self.assertEqual(loaded[name].shape, (4, 32))
+        self.assertEqual(loaded[name].dtype, torch.float16)
+        self.assertTrue(torch.allclose(loaded[name].float(), expected, atol=0, rtol=0))
+
+    def test_checkpoint_and_runtime_skip_patterns_stay_in_sync(self):
+        """checkpoint.py and weight_quant.py skip lists must not drift."""
+        from turboquant_vllm.checkpoint import _SKIP_PATTERNS as checkpoint_skips
+        from turboquant_vllm.weight_quant import _SKIP_PATTERNS as runtime_skips
+
+        self.assertEqual(checkpoint_skips, runtime_skips)
+        for pattern in ("mtp", "compressor", "indexer", "ape", "attn_sink", "hc_"):
+            self.assertIn(pattern, checkpoint_skips)
+
+    def test_deepseek_v4_control_tensors_are_not_compressed(self):
+        """CSA/HCA control tensors should remain full precision in TQ3 checkpoints."""
+        from turboquant_vllm.checkpoint import save_tq3_checkpoint
+
+        with tempfile.TemporaryDirectory() as srcdir, tempfile.TemporaryDirectory() as outdir:
+            from safetensors.torch import load_file, save_file
+
+            save_file(
+                {
+                    "model.layers.0.mlp.dense.weight": torch.randn(128, 128),
+                    "model.layers.0.attn.compressor.wkv.weight": torch.randn(128, 128),
+                },
+                os.path.join(srcdir, "model-00001-of-00001.safetensors"),
+            )
+
+            import json
+
+            with open(os.path.join(srcdir, "config.json"), "w") as f:
+                json.dump({"model_type": "bert", "vocab_size": 10}, f)
+            with open(os.path.join(srcdir, "tokenizer_config.json"), "w") as f:
+                json.dump({"model_type": "bert", "tokenizer_class": "BertTokenizer"}, f)
+            with open(os.path.join(srcdir, "vocab.txt"), "w") as f:
+                f.write("[PAD]\n[UNK]\n[CLS]\n[SEP]\n[MASK]\nhello\nworld\n")
+
+            save_tq3_checkpoint(
+                model_id=srcdir,
+                output_dir=outdir,
+                bits=3,
+                group_size=128,
+            )
+
+            loaded = {}
+            for fname in os.listdir(outdir):
+                if fname.endswith(".safetensors"):
+                    loaded.update(load_file(os.path.join(outdir, fname)))
+
+        self.assertIn("model.layers.0.mlp.dense.weight.tq_packed", loaded)
+        self.assertIn("model.layers.0.attn.compressor.wkv.weight", loaded)
+        self.assertNotIn("model.layers.0.attn.compressor.wkv.weight.tq_packed", loaded)
+        self.assertEqual(loaded["model.layers.0.attn.compressor.wkv.weight"].dtype, torch.float16)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

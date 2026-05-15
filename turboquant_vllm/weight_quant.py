@@ -694,7 +694,21 @@ class TurboQuantWrapper(nn.Module):
 #   kernels that read `self.conv1d.weight.view(...)` directly. `TurboQuantWrapper`
 #   has no `.weight`, so the direct-read path crashes. The layer is tiny
 #   (kernel_size × conv_dim), so skipping costs negligible memory.
-_SKIP_PATTERNS = ("lm_head", "embed", "norm", "head", "conv1d")
+# - DeepSeek V4 MTP/HyperConnection and CSA/HCA tensors are structurally
+#   special control-path weights, so they stay full precision by default.
+_SKIP_PATTERNS = (
+    "lm_head",
+    "embed",
+    "norm",
+    "head",
+    "conv1d",
+    "mtp",
+    "compressor",
+    "indexer",
+    "ape",
+    "attn_sink",
+    "hc_",
+)
 
 # Layers that benefit from higher precision (attention output + MLP output)
 _SENSITIVE_PATTERNS = ("o_proj", "down_proj")

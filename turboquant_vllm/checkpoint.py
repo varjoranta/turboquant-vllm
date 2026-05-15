@@ -36,7 +36,199 @@ logger = logging.getLogger(__name__)
 # linear-attention conv blocks): quantizing those weights silently corrupts outputs.
 # PR #31 added conv1d to weight_quant.py's runtime version; this file was missed,
 # letting save_tq3_checkpoint still quantize conv1d into native packed checkpoints.
-_SKIP_PATTERNS = ("lm_head", "embed", "norm", "head", "conv1d")
+# DeepSeek V4 adds MTP/HyperConnection and CSA/HCA infrastructure tensors
+# that are not ordinary capacity weights; keep them exact unless we have a
+# targeted quality study saying otherwise.
+_SKIP_PATTERNS = (
+    "lm_head",
+    "embed",
+    "norm",
+    "head",
+    "conv1d",
+    "mtp",
+    "compressor",
+    "indexer",
+    "ape",
+    "attn_sink",
+    "hc_",
+)
+
+
+class UnsupportedQuantizedSourceError(RuntimeError):
+    """Raised when save_tq3_checkpoint sees an unsupported quantized source."""
+
+
+def _source_quantization_config(config) -> dict:
+    """Return the source quantization config as a plain dict, if present."""
+    qcfg = getattr(config, "quantization_config", None)
+    if qcfg is None:
+        return {}
+    if isinstance(qcfg, dict):
+        return dict(qcfg)
+    if hasattr(qcfg, "to_dict"):
+        return qcfg.to_dict()
+    return {"value": str(qcfg)}
+
+
+def _source_has_quantized_weights(config) -> bool:
+    """Detect source checkpoints that need dequant before TQ compression.
+
+    This is intentionally conservative. The current converter strips
+    quantization_config from the output config, so any source format whose
+    weight tensors require sidecar scales must be dequantized before either
+    compressing or storing skipped weights.
+    """
+    qcfg = _source_quantization_config(config)
+    quant_method = str(qcfg.get("quant_method", "")).lower()
+    fmt = str(qcfg.get("fmt", "")).lower()
+    expert_dtype = str(getattr(config, "expert_dtype", "")).lower()
+    quantized_tokens = ("fp8", "fp4", "mxfp4", "int4", "int8", "e4m3", "e5m2")
+
+    return any(token in quant_method for token in quantized_tokens) or any(
+        token in fmt or token in expert_dtype for token in quantized_tokens
+    )
+
+
+def _has_source_quant_sidecar(tensor_name: str, tensor_names: set[str]) -> bool:
+    """Return True when a weight has a source quantization scale sidecar."""
+    if not tensor_name.endswith(".weight"):
+        return False
+    return tensor_name[: -len(".weight")] + ".scale" in tensor_names
+
+
+def _source_scale_name(tensor_name: str) -> str:
+    return tensor_name[: -len(".weight")] + ".scale"
+
+
+def _is_source_quant_scale_sidecar(tensor_name: str, tensor_names: set[str]) -> bool:
+    """Return True when this .scale tensor is consumed by a sibling .weight."""
+    if not tensor_name.endswith(".scale"):
+        return False
+    return tensor_name[: -len(".scale")] + ".weight" in tensor_names
+
+
+def _is_fp8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in {
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+        getattr(torch, "float8_e5m2", None),
+        getattr(torch, "float8_e5m2fnuz", None),
+    }
+
+
+def _dequant_fp8_block_weight(
+    tensor_name: str,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: tuple[int, int],
+) -> torch.Tensor:
+    """Dequantize a 2D block-scaled FP8 weight tensor to float32."""
+    if weight.dim() != 2:
+        _raise_unsupported_quantized_source(tensor_name, "FP8 dequant currently supports only 2D weights")
+    if scale.dim() != 2:
+        _raise_unsupported_quantized_source(tensor_name, "FP8 scale tensor must be 2D")
+
+    block_rows, block_cols = block_size
+    expected_rows = (weight.shape[0] + block_rows - 1) // block_rows
+    expected_cols = (weight.shape[1] + block_cols - 1) // block_cols
+    if tuple(scale.shape) != (expected_rows, expected_cols):
+        _raise_unsupported_quantized_source(
+            tensor_name,
+            f"FP8 scale shape {tuple(scale.shape)} does not match expected {(expected_rows, expected_cols)}",
+        )
+
+    expanded_scale = _scale_to_float(scale).repeat_interleave(block_rows, dim=0).repeat_interleave(block_cols, dim=1)
+    expanded_scale = expanded_scale[: weight.shape[0], : weight.shape[1]]
+    return weight.float() * expanded_scale
+
+
+def _scale_to_float(scale: torch.Tensor) -> torch.Tensor:
+    if scale.dtype == torch.uint8:
+        return torch.pow(torch.tensor(2.0, dtype=torch.float32, device=scale.device), scale.float() - 127.0)
+    return scale.float()
+
+
+def _dequant_mxfp4_weight(
+    tensor_name: str,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize OCP MXFP4/E2M1 packed weights to float32.
+
+    MXFP4 stores two E2M1 FP4 values per byte along the input dimension and
+    one scale per block of 32 unpacked values.
+    """
+    if weight.dtype != torch.uint8:
+        _raise_unsupported_quantized_source(tensor_name, f"MXFP4 weight dtype must be uint8, got {weight.dtype}")
+    if weight.dim() != 2:
+        _raise_unsupported_quantized_source(tensor_name, "MXFP4 dequant currently supports only 2D weights")
+    if scale.dim() != 2:
+        _raise_unsupported_quantized_source(tensor_name, "MXFP4 scale tensor must be 2D")
+
+    out_dim, packed_in_dim = weight.shape
+    in_dim = packed_in_dim * 2
+    expected_scale_shape = (out_dim, (in_dim + 31) // 32)
+    if tuple(scale.shape) != expected_scale_shape:
+        _raise_unsupported_quantized_source(
+            tensor_name,
+            f"MXFP4 scale shape {tuple(scale.shape)} does not match expected {expected_scale_shape}",
+        )
+
+    # OCP E2M1 FP4 finite values, indexed by the low 3 bits; high bit is sign.
+    fp4_lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    packed = weight.to(torch.int64)
+    low = packed & 0x0F
+    high = (packed >> 4) & 0x0F
+
+    low_values = fp4_lut[low & 0x07] * torch.where((low & 0x08) != 0, -1.0, 1.0)
+    high_values = fp4_lut[high & 0x07] * torch.where((high & 0x08) != 0, -1.0, 1.0)
+
+    unpacked = torch.empty((out_dim, in_dim), dtype=torch.float32, device=weight.device)
+    unpacked[:, 0::2] = low_values
+    unpacked[:, 1::2] = high_values
+
+    expanded_scale = _scale_to_float(scale).repeat_interleave(32, dim=1)[:, :in_dim]
+    return unpacked * expanded_scale
+
+
+def _source_weight_block_size(config) -> tuple[int, int]:
+    qcfg = _source_quantization_config(config)
+    raw = qcfg.get("weight_block_size", (128, 128))
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return (128, 128)
+    return (int(raw[0]), int(raw[1]))
+
+
+def _dequant_source_weight(
+    tensor_name: str,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    config,
+) -> torch.Tensor:
+    """Dequantize a supported source-quantized weight before TQ conversion."""
+    if _is_fp8_dtype(weight.dtype):
+        return _dequant_fp8_block_weight(tensor_name, weight, scale, _source_weight_block_size(config))
+    expert_dtype = str(getattr(config, "expert_dtype", "")).lower()
+    quant_method = str(_source_quantization_config(config).get("quant_method", "")).lower()
+    if weight.dtype == torch.uint8 and ("fp4" in expert_dtype or "mxfp4" in quant_method):
+        return _dequant_mxfp4_weight(tensor_name, weight, scale)
+    _raise_unsupported_quantized_source(
+        tensor_name,
+        f"found sibling .scale tensor but unsupported source dtype {weight.dtype}",
+    )
+
+
+def _raise_unsupported_quantized_source(tensor_name: str, reason: str) -> None:
+    raise UnsupportedQuantizedSourceError(
+        "save_tq3_checkpoint encountered a quantized source tensor "
+        f"({tensor_name}: {reason}). This path is not safe to convert with "
+        "tensor.float(); add source dequantization for the checkpoint format "
+        "before writing a TQ3-native checkpoint."
+    )
 
 
 def _resolve_module(root, dotted_path: str):
@@ -108,13 +300,17 @@ def save_tq3_checkpoint(
     logger.info("Saving config and tokenizer to %s", output_dir)
     config = AutoConfig.from_pretrained(model_id)
     tokenizer = AutoTokenizer.from_pretrained(model_id)
+    source_has_quantized_weights = _source_has_quantized_weights(config)
     # Do NOT inject quantization_config into config.json — vLLM
     # treats models with quantization_config differently during
     # compilation and CUDA graph capture.  Instead, tq_config.json
     # (written at the end of this function) is the sole marker.
     # The decompress-on-load hook in vllm_quant.py detects it.
     if hasattr(config, "quantization_config"):
-        config.quantization_config = None
+        try:
+            delattr(config, "quantization_config")
+        except AttributeError:
+            config.quantization_config = None
     config.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     if is_local:
@@ -231,15 +427,32 @@ def save_tq3_checkpoint(
             shard_path = hf_hub_download(model_id, shard_name, local_dir=_tmp_download_dir)
 
         with safe_open(shard_path, framework="pt", device="cpu") as f:
+            tensor_names = set(f.keys())
             for tensor_name in f.keys():
                 tensor = f.get_tensor(tensor_name)
                 original_bytes = tensor.numel() * tensor.element_size()
                 total_original += original_bytes
 
+                if _is_source_quant_scale_sidecar(tensor_name, tensor_names):
+                    del tensor
+                    continue
+
                 is_weight_2d = tensor_name.endswith(".weight") and tensor.dim() == 2
                 is_expert_3d = tensor.dim() == 3 and "expert" in tensor_name.lower()
                 is_weight = is_weight_2d or is_expert_3d
                 is_skip = any(p in tensor_name.lower() for p in _SKIP_PATTERNS)
+
+                if is_weight:
+                    if _has_source_quant_sidecar(tensor_name, tensor_names):
+                        scale_tensor = f.get_tensor(_source_scale_name(tensor_name))
+                        tensor = _dequant_source_weight(tensor_name, tensor, scale_tensor, config)
+                        del scale_tensor
+                    elif source_has_quantized_weights and not tensor.is_floating_point():
+                        _raise_unsupported_quantized_source(
+                            tensor_name,
+                            "source config advertises quantized weights but no supported sidecar was found",
+                        )
+
                 is_large = tensor.shape[-1] >= 128 or (tensor.dim() >= 2 and tensor.shape[-2] >= 128)
 
                 if is_weight and not is_skip and is_large:
