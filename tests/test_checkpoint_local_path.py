@@ -413,6 +413,19 @@ class TestSaveTqCheckpointLocalPath(unittest.TestCase):
         self.assertEqual(loaded[name].dtype, torch.float16)
         self.assertTrue(torch.allclose(loaded[name].float(), expected, atol=0, rtol=0))
 
+    def test_mxfp4_int8_weight_reinterprets_as_packed_uint8(self):
+        """DeepSeek V4 stores packed MXFP4 expert weights with an int8 dtype tag."""
+        from turboquant_vllm.checkpoint import _dequant_mxfp4_weight
+
+        packed_u8 = torch.full((4, 16), 0xB2, dtype=torch.uint8)
+        packed_i8 = packed_u8.view(torch.int8)
+        scale = torch.full((4, 1), 128, dtype=torch.uint8)
+
+        out_u8 = _dequant_mxfp4_weight("layers.0.ffn.experts.0.w1.weight", packed_u8, scale)
+        out_i8 = _dequant_mxfp4_weight("layers.0.ffn.experts.0.w1.weight", packed_i8, scale)
+
+        self.assertTrue(torch.equal(out_i8, out_u8))
+
     def test_checkpoint_and_runtime_skip_patterns_stay_in_sync(self):
         """checkpoint.py and weight_quant.py skip lists must not drift."""
         from turboquant_vllm.checkpoint import _SKIP_PATTERNS as checkpoint_skips

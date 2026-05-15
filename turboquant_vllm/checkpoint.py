@@ -158,8 +158,10 @@ def _dequant_mxfp4_weight(
     MXFP4 stores two E2M1 FP4 values per byte along the input dimension and
     one scale per block of 32 unpacked values.
     """
-    if weight.dtype != torch.uint8:
-        _raise_unsupported_quantized_source(tensor_name, f"MXFP4 weight dtype must be uint8, got {weight.dtype}")
+    if weight.dtype not in (torch.uint8, torch.int8):
+        _raise_unsupported_quantized_source(tensor_name, f"MXFP4 weight dtype must be uint8/int8, got {weight.dtype}")
+    if weight.dtype == torch.int8:
+        weight = weight.view(torch.uint8)
     if weight.dim() != 2:
         _raise_unsupported_quantized_source(tensor_name, "MXFP4 dequant currently supports only 2D weights")
     if scale.dim() != 2:
@@ -214,7 +216,7 @@ def _dequant_source_weight(
         return _dequant_fp8_block_weight(tensor_name, weight, scale, _source_weight_block_size(config))
     expert_dtype = str(getattr(config, "expert_dtype", "")).lower()
     quant_method = str(_source_quantization_config(config).get("quant_method", "")).lower()
-    if weight.dtype == torch.uint8 and ("fp4" in expert_dtype or "mxfp4" in quant_method):
+    if weight.dtype in (torch.uint8, torch.int8) and ("fp4" in expert_dtype or "mxfp4" in quant_method):
         return _dequant_mxfp4_weight(tensor_name, weight, scale)
     _raise_unsupported_quantized_source(
         tensor_name,
