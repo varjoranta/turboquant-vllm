@@ -347,7 +347,7 @@ def packed_group_bytes(bits: int, group_size: int) -> int:
     if bits == 4:
         return group_size // 2
     elif bits == 3:
-        return (group_size // 8) * 3
+        return ((group_size + 7) // 8) * 3
     elif bits == 2:
         return group_size // 4
     return group_size
@@ -774,13 +774,30 @@ class Compressed3D:
             )
         obj = object.__new__(cls)
         n_experts, out_dim, in_dim = shape
+        padded_in, n_groups = padded_size(in_dim, group_size)
+        expected_packed_shape = (n_experts * out_dim * n_groups, packed_group_bytes(bits, group_size))
+        expected_norms_shape = (n_experts * out_dim, n_groups)
+        if packed.shape != expected_packed_shape:
+            raise ValueError(
+                f"Compressed3D.from_packed expected packed shape {expected_packed_shape} "
+                f"for {shape}, got {tuple(packed.shape)}"
+            )
+        if norms.shape != expected_norms_shape:
+            raise ValueError(
+                f"Compressed3D.from_packed expected norms shape {expected_norms_shape} "
+                f"for {shape}, got {tuple(norms.shape)}"
+            )
+        if packed.device != norms.device:
+            raise ValueError(
+                f"Compressed3D.from_packed expected packed/norms on same device, got {packed.device} and {norms.device}"
+            )
         obj.shape = shape
         obj.dtype = dtype
         obj.device = packed.device
         obj.bits = bits
         obj.group_size = group_size
         obj.in_dim = in_dim
-        obj.padded_in, obj.n_groups = padded_size(in_dim, group_size)
+        obj.padded_in, obj.n_groups = padded_in, n_groups
         obj.packed = packed
         obj.norms = norms
         obj.original_bytes = n_experts * out_dim * in_dim * 2  # FP16

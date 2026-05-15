@@ -50,6 +50,7 @@ class TestPackedGroupBytes(unittest.TestCase):
         self.assertEqual(packed_group_bytes(3, 128), 48)
         self.assertEqual(packed_group_bytes(3, 64), 24)
         self.assertEqual(packed_group_bytes(3, 256), 96)
+        self.assertEqual(packed_group_bytes(3, 4), 3)
 
     def test_2bit(self):
         self.assertEqual(packed_group_bytes(2, 128), 32)
@@ -173,6 +174,32 @@ class TestCompressed3DFromPackedRoundTrip(unittest.TestCase):
         comp2 = Compressed3D.from_packed(comp.packed, comp.norms, data.shape, data.dtype, bits, gs)
         out = comp2.decompress()
         self.assertTrue(torch.allclose(ref, out))
+
+    def test_from_packed_rejects_bad_packed_shape(self):
+        data = torch.randn(2, 64, 128, dtype=torch.float32)
+        comp = Compressed3D(data, bits=3, group_size=128)
+        with self.assertRaisesRegex(ValueError, "expected packed shape"):
+            Compressed3D.from_packed(
+                comp.packed[:, :-1],
+                comp.norms,
+                data.shape,
+                data.dtype,
+                3,
+                128,
+            )
+
+    def test_from_packed_rejects_bad_norms_shape(self):
+        data = torch.randn(2, 64, 128, dtype=torch.float32)
+        comp = Compressed3D(data, bits=3, group_size=128)
+        with self.assertRaisesRegex(ValueError, "expected norms shape"):
+            Compressed3D.from_packed(
+                comp.packed,
+                comp.norms[:-1],
+                data.shape,
+                data.dtype,
+                3,
+                128,
+            )
 
 
 class TestNativeMoELoaderShapes(unittest.TestCase):

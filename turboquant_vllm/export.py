@@ -1,4 +1,4 @@
-"""Export TQ-compressed models to serving-optimized formats.
+"""Export TQ-compressed dense models to serving-optimized formats.
 
 Converts TurboQuant-compressed weights to Marlin/AWQ-compatible format
 for serving at full Marlin speed. The TQ compression (data-oblivious,
@@ -95,6 +95,15 @@ def _compute_awq_params(weight: torch.Tensor, group_size: int = 128, bits: int =
     return packed, scales.to(torch.float16), qzeros
 
 
+def _find_unsupported_moe_tensors(model: nn.Module) -> list[tuple[str, tuple[int, ...]]]:
+    """Return 3D expert tensors that AWQ export cannot represent yet."""
+    unsupported: list[tuple[str, tuple[int, ...]]] = []
+    for name, param in model.named_parameters():
+        if param.dim() == 3:
+            unsupported.append((name, tuple(param.shape)))
+    return unsupported
+
+
 def compress_and_export(
     model_id: str,
     output_dir: str,
@@ -108,6 +117,8 @@ def compress_and_export(
 
     This replaces hours of AWQ calibration with 30 seconds of TQ compression.
     The exported checkpoint loads into vLLM with --quantization awq at Marlin speed.
+    Dense models are supported today; MoE expert tensors are rejected with a
+    clear error instead of silently writing a partial checkpoint.
 
     Args:
         model_id: HuggingFace model ID or local path.
@@ -144,6 +155,15 @@ def compress_and_export(
     # Step 2: TQ compress + decompress (to get quantized-quality weights in float)
     logger.info("TQ%d compression + decompression for export...", bits)
     from turboquant_vllm.weight_quant import _SKIP_PATTERNS, _get_quantizer
+
+    unsupported_moe = _find_unsupported_moe_tensors(model)
+    if unsupported_moe:
+        preview = ", ".join(f"{name}{shape}" for name, shape in unsupported_moe[:4])
+        if len(unsupported_moe) > 4:
+            preview += ", ..."
+        raise NotImplementedError(
+            f"AWQ export does not support MoE expert tensors yet. Found {len(unsupported_moe)} 3D tensor(s): {preview}"
+        )
 
     # Step 3: Export each linear layer to AWQ format
     os.makedirs(output_dir, exist_ok=True)

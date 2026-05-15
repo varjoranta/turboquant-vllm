@@ -351,20 +351,23 @@ def load_tq3_model(path_or_hf_repo: str) -> tuple[nn.Module, dict[str, Any]]:
     # → ``switch_mlp.gate_proj/up_proj``). Those need a checkpoint-side fix
     # and are skipped here with a warning.
     remaining: list[tuple[str, mx.array]] = []
-    unresolved_packed = 0
+    unresolved_packed: list[str] = []
     for key, value in weights.items():
         if key in consumed:
             continue
         if ".tq_packed" in key or ".tq_norms" in key:
-            unresolved_packed += 1
+            unresolved_packed.append(key)
             continue
         remaining.append((key, value))
 
     if unresolved_packed:
-        logger.warning(
-            "Skipped %d packed TQ tensor(s) not matched to a Linear or SwitchLinear; "
-            "likely a pre-sanitize HF MoE layout that needs a split-before-compress fix.",
-            unresolved_packed,
+        preview = ", ".join(unresolved_packed[:6])
+        if len(unresolved_packed) > 6:
+            preview += ", ..."
+        raise ValueError(
+            "Found packed TQ tensor(s) that did not match any Linear or SwitchLinear module. "
+            "This usually means a pre-sanitize HF MoE layout was compressed before the required "
+            f"split/rename step. Unresolved keys ({len(unresolved_packed)}): {preview}"
         )
 
     del weights
