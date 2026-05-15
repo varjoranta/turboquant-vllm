@@ -43,4 +43,4 @@ __all__ = [
     "CompressedKV",
 ]
 
-__version__ = "0.13.5"
+__version__ = "0.13.6"
