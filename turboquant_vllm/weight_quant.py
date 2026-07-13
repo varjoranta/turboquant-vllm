@@ -1470,7 +1470,12 @@ def _replace_linear_layers(
 
     moe_scratch_pool = None
 
-    if FusedMoE is not None and TurboQuantFusedMoEMethod is not None and TurboQuantFusedMoEScratchPool is not None:
+    # `isinstance(FusedMoE, type)`, not `is not None`: vLLM 0.25.0 exports
+    # FusedMoE as a non-None, non-class object (lazy proxy / moved export), so a
+    # `None` check passes but `isinstance(module, FusedMoE)` below raises
+    # `TypeError: isinstance() arg 2 must be a type`, breaking engine init for
+    # the TQ_WEIGHT_BITS online path (even on dense models).
+    if isinstance(FusedMoE, type) and TurboQuantFusedMoEMethod is not None and TurboQuantFusedMoEScratchPool is not None:
         for name, module in list(model.named_modules()):
             if not isinstance(module, FusedMoE):
                 continue
@@ -1572,7 +1577,7 @@ def _replace_linear_layers(
         # in Phase 2A. _compress_3d_param resets param.data to an empty
         # tensor, so those params now have numel 0 and would fail the
         # downstream pipeline anyway.
-        if FusedMoE is not None and isinstance(owner, FusedMoE):
+        if isinstance(FusedMoE, type) and isinstance(owner, FusedMoE):
             continue
 
         # Apply expert pruning in-place if mask available
