@@ -46,9 +46,28 @@ except ImportError:
 _patched = False
 
 
+def _disable_incompatible_aot_compile():
+    """Default vLLM's AOT compile off — it is incompatible with weight replacement.
+
+    vLLM 0.25 (with torch >= 2.10) turns ``VLLM_USE_AOT_COMPILE`` on by default.
+    Its AOT path loads a compiled forward that binds the model's parameters by
+    name, including ``weight``. This plugin replaces each Linear's ``.weight``
+    with compressed buffers, so the binding raises ``KeyError: 'weight'`` at
+    engine init (seen on dense TQ models under vLLM 0.25, e.g. Qwen3-8B). The
+    regular piecewise-CUDA-graph path the plugin supports is unaffected, so we
+    default AOT compile off. ``setdefault`` respects an explicit user override.
+
+    register() runs in every process (including the engine-core subprocess that
+    compiles), so setting the env here reaches the process that reads it.
+    """
+    os.environ.setdefault("VLLM_USE_AOT_COMPILE", "0")
+
+
 def register():
     """Called by vLLM's plugin loader in every process."""
     global _patched
+
+    _disable_incompatible_aot_compile()
 
     # Always register TurboQuant quant config — needed for loading native
     # TQ3 checkpoints via vLLM's quantization registry. Cheap, idempotent,
