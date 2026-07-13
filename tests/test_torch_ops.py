@@ -28,7 +28,7 @@ class TestPolarQuant:
     """PolarQuant roundtrip and quality."""
 
     def test_roundtrip_shape(self, random_vectors):
-        pq = PolarQuantTorch(HEAD_DIM, bits=4, seed=SEED, device="cuda")
+        pq = PolarQuantTorch(HEAD_DIM, bit_width=4, seed=SEED, device="cuda")
         indices, norms = pq.quantize(random_vectors)
         assert indices.shape == (64, HEAD_DIM)
         assert norms.shape == (64,)
@@ -37,15 +37,15 @@ class TestPolarQuant:
         assert restored.shape == (64, HEAD_DIM)
 
     def test_4bit_mse(self, random_vectors):
-        pq = PolarQuantTorch(HEAD_DIM, bits=4, seed=SEED, device="cuda")
+        pq = PolarQuantTorch(HEAD_DIM, bit_width=4, seed=SEED, device="cuda")
         indices, norms = pq.quantize(random_vectors)
         restored = pq.dequantize(indices, norms)
         mse = ((random_vectors.float() - restored.float()) ** 2).mean().item()
         assert mse < 0.02, f"4-bit MSE {mse:.6f} too high"
 
     def test_3bit_higher_mse(self, random_vectors):
-        pq4 = PolarQuantTorch(HEAD_DIM, bits=4, seed=SEED, device="cuda")
-        pq3 = PolarQuantTorch(HEAD_DIM, bits=3, seed=SEED, device="cuda")
+        pq4 = PolarQuantTorch(HEAD_DIM, bit_width=4, seed=SEED, device="cuda")
+        pq3 = PolarQuantTorch(HEAD_DIM, bit_width=3, seed=SEED, device="cuda")
 
         r4 = pq4.dequantize(*pq4.quantize(random_vectors))
         r3 = pq3.dequantize(*pq3.quantize(random_vectors))
@@ -55,15 +55,15 @@ class TestPolarQuant:
         assert mse3 > mse4
 
     def test_zero_vector(self):
-        pq = PolarQuantTorch(HEAD_DIM, bits=4, seed=SEED, device="cuda")
+        pq = PolarQuantTorch(HEAD_DIM, bit_width=4, seed=SEED, device="cuda")
         zero = torch.zeros(1, HEAD_DIM, dtype=torch.float16, device="cuda")
         indices, norms = pq.quantize(zero)
         restored = pq.dequantize(indices, norms)
         assert restored.abs().max().item() < 1e-6
 
     def test_seed_determinism(self, random_vectors):
-        pq1 = PolarQuantTorch(HEAD_DIM, bits=4, seed=SEED, device="cuda")
-        pq2 = PolarQuantTorch(HEAD_DIM, bits=4, seed=SEED, device="cuda")
+        pq1 = PolarQuantTorch(HEAD_DIM, bit_width=4, seed=SEED, device="cuda")
+        pq2 = PolarQuantTorch(HEAD_DIM, bit_width=4, seed=SEED, device="cuda")
         i1, n1 = pq1.quantize(random_vectors)
         i2, n2 = pq2.quantize(random_vectors)
         assert torch.equal(i1, i2)

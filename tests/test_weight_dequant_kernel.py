@@ -55,7 +55,7 @@ class TestWeightDequantKernel:
         # CUDA kernel
         w_cuda = torch.empty(out_dim, in_dim, device="cuda", dtype=torch.float32)
         cuda_mod.weight_dequant(
-            packed, norms_2d, quantizer.signs1, quantizer.signs2, centroids, w_cuda, group_size, bits, out_dim, in_dim
+            packed, norms_2d, quantizer.signs1, quantizer.signs2, centroids, w_cuda, group_size, bits, out_dim, in_dim, group_size
         )
 
         max_diff = (w_ref - w_cuda).abs().max().item()
@@ -78,6 +78,7 @@ class TestWeightDequantKernel:
             bits,
             out_dim,
             in_dim,
+            group_size,  # block_size == group_size (full-width WHT)
         )
         cuda_mod.weight_dequant(*args[:5], w_f32, *args[6:])
         cuda_mod.weight_dequant(*args[:5], w_f16, *args[6:])
@@ -110,6 +111,7 @@ class TestWeightDequantKernel:
             n_experts,
             out_dim,
             in_dim,
+            group_size,  # block_size == group_size (full-width WHT)
         )
 
         output_2d = torch.empty(n_experts * out_dim, in_dim, device="cuda")
@@ -124,6 +126,7 @@ class TestWeightDequantKernel:
             bits,
             n_experts * out_dim,
             in_dim,
+            group_size,  # block_size == group_size (full-width WHT)
         )
 
         max_diff = (output_3d.reshape(-1, in_dim) - output_2d).abs().max().item()
@@ -147,6 +150,7 @@ class TestWeightDequantKernel:
                 bits,
                 out_dim,
                 in_dim,
+                group_size,  # block_size == group_size (full-width WHT)
             )
         torch.cuda.synchronize()
 
@@ -168,6 +172,7 @@ class TestWeightDequantKernel:
                 bits,
                 out_dim,
                 in_dim,
+                group_size,  # block_size == group_size (full-width WHT)
             )
         torch.cuda.synchronize()
         cuda_ms = (time.perf_counter() - t0) / n_iters * 1000
