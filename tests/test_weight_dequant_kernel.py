@@ -55,7 +55,17 @@ class TestWeightDequantKernel:
         # CUDA kernel
         w_cuda = torch.empty(out_dim, in_dim, device="cuda", dtype=torch.float32)
         cuda_mod.weight_dequant(
-            packed, norms_2d, quantizer.signs1, quantizer.signs2, centroids, w_cuda, group_size, bits, out_dim, in_dim, group_size
+            packed,
+            norms_2d,
+            quantizer.signs1,
+            quantizer.signs2,
+            centroids,
+            w_cuda,
+            group_size,
+            bits,
+            out_dim,
+            in_dim,
+            group_size,
         )
 
         max_diff = (w_ref - w_cuda).abs().max().item()
