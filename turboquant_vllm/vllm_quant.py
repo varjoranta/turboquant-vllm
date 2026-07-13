@@ -154,9 +154,13 @@ if LinearBase is not None:
             if isinstance(layer, LinearBase):
                 return TurboQuantOnlineLinearMethod(self._bits_for(prefix), self.group_size)
             try:
-                from vllm.model_executor.layers.fused_moe import FusedMoE
+                from turboquant_vllm.weight_quant import _moe_module_types
 
-                if isinstance(layer, FusedMoE) and TurboQuantOnlineMoEMethod is not None:
+                # vLLM 0.25 made FusedMoE a factory function; the expert-weight
+                # module is RoutedExperts. Match whichever class(es) exist.
+                moe_types = _moe_module_types()
+
+                if moe_types and isinstance(layer, moe_types) and TurboQuantOnlineMoEMethod is not None:
                     # The fused MoE params don't carry per-projection names,
                     # so match the patterns against synthetic proj names under
                     # this prefix — the same substrings the checkpoint packer
