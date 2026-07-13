@@ -1592,11 +1592,11 @@ def _replace_linear_layers(
 
         owner, param_name = _resolve_parent_and_attr(model, name)
 
-        # Skip params that live inside a FusedMoE we already handled
-        # in Phase 2A. _compress_3d_param resets param.data to an empty
-        # tensor, so those params now have numel 0 and would fail the
-        # downstream pipeline anyway.
-        if isinstance(FusedMoE, type) and isinstance(owner, FusedMoE):
+        # Skip params that live inside a MoE module we already handled in
+        # Phase 2A (FusedMoE class on <=0.20, RoutedExperts on 0.25).
+        # _compress_3d_param resets param.data to an empty tensor, so those
+        # params now have numel 0 and would fail the downstream pipeline anyway.
+        if moe_types and isinstance(owner, moe_types):
             continue
 
         # Apply expert pruning in-place if mask available
