@@ -242,7 +242,12 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None = None,
+        **kwargs,
     ):
+        # **kwargs absorbs vLLM-version additions to the MoE apply signature
+        # (vLLM 0.25 added `shared_experts=`) and forwards them to the base
+        # method unchanged, so this delegating wrapper does not break on new
+        # keyword arguments.
         # ``layer.w13_weight.data`` / ``layer.w2_weight.data`` were
         # re-pointed at ``pool.w13`` / ``pool.w2`` at install time, so
         # writing into the pool buffers here makes the freshly
@@ -266,6 +271,7 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             shared_experts_input=shared_experts_input,
+            **kwargs,
         )
 
     def apply_monolithic(
@@ -273,6 +279,7 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
         layer: torch.nn.Module,
         x: torch.Tensor,
         router_logits: torch.Tensor,
+        **kwargs,
     ):
         pool = self._pool
         self._w13.decompress_into(pool.w13, fp32_scratch=pool.w13_fp32)
@@ -281,4 +288,5 @@ class TurboQuantFusedMoEMethod(FusedMoEMethodBase, CustomOp):
             layer=layer,
             x=x,
             router_logits=router_logits,
+            **kwargs,
         )
