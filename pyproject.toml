@@ -33,6 +33,10 @@ turboquant_weight = "turboquant_vllm._vllm_plugin:register"
 [project.urls]
 Homepage = "https://github.com/varjoranta/turboquant-vllm"
 
+[tool.uv]
+# Resolve only releases at least three days old.
+exclude-newer = "P3D"
+
 [tool.hatch.build.targets.wheel]
 packages = ["turboquant_vllm", "csrc"]
 
